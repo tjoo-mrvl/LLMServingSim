@@ -38,11 +38,11 @@ configurations:
 
 | Model | Parallelism | TTFT mean | TPOT mean | Latency mean |
 | --- | --- | --- | --- | --- |
-| Llama-3.1-8B                | TP=1 dense       | -2.8% | -0.3% | -1.0% |
-| Qwen3-32B                   | TP=2 dense       | -0.7% | -0.3% | -0.4% |
-| Qwen3-30B-A3B-Instruct-2507 | DP=2 × EP=2 MoE  | -2.9% | +0.6% | +0.4% |
+| Llama-3.1-8B                | TP=1 dense       | -0.3% | +0.7% | +0.4% |
+| Qwen3-32B                   | TP=2 dense       | +2.4% | +1.7% | +2.0% |
+| Qwen3-30B-A3B-Instruct-2507 | DP=2 × EP=2 MoE  | -1.5% | +1.1% | +0.9% |
 
-Across all three, **TTFT / TPOT / latency means stay within sub-3%
+Across all three, **TTFT / TPOT / latency means stay within ~2.5%
 of vLLM**, and the DP+EP MoE path tracks vLLM as tightly as the
 dense TP path. Per-percentile numbers (P50 / P90 / P95 / P99) are in
 the per-model `summary.txt` files under
@@ -60,16 +60,16 @@ Headline error vs. vLLM:
 
 | Metric | vLLM | Sim | Diff |
 | --- | --- | --- | --- |
-| TTFT mean    |  7.10 s   |  6.90 s   | **-2.8%** |
-| TTFT P99     | 19.76 s   | 19.48 s   | -1.4% |
-| TPOT mean    | 32.5 ms   | 32.3 ms   | **-0.3%** |
-| TPOT P99     | 37.3 ms   | 37.6 ms   | +0.6% |
-| Latency mean | 28.20 s   | 27.92 s   | **-1.0%** |
-| Latency P99  | 37.64 s   | 37.41 s   | -0.6% |
+| TTFT mean    |  7.10 s   |  7.07 s   | **-0.3%** |
+| TTFT P99     | 19.76 s   | 19.96 s   | +1.0% |
+| TPOT mean    | 32.5 ms   | 32.7 ms   | **+0.7%** |
+| TPOT P99     | 37.3 ms   | 38.1 ms   | +2.1% |
+| Latency mean | 28.20 s   | 28.31 s   | **+0.4%** |
+| Latency P99  | 37.64 s   | 37.96 s   | +0.8% |
 
 Single-instance dense Llama is the simplest configuration. The
-simulator slightly under-predicts TTFT (-2.8%) and tracks TPOT and
-end-to-end latency within half a percent.
+simulator matches TTFT mean to within 0.3% and tracks TPOT and
+end-to-end latency within ~1%.
 
 ### Qwen3-32B (TP=2 dense)
 
@@ -81,15 +81,17 @@ Headline error vs. vLLM:
 
 | Metric | vLLM | Sim | Diff |
 | --- | --- | --- | --- |
-| TTFT mean    | 36.91 s    | 36.66 s    | **-0.7%** |
-| TTFT P99     | 93.35 s    | 92.45 s    | -1.0% |
-| TPOT mean    |  80.3 ms   |  80.1 ms   | **-0.3%** |
-| TPOT P99     |  97.1 ms   |  97.0 ms   | -0.1% |
-| Latency mean | 90.41 s    | 90.02 s    | **-0.4%** |
-| Latency P99  | 126.34 s   | 126.44 s   | +0.1% |
+| TTFT mean    | 36.91 s    | 37.81 s    | **+2.4%** |
+| TTFT P99     | 93.35 s    | 95.25 s    | +2.0% |
+| TPOT mean    |  80.3 ms   |  81.7 ms   | **+1.7%** |
+| TPOT P99     |  97.1 ms   |  99.2 ms   | +2.2% |
+| Latency mean | 90.41 s    | 92.23 s    | **+2.0%** |
+| Latency P99  | 126.34 s   | 129.30 s   | +2.3% |
 
 TP=2 exercises the dense ALLREDUCE collective on `o_proj` /
-`down_proj`. All means stay sub-1%; even P99s land within ~1%.
+`down_proj`. Means and P99s land within ~2.5%; the simulator
+slightly over-predicts because per-iteration dense compute now
+accounts for chunked-prefill token counts more aggressively.
 
 ### Qwen3-30B-A3B-Instruct-2507 (DP=2 × EP=2 MoE)
 
@@ -101,12 +103,12 @@ Headline error vs. vLLM:
 
 | Metric | vLLM | Sim | Diff |
 | --- | --- | --- | --- |
-| TTFT mean    |  1.09 s    |  1.05 s    | **-2.9%** |
-| TTFT P99     |  9.59 s    | 10.03 s    | +4.6% |
-| TPOT mean    | 47.3 ms    | 47.6 ms    | **+0.6%** |
-| TPOT P99     | 53.3 ms    | 54.3 ms    | +1.9% |
-| Latency mean | 32.34 s    | 32.47 s    | **+0.4%** |
-| Latency P99  | 43.90 s    | 44.12 s    | +0.5% |
+| TTFT mean    |  1.09 s    |  1.07 s    | **-1.5%** |
+| TTFT P99     |  9.59 s    | 10.04 s    | +4.7% |
+| TPOT mean    | 47.3 ms    | 47.8 ms    | **+1.1%** |
+| TPOT P99     | 53.3 ms    | 54.7 ms    | +2.7% |
+| Latency mean | 32.34 s    | 32.64 s    | **+0.9%** |
+| Latency P99  | 43.90 s    | 44.26 s    | +0.8% |
 
 This is the disaggregated path: data-parallel across two instances,
 expert-parallel within each instance, with wave-synchronized
