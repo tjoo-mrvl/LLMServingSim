@@ -573,19 +573,19 @@ class Scheduler:
                 #     self.memory.cache_unfinished_req(req, self.prefix_storage)
                 
                 if req.is_prefill():
-                    # Use scheduled_tokens for chunk size
+                    # Use scheduled_tokens for chunk size. num_computed_tokens
+                    # already includes any prefix-cache hit (memory_model.py
+                    # bumps it on first prefix_match), so chunk_size is already
+                    # the count of tokens actually computed this iteration —
+                    # no further prefix-hit subtraction is needed downstream.
                     chunk_size = scheduled_tokens.get(req.id, req.original_input - req.num_computed_tokens)
                     if chunk_size > self.max_num_batched_tokens:
                         raise Exception("Chunk length exceeds max num batched tokens")
-                    prefix_hit = req.prefix_cache_hit
-                    
+
                     total_len += chunk_size
                     if req.is_init:  # Only set queuing delay on first chunk
                         req.set_que_delay(current)
-                    
-                    if self.enable_prefix_caching and prefix_hit > 0:
-                        hit_len += prefix_hit
-                    
+
                     q_list.append(chunk_size)
                     num_prefill += 1
                     prefill_q_list.append(chunk_size)
