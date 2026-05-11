@@ -473,7 +473,7 @@ def main():
                 # group's max_total_len, matching vLLM's CUDA-graph DP padding.
                 logger.debug(f"Instance {instance_id} is idle but DP group {dg} has pending batches. Creating dummy batch for synchronization.")
                 dummy = Batch(schedulers[instance_id].get_batch_id(), instances[instance_id]["model_name"],
-                              1, 1, 0, [1], [], 0, 1, [], [], [1], current, 0)
+                              1, 1, [1], [], 0, 1, [], [], [1], current, 0)
                 dummy.fired.append(sys)
                 dp_pending[dg][instance_id] = (dummy, inst2node_mapping[instance_id])
 

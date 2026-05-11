@@ -865,10 +865,12 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
     )
 
 
-def _build_batch_ctx(batch, ctx, enable_prefix_caching):
+def _build_batch_ctx(batch, ctx):
+    # batch.total_len is the number of tokens actually computed this iteration:
+    # the scheduler builds it from chunk_size = original_input - num_computed_tokens,
+    # and num_computed_tokens already absorbs any prefix-cache hit, so no further
+    # subtraction is needed even when prefix caching is on.
     total_len = batch.total_len
-    if enable_prefix_caching:
-        total_len = max(1, total_len - batch.hit_len)
     # DP padding (see serving.__main__._pad_batch_to_max) adds dummy decodes without
     # touching batch.requests. vLLM keeps lm_head's output shape pinned to
     # num_tokens_after_padding for CUDA-graph replay, so each padded decode
@@ -1289,7 +1291,7 @@ def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
 
 def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
                       batch, max_len, output_path, placement, block_mode_on, gate,
-                      enable_prefix_caching, enable_attn_offloading, power_model, pim_model, fp,
+                      enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                       tp_dim=None, ep_dim=None, dp_sum_total_len=0):
@@ -1299,7 +1301,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
-    bctx = _build_batch_ctx(batch, ctx, enable_prefix_caching)
+    bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
         "Batch #%d: model=%s num_reqs=%d total_len=%d req_ids=%s",
@@ -1342,7 +1344,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
 
 def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
                                   batches, max_len, output_path, placement, block_mode_on, gate,
-                                  enable_prefix_caching, enable_attn_offloading, power_model, pim_model, fp,
+                                  enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                                   tp_dim=None, ep_dim=None, dp_sum_total_len=0):
@@ -1352,8 +1354,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
-    bctx1 = _build_batch_ctx(batches[0], ctx, enable_prefix_caching)
-    bctx2 = _build_batch_ctx(batches[1], ctx, enable_prefix_caching)
+    bctx1 = _build_batch_ctx(batches[0], ctx)
+    bctx2 = _build_batch_ctx(batches[1], ctx)
 
     logger.info(
         "Sub-batch #%s: model=%s num_reqs=%d total_len=%d req_ids=%s",
@@ -1482,8 +1484,12 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
 
     # make trace
     synth_args = (hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id)
+    # enable_prefix_caching is intentionally not forwarded: with chunked-prefill
+    # semantics, the scheduler already encodes prefix hits via num_computed_tokens,
+    # so trace synthesis no longer needs the flag.
+    del enable_prefix_caching
     synth_kwargs = dict(placement=placement, block_mode_on=block_mode_on, gate=gate,
-                        enable_prefix_caching=enable_prefix_caching, enable_attn_offloading=enable_attn_offloading,
+                        enable_attn_offloading=enable_attn_offloading,
                         power_model=power_model, pim_model=pim_model, fp=fp,
                         variant=variant, kv_cache_dtype=kv_cache_dtype,
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
@@ -1674,7 +1680,7 @@ def _make_sub_batch(batch):
         evict, load = (batch.evict, batch.load) if i == 0 else (0, 0)
         sub = Batch(
             batch.batch_id, batch.model,
-            total_len, kv_len, 0,
+            total_len, kv_len,
             q_list, k_list, num_prefill,
             num_decode, prefill_q_list,
             prefill_k_list, decode_k_list,

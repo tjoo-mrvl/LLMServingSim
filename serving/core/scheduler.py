@@ -241,7 +241,6 @@ class Scheduler:
             # ============ STEP 5: Build batch with lists ============
             total_len = 0
             kv_len = 0
-            hit_len = 0
             num_prefill = 0
             num_decode = 0
             q_list = []
@@ -253,7 +252,7 @@ class Scheduler:
                 if req.is_prefill():
                     # Use scheduled_tokens for chunk size
                     chunk_size = scheduled_tokens.get(req.id, req.original_input - req.num_computed_tokens)
-                    
+
                     total_len += chunk_size
                     if req.is_init:  # Only set queuing delay on first chunk
                         req.set_que_delay(current)
@@ -264,7 +263,7 @@ class Scheduler:
                     # k_list: total kv cache after this step (computed + new)
                     # k_list.append(req.num_computed_tokens + chunk_size)
                     num_prefill += 1
-                    
+
                 else:
                     # Decode
                     total_len += 1
@@ -276,7 +275,7 @@ class Scheduler:
 
             # make batch, output doesn't matter here!! always one iteration
             # batch is also 1
-            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, hit_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, load_size)
+            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, load_size)
             # add already fired system
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
@@ -544,7 +543,6 @@ class Scheduler:
             # ============ STEP 5: Build batch with lists ============
             total_len = 0
             kv_len = 0
-            hit_len = 0
             num_prefill = 0
             num_decode = 0
             q_list = []
@@ -610,7 +608,7 @@ class Scheduler:
             # For debugging
             # self.memory.npu_prefix_cache.pretty_print()
             # self.memory.npu_prefix_cache.print_prefix_info()
-            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, hit_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, evict_load_size + prefix_load_size)
+            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, evict_load_size + prefix_load_size)
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
             self.inflight.append(batch)
