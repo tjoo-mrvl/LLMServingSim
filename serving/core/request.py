@@ -72,12 +72,11 @@ class Request:
 
 # class that manages batch of astra-sim
 class Batch:
-    def __init__(self, batch_id, model, total_len, kv_len, hit_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, batch_time, kv_size, evict=0, load=0):
+    def __init__(self, batch_id, model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, batch_time, kv_size, evict=0, load=0):
         self.batch_id = batch_id
         self.model = model
         self.total_len = total_len
         self.kv_len = kv_len
-        self.hit_len = hit_len
         self.batch_time = batch_time
         self.fired = [] # systems that fired this batch
         self.requests = []

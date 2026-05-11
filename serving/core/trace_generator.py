@@ -865,10 +865,12 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
     )
 
 
-def _build_batch_ctx(batch, ctx, enable_prefix_caching):
+def _build_batch_ctx(batch, ctx):
+    # batch.total_len is the number of tokens actually computed this iteration:
+    # the scheduler builds it from chunk_size = original_input - num_computed_tokens,
+    # and num_computed_tokens already absorbs any prefix-cache hit, so no further
+    # subtraction is needed even when prefix caching is on.
     total_len = batch.total_len
-    if enable_prefix_caching:
-        total_len = max(1, total_len - batch.hit_len)
     # DP padding (see serving.__main__._pad_batch_to_max) adds dummy decodes without
     # touching batch.requests. vLLM keeps lm_head's output shape pinned to
     # num_tokens_after_padding for CUDA-graph replay, so each padded decode
@@ -1289,7 +1291,7 @@ def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
 
 def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
                       batch, max_len, output_path, placement, block_mode_on, gate,
-                      enable_prefix_caching, enable_attn_offloading, power_model, pim_model, fp,
+                      enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                       tp_dim=None, ep_dim=None, dp_sum_total_len=0):
@@ -1299,7 +1301,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
-    bctx = _build_batch_ctx(batch, ctx, enable_prefix_caching)
+    bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
         "Batch #%d: model=%s num_reqs=%d total_len=%d req_ids=%s",
@@ -1342,7 +1344,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
 
 def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
                                   batches, max_len, output_path, placement, block_mode_on, gate,
-                                  enable_prefix_caching, enable_attn_offloading, power_model, pim_model, fp,
+                                  enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                                   tp_dim=None, ep_dim=None, dp_sum_total_len=0):
@@ -1352,8 +1354,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
-    bctx1 = _build_batch_ctx(batches[0], ctx, enable_prefix_caching)
-    bctx2 = _build_batch_ctx(batches[1], ctx, enable_prefix_caching)
+    bctx1 = _build_batch_ctx(batches[0], ctx)
+    bctx2 = _build_batch_ctx(batches[1], ctx)
 
     logger.info(
         "Sub-batch #%s: model=%s num_reqs=%d total_len=%d req_ids=%s",
@@ -1482,8 +1484,12 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
 
     # make trace
     synth_args = (hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id)
+    # enable_prefix_caching is intentionally not forwarded: with chunked-prefill
+    # semantics, the scheduler already encodes prefix hits via num_computed_tokens,
+    # so trace synthesis no longer needs the flag.
+    del enable_prefix_caching
     synth_kwargs = dict(placement=placement, block_mode_on=block_mode_on, gate=gate,
-                        enable_prefix_caching=enable_prefix_caching, enable_attn_offloading=enable_attn_offloading,
+                        enable_attn_offloading=enable_attn_offloading,
                         power_model=power_model, pim_model=pim_model, fp=fp,
                         variant=variant, kv_cache_dtype=kv_cache_dtype,
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
@@ -1611,126 +1617,76 @@ def _attn_load_balancer(requests, tp_size, pim_channels=0, channel_split=1):
 
 
 # ======================================================================
-# _make_sub_batch() — preserved exactly
+# _make_sub_batch() — chunked-prefill aware sub-batch split
 # ======================================================================
 
 # spliting one batch into sub-batches to do sub-batch interleaving while using PIM
-def _make_sub_batch(batch, enable_prefix_caching=False):
+def _make_sub_batch(batch):
     if len(batch.requests) == 1:
         return [batch]
 
-    # Copy & sort by input length (descending) for greedy assignment
-    reqs = batch.requests[:]
-    reqs = sorted(reqs, key=lambda x: x.input, reverse=True)
+    # scheduler attaches per-request chunk sizes; honor them so chunked-prefill
+    # later chunks (is_init=False but still is_prefill()) and prefix-cached
+    # tokens are accounted for correctly (chunk_size already excludes hits via
+    # num_computed_tokens).
+    sched = getattr(batch, 'scheduled_tokens', {}) or {}
 
-    # Two sub-batches as lists
-    req1, req2 = [], []
+    def compute_tokens(req):
+        if req.is_prefill():
+            return sched.get(req.id, max(1, req.original_input - req.num_computed_tokens))
+        return 1
 
-    # Track loads
+    # Greedy split: longest per-iteration compute first, assign to lighter side.
+    reqs = sorted(batch.requests, key=compute_tokens, reverse=True)
+    req_groups = [[], []]
     loads = [0, 0]
-
-    # Greedy split: each req goes to the sub-batch with less load for its type
     for req in reqs:
-        if req.is_init:
-            # Effective prefill length with optional prefix caching
-            if enable_prefix_caching and req.prefix_cache_hit > 0:
-                # Use only the non-hit part of the prefix as actual prefill load
-                hit = req.prefix_cache_hit
-                effective_len = max(0, req.input - hit)
+        target = 0 if loads[0] <= loads[1] else 1
+        loads[target] += compute_tokens(req)
+        req_groups[target].append(req)
+
+    sub_batches = []
+    for i, sub_reqs in enumerate(req_groups):
+        sub_reqs.sort(key=lambda r: r.arrival)
+
+        total_len = 0
+        kv_len = 0
+        num_prefill = 0
+        num_decode = 0
+        q_list = []
+        k_list = []
+        prefill_q_list = []
+        prefill_k_list = []
+        decode_k_list = []
+
+        for req in sub_reqs:
+            if req.is_prefill():
+                chunk = compute_tokens(req)
+                total_len += chunk
+                q_list.append(chunk)
+                prefill_q_list.append(chunk)
+                # KV already in cache from prior chunks plus any prefix-cache hit.
+                prefill_k_list.append(req.num_computed_tokens)
+                num_prefill += 1
             else:
-                effective_len = req.input
+                total_len += 1
+                q_list.append(1)
+                kv_len += req.num_computed_tokens
+                decode_k_list.append(req.num_computed_tokens)
+                num_decode += 1
+            k_list.append(req.num_computed_tokens)
 
-            # Choose sub-batch with lower prefill load
-            target = 0 if loads[0] <= loads[1] else 1
-            loads[target] += effective_len
-        else:
-            # Decode request => choose sub-batch with lower decode load
-            # (1 token per step, or adjust if you use another cost model)
-            target = 0 if loads[0] <= loads[1] else 1
-            loads[target] += req.input
+        # evict/load are counted once for the original batch; attach to sub-batch 0 only.
+        evict, load = (batch.evict, batch.load) if i == 0 else (0, 0)
+        sub = Batch(
+            batch.batch_id, batch.model,
+            total_len, kv_len,
+            q_list, k_list, num_prefill,
+            num_decode, prefill_q_list,
+            prefill_k_list, decode_k_list,
+            0, 0, evict, load,
+        )
+        sub.requests.extend(sub_reqs)
+        sub_batches.append(sub)
 
-        # Attach request into chosen sub-batch
-        if target == 0:
-            req1.append(req)
-        else:
-            req2.append(req)
-
-    # Sort each sub-batch by arrival time
-    req1 = sorted(req1, key=lambda x: x.arrival)
-    req2 = sorted(req2, key=lambda x: x.arrival)
-
-    total_len = 0
-    kv_len = 0
-    hit_len = 0
-    num_prefill = 0
-    num_decode = 0
-    q_list = []
-    k_list = []
-    prefill_q_list = []
-    prefill_k_list = []
-    decode_k_list = []
-
-    for req in req1:
-        if req.is_init:
-            total_len += req.input
-            if enable_prefix_caching and req.prefix_cache_hit > 0:
-                hit_len += req.prefix_cache_hit
-            q_list.append(max(req.input - req.prefix_cache_hit, 1))
-            num_prefill += 1
-            prefill_q_list.append(max(req.input - req.prefix_cache_hit, 1))
-            prefill_k_list.append(0)
-        else:
-            total_len += 1
-            q_list.append(1)
-            num_decode += 1
-            kv_len += req.input
-            decode_k_list.append(req.input)
-        k_list.append(req.input)
-
-    batch1 = Batch(
-        batch.batch_id, batch.model,
-        total_len, kv_len, hit_len,
-        q_list, k_list, num_prefill,
-        num_decode, prefill_q_list,
-        prefill_k_list, decode_k_list,
-        0, 0, batch.evict, batch.load
-    )
-    batch1.requests.extend(req1)
-
-    total_len = 0
-    kv_len = 0
-    hit_len = 0
-    num_prefill = 0
-    num_decode = 0
-    q_list = []
-    k_list = []
-
-    for req in req2:
-        if req.is_init:
-            total_len += req.input
-            if enable_prefix_caching and req.prefix_cache_hit > 0:
-                hit_len += req.prefix_cache_hit
-            q_list.append(max(req.input - req.prefix_cache_hit, 1))
-            num_prefill += 1
-            prefill_q_list.append(max(req.input - req.prefix_cache_hit, 1))
-            prefill_k_list.append(0)
-        else:
-            total_len += 1
-            q_list.append(1)
-            num_decode += 1
-            kv_len += req.input
-            decode_k_list.append(req.input)
-        k_list.append(req.input)
-
-    # KV cache is just handled once
-    batch2 = Batch(
-        batch.batch_id, batch.model,
-        total_len, kv_len, hit_len,
-        q_list, k_list, num_prefill,
-        num_decode, prefill_q_list,
-        prefill_k_list, decode_k_list,
-        0, 0, 0, 0
-    )
-    batch2.requests.extend(req2)
-
-    return [batch1, batch2]
+    return sub_batches
