@@ -1,0 +1,55 @@
+{
+    "num_nodes": 2,
+    "link_bw": 100,
+    "link_latency": 1000,
+    "nodes": [
+        {
+            "num_instances": 1,
+            "cpu_mem": {
+                "mem_size": 2048,
+                "mem_bw": 256,
+                "mem_latency": 0
+            },
+            "instances": [
+                {
+                    "model_name": "deepseek-ai/DeepSeek-R1",
+                    "hardware": "H200",
+                    "npu_mem": {
+                        "mem_size": 141,
+                        "mem_bw": 4800,
+                        "mem_latency": 0
+                    },
+                    "num_npus": 8,
+                    "tp_size": 8,
+                    "ep_size": 16,
+                    "dp_group": "A",
+                    "pd_type": null
+                }
+            ]
+        },
+        {
+            "num_instances": 1,
+            "cpu_mem": {
+                "mem_size": 2048,
+                "mem_bw": 256,
+                "mem_latency": 0
+            },
+            "instances": [
+                {
+                    "model_name": "deepseek-ai/DeepSeek-R1",
+                    "hardware": "H200",
+                    "npu_mem": {
+                        "mem_size": 141,
+                        "mem_bw": 4800,
+                        "mem_latency": 0
+                    },
+                    "num_npus": 8,
+                    "tp_size": 8,
+                    "ep_size": 16,
+                    "dp_group": "A",
+                    "pd_type": null
+                }
+            ]
+        }
+    ]
+}
