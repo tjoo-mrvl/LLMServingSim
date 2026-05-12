@@ -110,6 +110,7 @@ class TraceCtx:
     tp_dim: list       # involved_dim for TP collectives (ALLREDUCE), None = all dims
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
+    first_k_dense_replace: int  # DeepSeek-V3-style hybrid MoE: layers [0, first_k_dense_replace) run mlp_dense, the rest run mlp_moe. 0 disables (use is_moe flag globally).
 
 
 @dataclass
@@ -852,6 +853,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pim_config = pim_model.get_config()
         pim_channels = int(pim_config["mem_size"] // pim_config["dimm_size"])
 
+    first_k_dense_replace = int(config.get('first_k_dense_replace', 0) or 0)
+
     return TraceCtx(
         hardware=hardware, model=model, config=config, perf_db=perf_db,
         node_id=node_id,
@@ -862,6 +865,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+        first_k_dense_replace=first_k_dense_replace,
     )
 
 
@@ -1182,8 +1186,11 @@ def _emit_post_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_id_str,
     # Attention post-processing common to dense and MoE.
     _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, "post_attn"),
                    lines, power_acc, batch_tag)
-    # MLP: either the dense FFN stack or a single MoE block.
-    if ctx.is_moe:
+    # MLP: either the dense FFN stack or a single MoE block. Hybrid
+    # models (DeepSeek-V3) keep the first ``first_k_dense_replace``
+    # layers dense and only run the MoE block from that index onward.
+    use_moe = ctx.is_moe and layer_num >= ctx.first_k_dense_replace
+    if use_moe:
         moe_seq = _sequence(ctx.perf_db, "mlp_moe")
         for layer_name in moe_seq:
             if layer_name == "moe":
@@ -1313,7 +1320,11 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
 
         # Transformer blocks
         num_layers = config['num_hidden_layers']
-        iter_count, copy_count = (num_layers, 1) if block_mode_on else (1, num_layers)
+        # Hybrid FFN models (DeepSeek-V3) must iterate every layer so
+        # the dense/MoE dispatch in _emit_post_attn_layers actually
+        # produces both block kinds — block_copy is unsafe here.
+        hybrid_ffn = ctx.first_k_dense_replace > 0
+        iter_count, copy_count = (num_layers, 1) if (block_mode_on or hybrid_ffn) else (1, num_layers)
 
         for layer_num in range(iter_count):
             block_lines, block_power = _build_transformer_block(ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
@@ -1321,8 +1332,15 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
             # MoE blocks are only safely replayable when the router
             # opts into block copy (BALANCED is deterministic; others
             # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
+            # for the sake of trace-generation speed). Hybrid models
+            # (DeepSeek-V3 with first_k_dense_replace>0) have a different
+            # MLP stack on the early layers, so block-copying the first
+            # block to all layers is structurally wrong — disable it.
+            can_copy = (
+                (not ctx.is_moe or ctx.gate.block_copy)
+                and not block_mode_on
+                and ctx.first_k_dense_replace == 0
+            )
             if can_copy:
                 for _ in range(copy_count):
                     f.writelines(block_lines)
@@ -1391,7 +1409,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 
         # MIDDLE LAYERS: interleaved post_attn + pre_attn
         middle_layers = num_layers - 1
-        iter_count, copy_count = (middle_layers, 1) if block_mode_on else (1, middle_layers)
+        hybrid_ffn = ctx.first_k_dense_replace > 0
+        iter_count, copy_count = (middle_layers, 1) if (block_mode_on or hybrid_ffn) else (1, middle_layers)
 
         for layer_num in range(iter_count):
             block_lines = []
@@ -1408,8 +1427,14 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
             # MoE blocks are only safely replayable when the router
             # opts into block copy (BALANCED is deterministic; others
             # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
+            # for the sake of trace-generation speed). Hybrid models
+            # (DeepSeek-V3) disable block_copy because the first
+            # ``first_k_dense_replace`` layers run a different MLP.
+            can_copy = (
+                (not ctx.is_moe or ctx.gate.block_copy)
+                and not block_mode_on
+                and ctx.first_k_dense_replace == 0
+            )
             if can_copy:
                 for _ in range(copy_count):
                     f.writelines(block_lines)
