@@ -43,7 +43,20 @@ class MemoryModel():
         # Accept either the Mistral-style ``num_local_experts`` or the
         # HF/Qwen-style ``num_experts`` key — profiler configs track
         # upstream HF naming which varies per family.
-        self.is_moe = 'num_local_experts' in self.config or 'num_experts' in self.config
+        self.is_moe = 'num_local_experts' in self.config or 'num_experts' in self.config or 'n_routed_experts' in self.config
+        # MLA (DeepSeek V2/V3): KV cache stores the compressed latent
+        # (kv_lora_rank + qk_rope_head_dim) per token instead of full
+        # num_kv_heads*head_dim. Detect via the presence of kv_lora_rank
+        # and cache the latent footprint for get_kv.
+        self.is_mla = 'kv_lora_rank' in self.config
+        if self.is_mla:
+            self.kv_lora_rank = int(self.config['kv_lora_rank'])
+            self.qk_rope_head_dim = int(self.config.get('qk_rope_head_dim', 0))
+            self.mla_latent_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        # DeepSeek-V3 / R1: layers [0, first_k_dense_replace) run plain
+        # MLP; the remaining MoE layers run DeepseekV2MoE. Tracked for
+        # the per-layer weight aggregation in get_weight().
+        self.first_k_dense_replace = int(self.config.get('first_k_dense_replace', 0))
 
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
 
@@ -101,7 +114,18 @@ class MemoryModel():
 
         _, embedding, _ = calculate_sizes(self.model, 'embedding', 1, parallel=tp, fp=fp)
         weight += embedding
-        weight += self._get_weight_per_block(tp, ep, fp) * self.n_layer
+        # Hybrid-FFN models (DeepSeek-V3) run a plain MLP for the first
+        # ``first_k_dense_replace`` layers and the MoE block for the rest.
+        # is_moe + first_k_dense_replace=0 collapses to "all MoE", which
+        # matches non-hybrid MoE families like Mixtral / Qwen3-MoE.
+        if self.is_moe and self.first_k_dense_replace > 0:
+            n_dense = self.first_k_dense_replace
+            n_moe = self.n_layer - n_dense
+            weight += self._get_weight_per_block(tp, ep, fp, mlp_type='dense') * n_dense
+            weight += self._get_weight_per_block(tp, ep, fp, mlp_type='moe') * n_moe
+        else:
+            mlp_type = 'moe' if self.is_moe else 'dense'
+            weight += self._get_weight_per_block(tp, ep, fp, mlp_type=mlp_type) * self.n_layer
         _, ln_f, _ = calculate_sizes(self.model, 'final_layernorm', 1, parallel=tp, fp=fp)
         weight += ln_f
         _, lm_head, _ = calculate_sizes(self.model, 'lm_head', 1, parallel=tp, fp=fp)
@@ -113,17 +137,31 @@ class MemoryModel():
         )
         return weight
 
-    def _get_weight_per_block(self, tp, ep, fp):
-        """Per-block weight: dense layers use TP, MoE experts use EP."""
+    def _get_weight_per_block(self, tp, ep, fp, mlp_type):
+        """Per-block weight: dense layers use TP, MoE experts use EP.
+
+        ``mlp_type`` selects whether this layer's MLP is the plain dense
+        FFN or the MoE block — needed for hybrid models (DeepSeek-V3)
+        where layer index decides.
+        """
         block_weight = 0
         _, ln_w, _ = calculate_sizes(self.model, 'layernorm', 1, parallel=tp, fp=fp)
         block_weight += ln_w  # input layernorm
-        _, qkv_w, _ = calculate_sizes(self.model, 'qkv_proj', 1, parallel=tp, fp=fp)
-        block_weight += qkv_w
-        _, o_w, _ = calculate_sizes(self.model, 'o_proj', 1, parallel=tp, fp=fp)
-        block_weight += o_w
+        if self.is_mla:
+            # MLA attention path: fused down-proj + Q/KV norms + B-projections + o_proj.
+            # Standard ``qkv_proj`` is replaced by the small fused A-projection
+            # and the two B-projections (Q and KV up-projections).
+            for ln in ('fused_qkv_a_proj', 'q_a_layernorm', 'q_b_proj',
+                       'kv_a_layernorm', 'kv_b_proj', 'o_proj'):
+                _, w, _ = calculate_sizes(self.model, ln, 1, parallel=tp, fp=fp)
+                block_weight += w
+        else:
+            _, qkv_w, _ = calculate_sizes(self.model, 'qkv_proj', 1, parallel=tp, fp=fp)
+            block_weight += qkv_w
+            _, o_w, _ = calculate_sizes(self.model, 'o_proj', 1, parallel=tp, fp=fp)
+            block_weight += o_w
         block_weight += ln_w  # post layernorm (same weight size)
-        if self.is_moe:
+        if mlp_type == 'moe':
             _, moe_w, _ = calculate_sizes(self.model, 'moe', 1, parallel=ep, fp=fp)
             block_weight += moe_w
         else:
@@ -138,6 +176,12 @@ class MemoryModel():
         # (kv_head, batch_size, n_embd//n_head, seq_len) per layer
         # return batch_size = 1 to caclulate max batch_size in scheduler
 
+        if self.is_mla:
+            # MLA caches a single per-token latent (kv_lora_rank +
+            # qk_rope_head_dim) shared by every head — vLLM stores it
+            # pre-``kv_b_proj`` and replicates it across TP ranks, so
+            # there's no division by num_npus and no factor of 2.
+            return self.mla_latent_dim * seq * self.n_layer * self.kv_fp
         # K & V multiply 2
         return 2 * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
     
@@ -646,10 +690,37 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     ffn_dim = config.get("intermediate_size", config.get("ffn_dim"))  # dense FFN dim
     moe_ffn_dim = config.get("moe_intermediate_size", ffn_dim)  # per-expert FFN dim (may differ from dense)
     # Same both-name fallback as MemoryModel.__init__ — HF / Qwen use
-    # ``num_experts`` while Mistral uses ``num_local_experts``.
+    # ``num_experts`` while Mistral uses ``num_local_experts``; DeepSeek
+    # uses ``n_routed_experts``.
     num_local_experts = config.get(
-        "num_local_experts", config.get("num_experts", 1)
+        "num_local_experts",
+        config.get("num_experts", config.get("n_routed_experts", 1)),
     )
+    n_shared_experts = int(config.get("n_shared_experts", 0) or 0)
+
+    # MLA (DeepSeek V2/V3) extras. ``q_total`` is the per-rank Q output
+    # of q_b_proj; ``v_total`` is the per-rank attention output that
+    # feeds o_proj. ``mla_latent_dim`` is the cached latent width.
+    is_mla = 'kv_lora_rank' in config
+    if is_mla:
+        kv_lora_rank = int(config['kv_lora_rank'])
+        q_lora_rank = int(config.get('q_lora_rank', 0)) or None
+        qk_nope_head_dim = int(config.get('qk_nope_head_dim', 0))
+        qk_rope_head_dim = int(config.get('qk_rope_head_dim', 0))
+        v_head_dim = int(config.get('v_head_dim', head_dim))
+        qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        q_total = n_head * qk_head_dim       # full Q output of q_b_proj
+        v_total = n_head * v_head_dim        # attention output dim (input to o_proj)
+        mla_latent_dim = kv_lora_rank + qk_rope_head_dim
+        a_proj_out = (q_lora_rank or 0) + mla_latent_dim
+    else:
+        kv_lora_rank = q_lora_rank = qk_nope_head_dim = qk_rope_head_dim = 0
+        v_head_dim = head_dim
+        qk_head_dim = head_dim
+        q_total = q_dim
+        v_total = q_dim
+        mla_latent_dim = 0
+        a_proj_out = 0
 
     p = max(int(parallel), 1)
 
@@ -684,7 +755,18 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         output_size = ((n_head // p) + (kv_head // p)) * length * head_dim * fp
 
     elif layer_name == "attention":
-        if not pim:
+        if is_mla:
+            # MLA: Q is (n_head * qk_head_dim) per rank, KV cache is the
+            # latent (kv_lora_rank + qk_rope_head_dim) per token —
+            # replicated across TP ranks (no // p), single buffer (no *2).
+            attn_len = length if not pim else 1
+            input_size = (
+                (n_head // p) * attn_len * qk_head_dim * fp +
+                mla_latent_dim * (kv_len if kv_len is not None else attn_len) * fp
+            )
+            weight_size = 0
+            output_size = (n_head // p) * attn_len * v_head_dim * fp
+        elif not pim:
             input_size = (
                 (n_head // p) * length * head_dim * fp +
                 (kv_head // p) * kv_len * head_dim * fp * 2
@@ -705,10 +787,47 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         weight_size = n_embd * ((q_dim + 2 * kv_dim) // p) * fp
         output_size = length * ((q_dim + 2 * kv_dim) // p) * fp
 
+    # ----------------- MLA A/B projections (DeepSeek V2/V3) -----------------
+    elif layer_name == "fused_qkv_a_proj":
+        # MergedColumnParallelLinear: 7168 → q_lora_rank + kv_lora_rank
+        # + qk_rope_head_dim, output split across TP.
+        input_size = length * n_embd * fp
+        weight_size = n_embd * (a_proj_out // p) * fp
+        output_size = length * (a_proj_out // p) * fp
+
+    elif layer_name == "q_a_layernorm":
+        input_size = length * (q_lora_rank or 0) * fp
+        weight_size = (q_lora_rank or 0) * fp
+        output_size = input_size
+
+    elif layer_name == "q_b_proj":
+        # ColumnParallelLinear: q_lora_rank → n_head * qk_head_dim,
+        # output split across TP.
+        input_size = length * (q_lora_rank or 0) * fp
+        weight_size = (q_lora_rank or 0) * (q_total // p) * fp
+        output_size = length * (q_total // p) * fp
+
+    elif layer_name == "kv_a_layernorm":
+        input_size = length * kv_lora_rank * fp
+        weight_size = kv_lora_rank * fp
+        output_size = input_size
+
+    elif layer_name == "kv_b_proj":
+        # ColumnParallelLinear: kv_lora_rank → n_head * (qk_nope + v).
+        kv_b_out = n_head * (qk_nope_head_dim + v_head_dim)
+        input_size = length * kv_lora_rank * fp
+        weight_size = kv_lora_rank * (kv_b_out // p) * fp
+        output_size = length * (kv_b_out // p) * fp
+
     elif layer_name == "o_proj":
-        input_size = length * (q_dim // p) * fp
-        weight_size = (q_dim // p) * n_embd * fp
-        output_size = length * n_embd * fp
+        if is_mla:
+            input_size = length * (v_total // p) * fp
+            weight_size = (v_total // p) * n_embd * fp
+            output_size = length * n_embd * fp
+        else:
+            input_size = length * (q_dim // p) * fp
+            weight_size = (q_dim // p) * n_embd * fp
+            output_size = length * n_embd * fp
 
     elif layer_name == "gate_up_proj":
         input_size = length * n_embd * fp
@@ -733,8 +852,14 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     elif layer_name == "moe":
         experts_per_rank = num_local_experts // p
         input_size = length * n_embd * fp
-        weight_size = (n_embd * num_local_experts * fp  # gate (replicated)
-                     + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp)  # local experts
+        # gate (replicated) + per-rank routed experts + replicated shared
+        # experts (DeepSeek-V3 has n_shared_experts=1; absent on other
+        # families). Shared experts share dims with routed experts but
+        # are NOT divided by EP.
+        shared_w = n_shared_experts * 3 * n_embd * moe_ffn_dim * fp
+        weight_size = (n_embd * num_local_experts * fp
+                     + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp
+                     + shared_w)
         output_size = length * n_embd * fp
 
     # ----------------- LM Head -----------------
