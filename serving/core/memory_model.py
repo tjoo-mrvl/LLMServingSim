@@ -13,8 +13,39 @@ class Device(Enum):
     CPU = 2
     CXL = 3
 
+
+# Bytes per element by weight-quantization scheme. Keys match vLLM's
+# ``--quantization`` choices and HF ``quantization_config.quant_method`` values.
+_QUANT_BYTES = {
+    'fp8': 1, 'fp8_e4m3': 1, 'fp8_e5m2': 1,
+    'int8': 1,
+    'int4': 0.5, 'awq': 0.5, 'gptq': 0.5,
+}
+
+
+def _resolve_weight_fp(act_fp, quantization, config=None):
+    """Pick bytes/element for the weight tensors of parameterised layers.
+
+    CLI ``--quantization`` wins; otherwise auto-detect from HF
+    ``quantization_config.quant_method``. Unknown / unset → no quantization
+    (weights kept at activation dtype). Block-scale overhead (e.g. bf16 scale
+    per ``weight_block_size`` tile) is ignored — for [128, 128] it adds
+    ~0.012% which is well below other sources of modelling error.
+    """
+    method = quantization
+    if method is None and isinstance(config, dict):
+        qcfg = config.get('quantization_config') or {}
+        if isinstance(qcfg, dict):
+            method = qcfg.get('quant_method')
+    if method in (None, 'none', 'auto'):
+        return act_fp
+    if method in _QUANT_BYTES:
+        return _QUANT_BYTES[method]
+    # Unknown scheme — fall back to activation dtype rather than guessing.
+    return act_fp
+
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, kv_cache_dtype='auto'):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, kv_cache_dtype='auto', quantization=None):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -25,13 +56,22 @@ class MemoryModel():
         self.cpu_mem = cpu_mem * GB_TO_BYTE # GB -> Byte
         self.cxl_mem = cxl_mem * GB_TO_BYTE
         self.block_size = block_size
-        self.fp = fp // 8 # bit -> byte of floating point
-        self.kv_fp = 1 if kv_cache_dtype == 'fp8' else self.fp  # KV cache bytes per element
+        # Activation / compute dtype in bytes (e.g. bf16 -> 2). `self.fp` kept
+        # for back-compat; downstream code that wants bytes-per-activation can
+        # use either name.
+        self.act_fp = fp // 8
+        self.fp = self.act_fp
+        self.kv_fp = 1 if kv_cache_dtype == 'fp8' else self.act_fp  # KV cache bytes per element
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
 
         self.config = get_config(model)
+        # Weight quantization: distinct from activation dtype. ``--quantization
+        # fp8`` (or HF config ``quantization_config.quant_method``) means GEMM
+        # weights are stored at 1 byte/element while activations stay at
+        # ``act_fp``. DeepSeek-R1 ships in this W8A16 fp8 scheme by default.
+        self.weight_fp = _resolve_weight_fp(self.act_fp, quantization, self.config)
         self.n_embd = self.config['hidden_size']
         self.n_layer = self.config['num_hidden_layers']
         self.n_head = self.config['num_attention_heads']
@@ -109,10 +149,11 @@ class MemoryModel():
         """Total per-GPU model weight in bytes."""
         tp = self.tp_size
         ep = self.ep_size
-        fp = self.fp
+        fp = self.act_fp
+        wfp = self.weight_fp
         weight = 0
 
-        _, embedding, _ = calculate_sizes(self.model, 'embedding', 1, parallel=tp, fp=fp)
+        _, embedding, _ = calculate_sizes(self.model, 'embedding', 1, parallel=tp, fp=fp, weight_fp=wfp)
         weight += embedding
         # Hybrid-FFN models (DeepSeek-V3) run a plain MLP for the first
         # ``first_k_dense_replace`` layers and the MoE block for the rest.
@@ -121,14 +162,14 @@ class MemoryModel():
         if self.is_moe and self.first_k_dense_replace > 0:
             n_dense = self.first_k_dense_replace
             n_moe = self.n_layer - n_dense
-            weight += self._get_weight_per_block(tp, ep, fp, mlp_type='dense') * n_dense
-            weight += self._get_weight_per_block(tp, ep, fp, mlp_type='moe') * n_moe
+            weight += self._get_weight_per_block(tp, ep, fp, wfp, mlp_type='dense') * n_dense
+            weight += self._get_weight_per_block(tp, ep, fp, wfp, mlp_type='moe') * n_moe
         else:
             mlp_type = 'moe' if self.is_moe else 'dense'
-            weight += self._get_weight_per_block(tp, ep, fp, mlp_type=mlp_type) * self.n_layer
-        _, ln_f, _ = calculate_sizes(self.model, 'final_layernorm', 1, parallel=tp, fp=fp)
+            weight += self._get_weight_per_block(tp, ep, fp, wfp, mlp_type=mlp_type) * self.n_layer
+        _, ln_f, _ = calculate_sizes(self.model, 'final_layernorm', 1, parallel=tp, fp=fp, weight_fp=wfp)
         weight += ln_f
-        _, lm_head, _ = calculate_sizes(self.model, 'lm_head', 1, parallel=tp, fp=fp)
+        _, lm_head, _ = calculate_sizes(self.model, 'lm_head', 1, parallel=tp, fp=fp, weight_fp=wfp)
         weight += lm_head
 
         self.logger.info(
@@ -137,15 +178,18 @@ class MemoryModel():
         )
         return weight
 
-    def _get_weight_per_block(self, tp, ep, fp, mlp_type):
+    def _get_weight_per_block(self, tp, ep, fp, wfp, mlp_type):
         """Per-block weight: dense layers use TP, MoE experts use EP.
 
         ``mlp_type`` selects whether this layer's MLP is the plain dense
         FFN or the MoE block — needed for hybrid models (DeepSeek-V3)
         where layer index decides.
+        ``wfp`` is the weight-quantized bytes/element used for GEMM weights;
+        layernorms keep ``fp`` (the activation dtype) since RMSNorm scales are
+        not quantized.
         """
         block_weight = 0
-        _, ln_w, _ = calculate_sizes(self.model, 'layernorm', 1, parallel=tp, fp=fp)
+        _, ln_w, _ = calculate_sizes(self.model, 'layernorm', 1, parallel=tp, fp=fp, weight_fp=wfp)
         block_weight += ln_w  # input layernorm
         if self.is_mla:
             # MLA attention path: fused down-proj + Q/KV norms + B-projections + o_proj.
@@ -153,21 +197,21 @@ class MemoryModel():
             # and the two B-projections (Q and KV up-projections).
             for ln in ('fused_qkv_a_proj', 'q_a_layernorm', 'q_b_proj',
                        'kv_a_layernorm', 'kv_b_proj', 'o_proj'):
-                _, w, _ = calculate_sizes(self.model, ln, 1, parallel=tp, fp=fp)
+                _, w, _ = calculate_sizes(self.model, ln, 1, parallel=tp, fp=fp, weight_fp=wfp)
                 block_weight += w
         else:
-            _, qkv_w, _ = calculate_sizes(self.model, 'qkv_proj', 1, parallel=tp, fp=fp)
+            _, qkv_w, _ = calculate_sizes(self.model, 'qkv_proj', 1, parallel=tp, fp=fp, weight_fp=wfp)
             block_weight += qkv_w
-            _, o_w, _ = calculate_sizes(self.model, 'o_proj', 1, parallel=tp, fp=fp)
+            _, o_w, _ = calculate_sizes(self.model, 'o_proj', 1, parallel=tp, fp=fp, weight_fp=wfp)
             block_weight += o_w
         block_weight += ln_w  # post layernorm (same weight size)
         if mlp_type == 'moe':
-            _, moe_w, _ = calculate_sizes(self.model, 'moe', 1, parallel=ep, fp=fp)
+            _, moe_w, _ = calculate_sizes(self.model, 'moe', 1, parallel=ep, fp=fp, weight_fp=wfp)
             block_weight += moe_w
         else:
-            _, ffn1_w, _ = calculate_sizes(self.model, 'gate_up_proj', 1, parallel=tp, fp=fp)
+            _, ffn1_w, _ = calculate_sizes(self.model, 'gate_up_proj', 1, parallel=tp, fp=fp, weight_fp=wfp)
             block_weight += ffn1_w
-            _, ffn2_w, _ = calculate_sizes(self.model, 'down_proj', 1, parallel=tp, fp=fp)
+            _, ffn2_w, _ = calculate_sizes(self.model, 'down_proj', 1, parallel=tp, fp=fp, weight_fp=wfp)
             block_weight += ffn2_w
         return block_weight
 
@@ -672,13 +716,24 @@ class MemoryModel():
 
         
 # calculate the per-rank input, weight, output size of each layer
-def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2):
+def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2, weight_fp=None):
     """Calculate input, weight, and output tensor sizes for a given layer.
 
     Args:
         parallel: parallelism degree for weight/activation sharding.
             For dense layers this is TP; for MoE experts this is EP.
+        fp: bytes per activation/compute element (bf16 -> 2, fp8 -> 1).
+            Used for input/output sizes, layernorm/embedding/router weights,
+            and unquantized parameters.
+        weight_fp: bytes per element for quantizable GEMM weights
+            (qkv_proj, o_proj, gate_up_proj, down_proj, MLA B-projections,
+            routed/shared experts, lm_head). When ``None`` (default), falls
+            back to ``fp`` — i.e. no weight quantization. Set to ``1`` for
+            fp8/int8, ``0.5`` for int4/AWQ/GPTQ. Modelling W8A16 (DeepSeek-R1):
+            ``fp=2, weight_fp=1``.
     """
+    if weight_fp is None:
+        weight_fp = fp
     config = get_config(model)
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
@@ -734,6 +789,8 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
 
     # ----------------- Embedding & Norms -----------------
     if layer_name == "embedding":
+        # VocabParallelEmbedding is a sparse lookup, not a GEMM; vLLM keeps it
+        # at compute dtype even under fp8/int8 quantization.
         input_size = length * fp * 2  # token_ids are int32 or int64
         weight_size = (vocab_size // p) * n_embd * fp
         output_size = length * n_embd * fp
@@ -784,7 +841,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     # ----------------- QKV Projection (fused) -----------------
     elif layer_name == "qkv_proj":
         input_size = length * n_embd * fp
-        weight_size = n_embd * ((q_dim + 2 * kv_dim) // p) * fp
+        weight_size = n_embd * ((q_dim + 2 * kv_dim) // p) * weight_fp
         output_size = length * ((q_dim + 2 * kv_dim) // p) * fp
 
     # ----------------- MLA A/B projections (DeepSeek V2/V3) -----------------
@@ -792,7 +849,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # MergedColumnParallelLinear: 7168 → q_lora_rank + kv_lora_rank
         # + qk_rope_head_dim, output split across TP.
         input_size = length * n_embd * fp
-        weight_size = n_embd * (a_proj_out // p) * fp
+        weight_size = n_embd * (a_proj_out // p) * weight_fp
         output_size = length * (a_proj_out // p) * fp
 
     elif layer_name == "q_a_layernorm":
@@ -804,7 +861,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # ColumnParallelLinear: q_lora_rank → n_head * qk_head_dim,
         # output split across TP.
         input_size = length * (q_lora_rank or 0) * fp
-        weight_size = (q_lora_rank or 0) * (q_total // p) * fp
+        weight_size = (q_lora_rank or 0) * (q_total // p) * weight_fp
         output_size = length * (q_total // p) * fp
 
     elif layer_name == "kv_a_layernorm":
@@ -816,22 +873,22 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # ColumnParallelLinear: kv_lora_rank → n_head * (qk_nope + v).
         kv_b_out = n_head * (qk_nope_head_dim + v_head_dim)
         input_size = length * kv_lora_rank * fp
-        weight_size = kv_lora_rank * (kv_b_out // p) * fp
+        weight_size = kv_lora_rank * (kv_b_out // p) * weight_fp
         output_size = length * (kv_b_out // p) * fp
 
     elif layer_name == "o_proj":
         if is_mla:
             input_size = length * (v_total // p) * fp
-            weight_size = (v_total // p) * n_embd * fp
+            weight_size = (v_total // p) * n_embd * weight_fp
             output_size = length * n_embd * fp
         else:
             input_size = length * (q_dim // p) * fp
-            weight_size = (q_dim // p) * n_embd * fp
+            weight_size = (q_dim // p) * n_embd * weight_fp
             output_size = length * n_embd * fp
 
     elif layer_name == "gate_up_proj":
         input_size = length * n_embd * fp
-        weight_size = n_embd * 2 * (ffn_dim // p) * fp
+        weight_size = n_embd * 2 * (ffn_dim // p) * weight_fp
         output_size = length * 2 * (ffn_dim // p) * fp
 
     elif layer_name == "act_fn":
@@ -841,7 +898,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
 
     elif layer_name == "down_proj":
         input_size = length * (ffn_dim // p) * fp
-        weight_size = (ffn_dim // p) * n_embd * fp
+        weight_size = (ffn_dim // p) * n_embd * weight_fp
         output_size = length * n_embd * fp
 
     elif layer_name == "sampler":
@@ -852,20 +909,20 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     elif layer_name == "moe":
         experts_per_rank = num_local_experts // p
         input_size = length * n_embd * fp
-        # gate (replicated) + per-rank routed experts + replicated shared
-        # experts (DeepSeek-V3 has n_shared_experts=1; absent on other
-        # families). Shared experts share dims with routed experts but
-        # are NOT divided by EP.
-        shared_w = n_shared_experts * 3 * n_embd * moe_ffn_dim * fp
-        weight_size = (n_embd * num_local_experts * fp
-                     + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp
-                     + shared_w)
+        # Router gate stays at compute dtype (replicated, not quantized in
+        # vLLM's fp8 scheme). Routed experts and replicated shared experts
+        # (DeepSeek-V3, n_shared_experts=1) use ``weight_fp``. Shared experts
+        # share dims with routed experts but are NOT divided by EP.
+        gate_w = n_embd * num_local_experts * fp
+        routed_w = experts_per_rank * 3 * n_embd * moe_ffn_dim * weight_fp
+        shared_w = n_shared_experts * 3 * n_embd * moe_ffn_dim * weight_fp
+        weight_size = gate_w + routed_w + shared_w
         output_size = length * n_embd * fp
 
     # ----------------- LM Head -----------------
     elif layer_name == "lm_head":
         input_size = length * n_embd * fp
-        weight_size = n_embd * (vocab_size // p) * fp
+        weight_size = n_embd * (vocab_size // p) * weight_fp
         output_size = length * (vocab_size // p) * fp
 
     else:

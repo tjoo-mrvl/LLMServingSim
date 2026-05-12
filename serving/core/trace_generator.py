@@ -4,7 +4,7 @@ from .request import *
 from .utils import *
 import pandas as pd
 import yaml
-from .memory_model import calculate_sizes
+from .memory_model import calculate_sizes, _resolve_weight_fp
 from .gate_function import GateRouter
 from .config_builder import get_device
 from .power_model import PowerModel, total_ring_data
@@ -91,7 +91,8 @@ class TraceCtx:
     config: dict
     perf_db: dict
     node_id: int
-    fp: int
+    fp: int                # bytes per activation element (compute dtype)
+    weight_fp: int         # bytes per element for quantizable GEMM weights (W8A16 fp8 -> 1)
     placement: dict
     gate: object  # GateRouter or None
     enable_attn_offloading: bool
@@ -830,7 +831,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                     tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                     tp_dim=None, ep_dim=None, dp_sum_total_len=0, weight_fp=None):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -854,11 +855,15 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pim_channels = int(pim_config["mem_size"] // pim_config["dimm_size"])
 
     first_k_dense_replace = int(config.get('first_k_dense_replace', 0) or 0)
+    # Default weight_fp to activation dtype so unquantized callers behave
+    # exactly as before (no change to weight_size in the emitted trace).
+    if weight_fp is None:
+        weight_fp = fp
 
     return TraceCtx(
         hardware=hardware, model=model, config=config, perf_db=perf_db,
         node_id=node_id,
-        fp=fp, placement=placement, gate=gate,
+        fp=fp, weight_fp=weight_fp, placement=placement, gate=gate,
         enable_attn_offloading=enable_attn_offloading,
         power_model=power_model, pim_model=pim_model, pim_channels=pim_channels,
         n_head=n_head, kv_head=kv_head, head_dim=head_dim, is_moe=is_moe,
@@ -950,10 +955,10 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
         kv_len_for_sizes = bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean
         inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
                                        kv_len=kv_len_for_sizes,
-                                       parallel=ctx.tp_size, fp=ctx.fp)
+                                       parallel=ctx.tp_size, fp=ctx.fp, weight_fp=ctx.weight_fp)
     else:
         inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
-                                       parallel=ctx.tp_size, fp=ctx.fp)
+                                       parallel=ctx.tp_size, fp=ctx.fp, weight_fp=ctx.weight_fp)
 
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
 
@@ -1084,7 +1089,7 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
         if local_tokens > 0:
             rank_latency_ns = _lookup_moe(ctx.perf_db, local_tokens, max(activated_experts, 1))
             rank_inp, rank_wt, rank_out = calculate_sizes(
-                ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp)
+                ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp, weight_fp=ctx.weight_fp)
             max_rank_latency_ns = max(max_rank_latency_ns, rank_latency_ns)
 
             lines.append(formatter("expert", str(rank_latency_ns), 'LOCAL', str(rank_inp),
@@ -1250,7 +1255,7 @@ def _emit_final_layers(ctx, bctx, f, batch_tag='NONE'):
             lat = _layer_latency_for_power(ctx, bctx, layer_name)
             ctx.power_model.add_npu_active_energy_consumption(ctx.hardware, ctx.node_id, lat, num_npus=ctx.tp_size)
             if get_device(ctx.placement, None, layer_name, "weights") != 'LOCAL':
-                _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, parallel=ctx.tp_size, fp=ctx.fp)
+                _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, parallel=ctx.tp_size, fp=ctx.fp, weight_fp=ctx.weight_fp)
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 
 
@@ -1290,7 +1295,7 @@ def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
             ctx.power_model.add_npu_active_energy_consumption(
                 ctx.hardware, ctx.node_id, lat, num_npus=ctx.tp_size)
             if get_device(ctx.placement, None, layer_name, "weights") != 'LOCAL':
-                _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, fp=ctx.fp)
+                _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, fp=ctx.fp, weight_fp=ctx.weight_fp)
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 
 
@@ -1299,13 +1304,14 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       enable_prefix_caching, enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                      tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                      tp_dim=None, ep_dim=None, dp_sum_total_len=0, weight_fp=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                           weight_fp=weight_fp)
     bctx = _build_batch_ctx(batch, ctx, enable_prefix_caching)
 
     logger.info(
@@ -1363,13 +1369,14 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   enable_prefix_caching, enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0, weight_fp=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                           weight_fp=weight_fp)
     bctx1 = _build_batch_ctx(batches[0], ctx, enable_prefix_caching)
     bctx2 = _build_batch_ctx(batches[1], ctx, enable_prefix_caching)
 
@@ -1471,11 +1478,12 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True):
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, quantization=None):
 
     model = batch.model
     config = get_config(model)
     fp = fp // 8  # bit -> byte of floating point
+    weight_fp = _resolve_weight_fp(fp, quantization, config)
     max_len = min(max_num_batched_tokens, config['max_position_embeddings'])
     variant = resolve_variant(dtype, kv_cache_dtype, config)
 
@@ -1513,7 +1521,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         variant=variant, kv_cache_dtype=kv_cache_dtype,
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
-                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                        weight_fp=weight_fp)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:

@@ -149,6 +149,16 @@ def main():
                         help='logging verbosity: WARNING (minimal), INFO (per-iteration details), DEBUG (per-layer memory)')
     parser.add_argument('--kv-cache-dtype', type=str, choices=['auto', 'fp8'], default='auto',
                         help='KV cache data type: auto (use default profile.csv) or fp8 (use profile_fp8.csv, halves KV cache memory)')
+    parser.add_argument('--quantization', type=str,
+                        choices=['none', 'fp8', 'int8', 'int4', 'awq', 'gptq'],
+                        default=None,
+                        help='Weight quantization scheme (vLLM-style). Distinct '
+                        'from --dtype: weights are stored at the quantized '
+                        'width while activations stay at --dtype. When omitted, '
+                        'auto-detects from the model config\'s '
+                        'quantization_config.quant_method (DeepSeek-R1 ships '
+                        'with quant_method=fp8). Pass "none" to force '
+                        'unquantized weights even when the config requests fp8.')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
 
@@ -208,6 +218,9 @@ def main():
     log_interval=args.log_interval
     network_backend = args.network_backend
     kv_cache_dtype = args.kv_cache_dtype
+    # 'none' is the CLI escape hatch for "ignore the model config" — internally
+    # it collapses to ``None`` so MemoryModel skips the auto-detect path too.
+    quantization = None if args.quantization in (None, 'none') else args.quantization
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(astra_sim, args.cluster_config, args.enable_local_offloading, args.enable_attn_offloading)
     num_nodes = cluster["num_nodes"]
@@ -322,6 +335,7 @@ def main():
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
             kv_cache_dtype=kv_cache_dtype,
+            quantization=quantization,
         ))
 
     # Controller for astra-sim process communication
@@ -510,7 +524,8 @@ def main():
                                        power_model, pim_models[nid],
                                        enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
-                                       dp_sum_total_len=sum_total_len, enable_block_copy=enable_block_copy)
+                                       dp_sum_total_len=sum_total_len, enable_block_copy=enable_block_copy,
+                                       quantization=quantization)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id], enable_local_offloading,
                                        workload_name=dp_workload_name)
@@ -565,7 +580,8 @@ def main():
                                            power_model, pim_models[nid],
                                            enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
-                                           dp_sum_total_len=sum_total_len, enable_block_copy=enable_block_copy)
+                                           dp_sum_total_len=sum_total_len, enable_block_copy=enable_block_copy,
+                                           quantization=quantization)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id], enable_local_offloading,
                                            workload_name=dp_workload_name)
@@ -589,7 +605,8 @@ def main():
                                    node_id, instance_id, max_num_batched_tokens, max_num_seqs, placement[instance_id], block_mode_on[instance_id],
                                    expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id],
                                    enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
-                                   enable_block_copy=enable_block_copy)
+                                   enable_block_copy=enable_block_copy,
+                                   quantization=quantization)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id], enable_local_offloading)
                     workload = get_workload(new_req, instance["hardware"], instance_id)

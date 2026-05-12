@@ -19,7 +19,7 @@ class Scheduler:
                  num_npus, tp_size, pp_size, npu_mem, cpu_mem,
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
-                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto'):
+                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto', quantization=None):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -45,7 +45,7 @@ class Scheduler:
         self.batch_ids = -1
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, kv_cache_dtype=kv_cache_dtype)
+        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, kv_cache_dtype=kv_cache_dtype, quantization=quantization)
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
