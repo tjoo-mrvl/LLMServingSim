@@ -165,6 +165,23 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
                         "and only shots whose keys aren't already in the CSV "
                         "get fired. Applies to every category plus skew.")
 
+    # hf_overrides: forwarded verbatim to vllm.LLM(hf_overrides=...) on top
+    # of HOST_ENGINE_DEFAULTS (num_hidden_layers=1) and the per-TP shard
+    # rewrites. Needed for hybrid-FFN models — e.g. DeepSeek-V3 / R1, which
+    # require `--hf-overrides '{"num_hidden_layers": 2, "first_k_dense_replace": 1}'`
+    # so the single profile run materialises both a dense and an MoE layer.
+    p.add_argument(
+        "--hf-overrides",
+        dest="hf_overrides",
+        type=str,
+        default=None,
+        help="JSON string of extra hf_overrides forwarded to vLLM. Merged on "
+             "top of the profiler's defaults (num_hidden_layers=1) and the "
+             "per-TP shard rewrites. Example: "
+             '\'{"num_hidden_layers": 2, "first_k_dense_replace": 1}\' '
+             "for hybrid dense+MoE models like DeepSeek-V3.",
+    )
+
     # Output root.
     p.add_argument(
         "--out-root",
@@ -332,9 +349,23 @@ def _build_profile_args(
         skew_kvs_factor=getattr(ns, "skew_kvs_factor", 2.0),
         only_skew=getattr(ns, "only_skew", False),
         force=getattr(ns, "force", False),
-        hf_overrides=None,
+        hf_overrides=_parse_hf_overrides(getattr(ns, "hf_overrides", None)),
         model_config=model_config,
     )
+
+
+def _parse_hf_overrides(raw: str | None) -> dict | None:
+    """Decode the --hf-overrides JSON blob (None if unset)."""
+    if raw is None:
+        return None
+    import json
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"--hf-overrides must be valid JSON: {e}")
+    if not isinstance(parsed, dict):
+        raise SystemExit("--hf-overrides must decode to a JSON object")
+    return parsed
 
 
 # ---------------------------------------------------------------------------
