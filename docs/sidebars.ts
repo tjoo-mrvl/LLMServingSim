@@ -108,6 +108,7 @@ const sidebars: SidebarsConfig = {
         'profiler/skew-alpha-fit',
         'profiler/adding-hardware',
         'profiler/adding-model-architecture',
+        'profiler/deepseek-v4-support',
       ],
     },
     {
