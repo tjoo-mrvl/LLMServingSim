@@ -15,6 +15,16 @@
 #
 # The official vllm/vllm-openai image already provides vllm, pydantic,
 # pyyaml, rich, and huggingface_hub — no extra pip installs required.
+#
+# vLLM version: v0.20.2 is the active pin. v0.20.0 was the first
+# release with DeepSeek-V4 (``deepseek_v4.py`` + ``deepseek_v4_attention.py``)
+# in ``vllm/model_executor/models/``; v0.20.2 has the bug-fix cycles
+# since. If you change this, also re-validate
+# ``profiler/core/hooks/moe_hook.py`` — the MoE forced-routing hook
+# patches a method on ``FusedMoE`` whose name has changed across
+# versions (``forward_native`` on v0.19.x, ``forward`` on v0.20.x; the
+# hook auto-detects, but a future refactor of the router internals may
+# break the deeper ``select_experts``/``_compute_routing`` patches).
 
 set -euo pipefail
 
@@ -31,5 +41,5 @@ docker run --name vllm_docker \
   --shm-size=16g \
   -w /workspace \
   --entrypoint /bin/bash \
-  vllm/vllm-openai:v0.19.0 \
+  vllm/vllm-openai:v0.20.2 \
   -c "pip install datasets matplotlib && exec bash"

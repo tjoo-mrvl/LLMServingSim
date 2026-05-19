@@ -11,16 +11,22 @@ This module provides:
   that would force a given number of experts to be activated over a
   given number of tokens.
 
-* ``force_moe_routing``: a context manager that monkey-patches
-  ``FusedMoE.forward_native`` for the duration of the block so that
-  ``self.router.select_experts`` returns our forged tensors instead
-  of whatever the actual learned gate produces. The patch is
+* ``force_moe_routing``: a context manager that monkey-patches the
+  active FusedMoE forward method (``forward_native`` on vLLM ≤
+  v0.19.x, ``forward`` on vLLM ≥ v0.20.0 after the
+  ``forward_native``/``forward_cuda`` consolidation) for the duration
+  of the block so that ``self.router.select_experts`` returns our
+  forged tensors instead of whatever the actual learned gate produces.
+  The method name is picked at runtime via ``hasattr``. The patch is
   reverted on exit.
 
-The patch targets (``FusedMoE.forward_native`` and
-``self.router.select_experts`` / ``self.router._compute_routing``)
-are internal vLLM APIs. A vLLM version bump may require updating the
-monkey-patch to match renamed or restructured symbols.
+The patched symbols are internal vLLM APIs: the FusedMoE forward and
+``self.router.select_experts`` / ``self.router._compute_routing``. A
+vLLM bump that goes further than the v0.20 forward consolidation
+(e.g., a router class refactor that drops ``_compute_routing``) will
+require updating ``force_moe_routing``. The hook raises a clear
+``RuntimeError`` when the router doesn't expose the expected internals,
+pointing at where to look.
 """
 
 from __future__ import annotations
@@ -145,7 +151,16 @@ def _cycle_expert_ids(
 
 @contextmanager
 def force_moe_routing(route: ExpertRoute | None) -> Iterator[None]:
-    """Patch ``FusedMoE.forward_native`` to use ``route`` when called.
+    """Patch ``FusedMoE``'s forward method to use ``route`` when called.
+
+    Targets ``forward_native`` on vLLM ≤ v0.19.x and the consolidated
+    ``forward`` on vLLM ≥ v0.20.0 (which collapsed
+    ``forward_native``/``forward_cuda`` into a single dispatch). The
+    name is picked at runtime via ``hasattr`` so the hook supports both
+    eras without a hard version pin. The wrapped signature uses
+    ``*args, **kwargs`` to pass through whichever positional/keyword
+    arguments the active vLLM version expects (v0.20.x added an
+    ``input_ids`` parameter).
 
     If ``route`` is None the function is a no-op (useful for dense
     profile categories where we still pass through the MoE-aware
@@ -166,15 +181,23 @@ def force_moe_routing(route: ExpertRoute | None) -> Iterator[None]:
     # cost just to read this module.
     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
-    original_forward_native = FusedMoE.forward_native
+    # Pick the right method name for the active vLLM version.
+    # v0.19.0 and earlier: forward_native (+ forward_cuda delegates to it).
+    # v0.20.0+: forward (the two variants were consolidated; runner.forward
+    # is dispatched to internally).
+    if hasattr(FusedMoE, 'forward_native'):
+        target_method = 'forward_native'
+    else:
+        target_method = 'forward'
+    original_forward = getattr(FusedMoE, target_method)
 
-    @wraps(original_forward_native)
-    def hooked_forward_native(self, hidden_states, router_logits):
+    @wraps(original_forward)
+    def hooked_forward(self, hidden_states, router_logits, *args, **kwargs):
         # Only patch the specific layer we care about. Any other
         # FusedMoE encountered during this forward pass uses its
         # normal routing.
         if self.layer_name != route.layer_name:
-            return original_forward_native(self, hidden_states, router_logits)
+            return original_forward(self, hidden_states, router_logits, *args, **kwargs)
 
         # We also sanity-check that our forged topk_ids matches the
         # actual per-call token count. If hidden_states is padded
@@ -192,25 +215,32 @@ def force_moe_routing(route: ExpertRoute | None) -> Iterator[None]:
         # than swapping select_experts wholesale because
         # select_experts does normalization / validation around
         # _compute_routing that we still want to run.
+        if not hasattr(self.router, 'select_experts') or not hasattr(self.router, '_compute_routing'):
+            raise RuntimeError(
+                f"MoE forced-routing patch requires "
+                f"self.router.select_experts and self.router._compute_routing "
+                f"on the FusedMoE layer's router (got {type(self.router).__name__}). "
+                f"vLLM may have refactored the router API — update moe_hook.py "
+                f"to match the new internals. See "
+                f"vllm/model_executor/layers/fused_moe/router/ for the current "
+                f"router class hierarchy."
+            )
         original_select_experts = self.router.select_experts
         original_compute_routing = self.router._compute_routing
 
         @wraps(original_select_experts)
-        def hooked_select_experts(*args, **kwargs):
+        def hooked_select_experts(*sargs, **skwargs):
             @wraps(original_compute_routing)
-            def forced_compute_routing(
-                _hidden_states: torch.Tensor,
-                _router_logits: torch.Tensor,
-                _indices_type: torch.dtype | None,
-            ):
+            def forced_compute_routing(*cargs, **ckwargs):
                 # Args are deliberately ignored — the whole point of
                 # forced routing is that we return pre-forged values
-                # regardless of the learned gate's logits.
+                # regardless of the learned gate's logits. Signature
+                # accepts whatever the active router version passes.
                 return route.weights, route.ids
 
             self.router._compute_routing = forced_compute_routing
             try:
-                return original_select_experts(*args, **kwargs)
+                return original_select_experts(*sargs, **skwargs)
             finally:
                 # Always restore _compute_routing, even if select_experts
                 # raises (otherwise subsequent MoE calls in the same
@@ -219,17 +249,17 @@ def force_moe_routing(route: ExpertRoute | None) -> Iterator[None]:
 
         self.router.select_experts = hooked_select_experts
         try:
-            return original_forward_native(self, hidden_states, router_logits)
+            return original_forward(self, hidden_states, router_logits, *args, **kwargs)
         finally:
             self.router.select_experts = original_select_experts
 
-    FusedMoE.forward_native = hooked_forward_native
+    setattr(FusedMoE, target_method, hooked_forward)
     try:
         yield
     finally:
         # Restore the original class method so future calls (in tests,
         # or after this profile session ends) behave normally.
-        FusedMoE.forward_native = original_forward_native
+        setattr(FusedMoE, target_method, original_forward)
 
 
 # ---------------------------------------------------------------------------
