@@ -196,9 +196,12 @@ class Scheduler:
                 gen_req[-1].evict = True
                 self.logger.info("Eviction of the request #%d", gen_req[-1].id)
                 gen_req = gen_req[:-1]
-                # spill to cpu (host) memory
+                # spill to cpu (host) memory. get_evict_kv returns per-rank
+                # bytes; cpu_used is tracked in full-cluster bytes (matches
+                # MemoryModel.apply_kv_cache_events convention), so scale by
+                # num_npus when crossing the NPU->CPU boundary.
                 self.memory.free(evict_size, Device.NPU)
-                self.memory.allocate(evict_size, Device.CPU)
+                self.memory.allocate(evict_size * self.num_npus, Device.CPU)
 
                 if len(gen_req) < batch_len:
                     batch_len = len(gen_req)
@@ -234,9 +237,10 @@ class Scheduler:
             if kv_size > 0:
                 self.memory.allocate(kv_size, Device.NPU)
             
-            # load memory from cpu (host)
+            # load memory from cpu (host); see offload comment above —
+            # load_size is per-rank, cpu_used is full-cluster.
             if load_size > 0:
-                self.memory.free(load_size, Device.CPU)
+                self.memory.free(load_size * self.num_npus, Device.CPU)
             
             # ============ STEP 5: Build batch with lists ============
             total_len = 0
