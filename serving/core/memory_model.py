@@ -592,20 +592,24 @@ class MemoryModel():
         # if npu_byte_free > 0:
         #     self.free(npu_byte_free, Device.NPU)
 
-        if not self.enable_prefix_sharing and self.prefix_storage is Device.CPU:
+        # Second-tier (CPU/CXL) prefix cache events.
+        if self.prefix_storage is None:
+            return
+
+        if self.prefix_storage is Device.CPU and not self.enable_prefix_sharing:
+            # Non-shared CPU second_tier: bridge events into the instance's
+            # cpu_used counter so allocations are bounded by cpu_mem.
             for ev in self.second_tier_prefix_cache.take_events():
                 if isinstance(ev, BlockStored):
                     tlen = len(ev.token_ids)
                     for h in ev.block_hashes:
-                        # self._cpu_cache_hashtolen[h] = tlen
                         if h in self._cpu_cache_hashtolen:
-                           self._cpu_cache_hashtolen[h][1] += 1
+                            self._cpu_cache_hashtolen[h][1] += 1
                         else:
-                           self._cpu_cache_hashtolen[h] = [tlen, 1]
+                            self._cpu_cache_hashtolen[h] = [tlen, 1]
                     cpu_byte_alloc += self.get_kv(tlen) * self.num_npus
                 elif isinstance(ev, BlockRemoved):
                     for h in ev.block_hashes:
-                        # tlen = self._cpu_cache_hashtolen.pop(h, 0)
                         if h in self._cpu_cache_hashtolen:
                             tlen = self._cpu_cache_hashtolen[h][0]
                             self._cpu_cache_hashtolen[h][1] -= 1
@@ -614,13 +618,17 @@ class MemoryModel():
                             cpu_byte_free += self.get_kv(tlen) * self.num_npus
                         else:
                             self.logger.warning(f"CPU prefix cache remove unknown block hash {h}")
-            
+
             if cpu_byte_free > 0:
                 self.free(cpu_byte_free, Device.CPU)
             if cpu_byte_alloc > 0:
-               self.allocate(cpu_byte_alloc, Device.CPU)
-            # if cpu_byte_free > 0:
-            #     self.free(cpu_byte_free, Device.CPU)
+                self.allocate(cpu_byte_alloc, Device.CPU)
+        else:
+            # Shared pool or CXL: the cache itself accounts via
+            # total_memory_usage (= kv_stored + total_size * kv_size),
+            # so no instance-side counter update is needed. Drain the
+            # queue to prevent it from growing unboundedly.
+            self.second_tier_prefix_cache.take_events()
 
     def return_prefix_info(self):
         if not self.enable_prefix_caching:
