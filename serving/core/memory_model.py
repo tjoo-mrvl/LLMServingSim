@@ -120,6 +120,26 @@ class MemoryModel():
             self.kv_lora_rank = int(self.config['kv_lora_rank'])
             self.qk_rope_head_dim = int(self.config.get('qk_rope_head_dim', 0))
             self.mla_latent_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        # DeepSeek-V4: MLA-derived but with shape changes (kv_lora_rank
+        # collapsed into head_dim, no separate kv_b_proj) plus a per-layer
+        # sparse-attention indexer overlay and sliding-window attention.
+        # Detection: V4 carries the ``compress_ratios`` array (one entry
+        # per layer; value 4 instantiates the indexer for that layer,
+        # value 128 skips it). Mutually exclusive with V3 ``is_mla``:
+        # V3 has kv_lora_rank but no compress_ratios; V4 has
+        # compress_ratios but no kv_lora_rank.
+        self.is_v4_mla = 'compress_ratios' in self.config
+        self.sliding_window = int(self.config.get('sliding_window', 0) or 0)
+        self.compress_ratios = list(self.config.get('compress_ratios') or [])
+        if self.is_v4_mla:
+            self.o_lora_rank = int(self.config['o_lora_rank'])
+            self.o_groups = int(self.config['o_groups'])
+            self.index_n_heads = int(self.config['index_n_heads'])
+            self.index_head_dim = int(self.config['index_head_dim'])
+            # Count of layers that instantiate a DeepseekV4Indexer
+            # (those with compress_ratios[i] == 4). About half of the
+            # 61 layers for V4-Pro, alternating per the config's array.
+            self.n_indexed_layers = sum(1 for r in self.compress_ratios if r == 4)
         # DeepSeek-V3 / R1: layers [0, first_k_dense_replace) run plain
         # MLP; the remaining MoE layers run DeepseekV2MoE. Tracked for
         # the per-layer weight aggregation in get_weight().
@@ -200,6 +220,19 @@ class MemoryModel():
         _, lm_head, _ = calculate_sizes(self.model, 'lm_head', 1, parallel=tp, fp=fp, weight_fp=wfp)
         weight += lm_head
 
+        # DeepSeek-V4: indexer weights are per-indexed-layer, not per-block,
+        # so they're aggregated here rather than inside _get_weight_per_block.
+        # Each indexer carries idx_wq_b + idx_weights_proj + idx_k_norm
+        # (ReplicatedLinear / LayerNorm — not TP-sharded, identical on every
+        # rank). idx_compressor and idx_indexer_op are kernel-only (no
+        # learnable weights).
+        if self.is_v4_mla and self.n_indexed_layers > 0:
+            indexer_w = 0
+            for ln in ('idx_wq_b', 'idx_weights_proj', 'idx_k_norm'):
+                _, w, _ = calculate_sizes(self.model, ln, 1, parallel=tp, fp=fp, weight_fp=wfp)
+                indexer_w += w
+            weight += indexer_w * self.n_indexed_layers
+
         self.logger.info(
             "NPU: model weight %dMB loaded",
             weight * tp // MB_TO_BYTE,
@@ -221,7 +254,18 @@ class MemoryModel():
         block_weight = 0
         _, ln_w, _ = calculate_sizes(self.model, 'layernorm', 1, parallel=tp, fp=fp, weight_fp=wfp)
         block_weight += ln_w  # input layernorm
-        if self.is_mla:
+        if self.is_v4_mla:
+            # DeepSeek-V4 MLA path: slimmer fused A-projection (no
+            # separate kv_b_proj — KV stays in latent until the kernel),
+            # plus a grouped low-rank o-projection split across
+            # ``wo_a`` (ColumnParallel + bmm across o_groups) and
+            # ``wo_b`` (RowParallel) through the o_lora_rank bottleneck.
+            # Indexer submodules are per-layer-conditional and summed
+            # separately in get_weight, not here.
+            for ln in ('fused_wqa_wkv', 'q_norm', 'wq_b', 'kv_norm', 'wo_a', 'wo_b'):
+                _, w, _ = calculate_sizes(self.model, ln, 1, parallel=tp, fp=fp, weight_fp=wfp)
+                block_weight += w
+        elif self.is_mla:
             # MLA attention path: fused down-proj + Q/KV norms + B-projections + o_proj.
             # Standard ``qkv_proj`` is replaced by the small fused A-projection
             # and the two B-projections (Q and KV up-projections).
@@ -251,6 +295,20 @@ class MemoryModel():
         # (kv_head, batch_size, n_embd//n_head, seq_len) per layer
         # return batch_size = 1 to caclulate max batch_size in scheduler
 
+        if self.is_v4_mla:
+            # DeepSeek-V4: MLA latent of width head_dim per token, bounded
+            # by sliding_window. Replicated across TP ranks (no //num_npus).
+            # Indexer layers (compress_ratios[i]==4) carry an additional
+            # K-cache for the SparseAttnIndexer — first-order approximated
+            # as index_n_heads*index_head_dim compressed keys per token.
+            # The exact DeepseekV4IndexerCache layout may include a small
+            # constant factor (compressed-vs-original key storage); leave
+            # as a follow-up once a real v0.20.2 load can be inspected.
+            effective_seq = min(seq, self.sliding_window) if self.sliding_window else seq
+            mla_bytes = self.head_dim * effective_seq * self.n_layer * self.kv_fp
+            indexer_bytes = (self.index_n_heads * self.index_head_dim
+                             * effective_seq * self.n_indexed_layers * self.kv_fp)
+            return mla_bytes + indexer_bytes
         if self.is_mla:
             # MLA caches a single per-token latent (kv_lora_rank +
             # qk_rope_head_dim) shared by every head — vLLM stores it
@@ -817,6 +875,27 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         mla_latent_dim = 0
         a_proj_out = 0
 
+    # DeepSeek-V4 MLA dims. V4 collapses kv_lora_rank into head_dim and
+    # drops the separate kv_b_proj path; the fused A-projection outputs
+    # only q_lora_rank + head_dim. The o-projection is decomposed into
+    # ``wo_a`` (column-parallel + batched matmul across ``o_groups``)
+    # plus ``wo_b`` (row-parallel) through an ``o_lora_rank`` bottleneck.
+    is_v4_mla = 'compress_ratios' in config
+    if is_v4_mla:
+        v4_q_lora_rank = int(config['q_lora_rank'])
+        v4_head_dim = int(config['head_dim'])          # = kv_lora_rank in V4
+        v4_o_lora_rank = int(config['o_lora_rank'])
+        v4_o_groups = int(config['o_groups'])
+        v4_a_proj_out = v4_q_lora_rank + v4_head_dim   # fused_wqa_wkv output
+        v4_index_n_heads = int(config['index_n_heads'])
+        v4_index_head_dim = int(config['index_head_dim'])
+        v4_sliding_window = int(config.get('sliding_window', 0) or 0)
+        v4_qk_rope_head_dim = int(config.get('qk_rope_head_dim', 0))
+    else:
+        v4_q_lora_rank = v4_head_dim = v4_o_lora_rank = v4_o_groups = 0
+        v4_a_proj_out = v4_index_n_heads = v4_index_head_dim = 0
+        v4_sliding_window = v4_qk_rope_head_dim = 0
+
     p = max(int(parallel), 1)
 
     # NOTE (vLLM-style assumptions):
@@ -852,7 +931,23 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         output_size = ((n_head // p) + (kv_head // p)) * length * head_dim * fp
 
     elif layer_name == "attention":
-        if is_mla:
+        if is_v4_mla:
+            # DeepSeek-V4 MLA: Q is (n_head * head_dim) per rank, KV cache
+            # is the head_dim-wide latent (== kv_lora_rank in V4) bounded
+            # by sliding_window. Latent is replicated across TP ranks (no // p).
+            # Indexer K-cache contribution is accounted for in get_kv on
+            # the layers where compress_ratios[i]==4; not double-counted here.
+            attn_len = length if not pim else 1
+            kv_for_attn = kv_len if kv_len is not None else attn_len
+            if v4_sliding_window > 0:
+                kv_for_attn = min(kv_for_attn, v4_sliding_window)
+            input_size = (
+                (n_head // p) * attn_len * v4_head_dim * fp +
+                v4_head_dim * kv_for_attn * fp        # latent KV, replicated
+            )
+            weight_size = 0
+            output_size = (n_head // p) * attn_len * v4_head_dim * fp
+        elif is_mla:
             # MLA: Q is (n_head * qk_head_dim) per rank, KV cache is the
             # latent (kv_lora_rank + qk_rope_head_dim) per token —
             # replicated across TP ranks (no // p), single buffer (no *2).
@@ -925,6 +1020,87 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
             input_size = length * (q_dim // p) * fp
             weight_size = (q_dim // p) * n_embd * weight_fp
             output_size = length * n_embd * fp
+
+    # ----------------- V4 MLA projections (DeepSeek-V4) -----------------
+    elif layer_name == "fused_wqa_wkv":
+        # MergedColumnParallelLinear: hidden -> q_lora_rank + head_dim.
+        # Smaller than V3's fused_qkv_a_proj because V4 drops the
+        # separate kv_b path (KV stays in latent until the MLA kernel).
+        input_size = length * n_embd * fp
+        weight_size = n_embd * (v4_a_proj_out // p) * weight_fp
+        output_size = length * (v4_a_proj_out // p) * fp
+
+    elif layer_name == "q_norm":
+        # RMSNorm on the q_lora_rank stream. Replicated, not TP-sharded.
+        input_size = length * v4_q_lora_rank * fp
+        weight_size = v4_q_lora_rank * fp
+        output_size = input_size
+
+    elif layer_name == "wq_b":
+        # ColumnParallelLinear: q_lora_rank -> n_head * head_dim,
+        # output split across TP.
+        input_size = length * v4_q_lora_rank * fp
+        q_total_v4 = n_head * v4_head_dim
+        weight_size = v4_q_lora_rank * (q_total_v4 // p) * weight_fp
+        output_size = length * (q_total_v4 // p) * fp
+
+    elif layer_name == "kv_norm":
+        # RMSNorm on the KV latent (head_dim wide in V4). Replicated.
+        input_size = length * v4_head_dim * fp
+        weight_size = v4_head_dim * fp
+        output_size = input_size
+
+    elif layer_name == "wo_a":
+        # First half of grouped low-rank o_proj. Per-rank shape:
+        # for each of o_groups groups, a (n_head*head_dim/o_groups) ->
+        # (o_lora_rank // p) weight matrix. ColumnParallel splits the
+        # o_lora_rank dim across TP; the bmm runs across o_groups.
+        input_per_group = (n_head * v4_head_dim) // max(v4_o_groups, 1)
+        weight_size = v4_o_groups * input_per_group * (v4_o_lora_rank // p) * weight_fp
+        # Activation flow: input is the full n_head*head_dim attention
+        # output (gathered across groups before the bmm), output is
+        # o_groups * (o_lora_rank // p) per token.
+        input_size = length * (n_head * v4_head_dim) * fp
+        output_size = length * (v4_o_groups * v4_o_lora_rank // p) * fp
+
+    elif layer_name == "wo_b":
+        # Second half: RowParallelLinear, o_groups*o_lora_rank -> hidden.
+        # Input dim is sharded across TP, output is full hidden.
+        input_size = length * (v4_o_groups * v4_o_lora_rank // p) * fp
+        weight_size = (v4_o_groups * v4_o_lora_rank // p) * n_embd * weight_fp
+        output_size = length * n_embd * fp
+
+    # ----------------- V4 Indexer subcomponents -----------------
+    # Per-layer-conditional: only present where compress_ratios[i] == 4.
+    # All projections are ReplicatedLinear / LayerNorm — not TP-sharded.
+    elif layer_name == "idx_wq_b":
+        # ReplicatedLinear: q_lora_rank -> index_n_heads * index_head_dim.
+        idx_out = v4_index_n_heads * v4_index_head_dim
+        input_size = length * v4_q_lora_rank * fp
+        weight_size = v4_q_lora_rank * idx_out * weight_fp
+        output_size = length * idx_out * fp
+
+    elif layer_name == "idx_weights_proj":
+        # ReplicatedLinear: hidden -> index_n_heads.
+        input_size = length * n_embd * fp
+        weight_size = n_embd * v4_index_n_heads * weight_fp
+        output_size = length * v4_index_n_heads * fp
+
+    elif layer_name == "idx_k_norm":
+        # LayerNorm on index_head_dim. Note: vLLM uses nn.LayerNorm here,
+        # not RMSNorm — so the bias term is present, but it shares the
+        # same per-element size as the scale, doubling the weight.
+        input_size = length * v4_index_head_dim * fp
+        weight_size = 2 * v4_index_head_dim * fp        # scale + bias
+        output_size = input_size
+
+    elif layer_name in ("idx_compressor", "idx_indexer_op"):
+        # Kernel-only: DeepseekCompressor and SparseAttnIndexer carry
+        # no learnable weights — their state lives in the cache modules.
+        # Activation shape passes through hidden_size.
+        input_size = length * n_embd * fp
+        weight_size = 0
+        output_size = length * n_embd * fp
 
     elif layer_name == "gate_up_proj":
         input_size = length * n_embd * fp
