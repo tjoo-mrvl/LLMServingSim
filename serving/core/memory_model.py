@@ -475,17 +475,20 @@ class MemoryModel():
         self.apply_kv_cache_events()
 
     def evict_prefix_cache(self, bytes, device):
-        if not self.enable_prefix_caching and bytes <= 0:
+        if not self.enable_prefix_caching or bytes <= 0:
             return
-        # space_needed = ceil(bytes / _bytes_per_token)
-        space_needed = (bytes + self._bytes_per_token - 1) // self._bytes_per_token
 
         if device == Device.NPU:
-            self.npu_prefix_cache.evict(space_needed)
+            cache = self.npu_prefix_cache
         elif device == Device.CPU:
-            self.second_tier_prefix_cache.evict(space_needed)
+            cache = self.second_tier_prefix_cache
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to evict prefix cache to unsupported device {device}")
+
+        # Each cache instance carries its own bytes-per-token in kv_size:
+        # per-rank for NPU, full-cluster for the second-tier pool.
+        space_needed = (bytes + cache.kv_size - 1) // cache.kv_size
+        cache.evict(space_needed)
 
         self.apply_kv_cache_events()
 
