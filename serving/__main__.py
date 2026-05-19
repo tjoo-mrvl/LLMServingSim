@@ -267,15 +267,28 @@ def main():
         num_prefix_pool = num_nodes
         # make prefix pool objects based on num_prefix_pool
         prefix_pools = []
+
+        def _pool_kv_bytes_per_token(inst_ids):
+            """KV bytes per token for a shared pool. All instances sharing a
+            pool must agree on (model, kv_cache_dtype); raise otherwise."""
+            models = {(instances[i]['model_name'], kv_cache_dtype) for i in inst_ids}
+            if len(models) > 1:
+                raise RuntimeError(
+                    f"Shared prefix pool requires instances to share model + "
+                    f"kv_cache_dtype; got {models}"
+                )
+            model = instances[inst_ids[0]]['model_name']
+            return full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype)
+
         if prefix_storage == 'CPU':
             for i in range(num_prefix_pool):
                 if cpu_mem_size[i] > 0:
                     new_prefix_pool = RadixCache(
                                                 node_id=0,
-                                                device=prefix_storage, 
+                                                device=prefix_storage,
                                                 page_size=256,
                                                 capacity = cpu_mem_size[i] * GB_TO_BYTE,
-                                                kv_size=131072,
+                                                kv_size=_pool_kv_bytes_per_token(node2inst_mapping[i]),
                                                 enable_kv_cache_events=True)
                     prefix_pools.append(new_prefix_pool)
                 else:
@@ -287,10 +300,10 @@ def main():
             if cluster["cxl_mem_size"] > 0:
                 new_prefix_pool = RadixCache(
                                             node_id=None,
-                                            device=prefix_storage, 
+                                            device=prefix_storage,
                                             page_size=1,
-                                            capacity = cluster["cxl_mem_size"] * GB_TO_BYTE, 
-                                            kv_size=131072,
+                                            capacity = cluster["cxl_mem_size"] * GB_TO_BYTE,
+                                            kv_size=_pool_kv_bytes_per_token(list(range(num_instances))),
                                             enable_kv_cache_events=True)
                 prefix_pools.append(new_prefix_pool)
                 # This means every instance shares the same universal prefix pool (maybe fixed later)
@@ -648,7 +661,7 @@ def main():
                     node_cpu_usage = 0
                     inst_usage = []
                     if enable_prefix_sharing and prefix_storage == "CPU":
-                        node_cpu_usage = (prefix_pools[node_id].total_size() * 131072)
+                        node_cpu_usage = prefix_pools[node_id].total_size() * prefix_pools[node_id].kv_size
                     else:
                         for inst_id in inst_ids:
                             inst_cpu_usage = schedulers[inst_id].memory.cpu_used
@@ -679,10 +692,10 @@ def main():
             if prefix_storage == "CXL":
                 if enable_prefix_sharing:
                     num_prefix_pool = len(prefix_pools)
-                    for i, cxl_id, cxl_pool in enumerate(prefix_pools):
-                        cxl_usage = (cxl_pool.total_size() * 131072)
+                    for cxl_id, cxl_pool in enumerate(prefix_pools):
+                        cxl_usage = cxl_pool.total_size() * cxl_pool.kv_size
                         cxl_util = cxl_usage / cxl_pool.capacity
-                        if not power_modeling and i == num_prefix_pool - 1:
+                        if not power_modeling and cxl_id == num_prefix_pool - 1:
                             tree_indent = '└─'
                         print_markup(
                             f"{log_indent+tree_indent}CXL\\[{cxl_id}]: "
@@ -692,8 +705,9 @@ def main():
                 else:
                     # else only one instance could explictly use CXL
                     inst_id = 0
-                    cxl_usage = (schedulers[inst_id].memory.second_tier_prefix_cache.total_size() * 131072)
-                    cxl_util = cxl_usage / schedulers[inst_id].memory.second_tier_prefix_cache.capacity
+                    second_tier = schedulers[inst_id].memory.second_tier_prefix_cache
+                    cxl_usage = second_tier.total_size() * second_tier.kv_size
+                    cxl_util = cxl_usage / second_tier.capacity
                     if not power_modeling:
                         tree_indent = '└─'
                     print_markup(
