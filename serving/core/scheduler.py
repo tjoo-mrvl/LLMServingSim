@@ -45,7 +45,7 @@ class Scheduler:
         self.batch_ids = -1
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, kv_cache_dtype=kv_cache_dtype)
+        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype)
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)

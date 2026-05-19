@@ -14,12 +14,13 @@ class Device(Enum):
     CXL = 3
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, kv_cache_dtype='auto'):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto'):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
         self.num_npus = num_npus
         self.tp_size = tp_size
+        self.pp_size = pp_size
         self.ep_size = ep_size
         self.npu_mem = npu_mem * GB_TO_BYTE # GB -> Byte
         self.cpu_mem = cpu_mem * GB_TO_BYTE # GB -> Byte
@@ -93,15 +94,24 @@ class MemoryModel():
         self._cpu_cache_hashtolen = {}
         self._bytes_per_token = self.get_kv(1)  # bytes per token for kv cache
     def get_weight(self):
-        """Total per-GPU model weight in bytes."""
+        """Per-GPU model weight in bytes.
+
+        Conservative upper bound across PP ranks: assumes a single rank
+        holds embedding + final_layernorm + lm_head along with its share
+        of transformer blocks (n_layer // pp_size). In real PP these
+        non-block weights live on the first/last rank only, so middle
+        ranks are lighter — but using the heaviest-rank value here keeps
+        the `weight > npu_mem` check safe.
+        """
         tp = self.tp_size
+        pp = max(self.pp_size, 1)
         ep = self.ep_size
         fp = self.fp
         weight = 0
 
         _, embedding, _ = calculate_sizes(self.model, 'embedding', 1, parallel=tp, fp=fp)
         weight += embedding
-        weight += self._get_weight_per_block(tp, ep, fp) * self.n_layer
+        weight += self._get_weight_per_block(tp, ep, fp) * (self.n_layer // pp)
         _, ln_f, _ = calculate_sizes(self.model, 'final_layernorm', 1, parallel=tp, fp=fp)
         weight += ln_f
         _, lm_head, _ = calculate_sizes(self.model, 'lm_head', 1, parallel=tp, fp=fp)
