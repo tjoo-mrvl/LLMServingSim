@@ -20,6 +20,8 @@ _QUANT_BYTES = {
     'fp8': 1, 'fp8_e4m3': 1, 'fp8_e5m2': 1,
     'int8': 1,
     'int4': 0.5, 'awq': 0.5, 'gptq': 0.5,
+    # FP4 schemes (DeepSeek-V4 routed experts use ``expert_dtype: fp4``).
+    'fp4': 0.5, 'mxfp4': 0.5, 'nvfp4': 0.5,
 }
 
 
@@ -43,6 +45,26 @@ def _resolve_weight_fp(act_fp, quantization, config=None):
         return _QUANT_BYTES[method]
     # Unknown scheme — fall back to activation dtype rather than guessing.
     return act_fp
+
+
+def _resolve_moe_weight_fp(act_fp, weight_fp, config=None):
+    """Pick bytes/element for routed-MoE-expert weights specifically.
+
+    Some checkpoints (DeepSeek-V4) quantize routed experts more aggressively
+    than the rest of the model — FP4 experts on top of FP8 dense weights.
+    The HF config exposes this via a top-level ``expert_dtype`` field
+    distinct from ``quantization_config.quant_method``.
+
+    Falls back to ``weight_fp`` when ``expert_dtype`` is absent — preserves
+    the existing single-precision behaviour for Mixtral / Qwen3-MoE /
+    phi-mini-MoE / DeepSeek-R1, which all leave routed experts at the same
+    precision as the dense weights.
+    """
+    if isinstance(config, dict):
+        ed = config.get('expert_dtype')
+        if isinstance(ed, str) and ed in _QUANT_BYTES:
+            return _QUANT_BYTES[ed]
+    return weight_fp
 
 class MemoryModel():
     def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, kv_cache_dtype='auto', quantization=None):
@@ -72,6 +94,11 @@ class MemoryModel():
         # weights are stored at 1 byte/element while activations stay at
         # ``act_fp``. DeepSeek-R1 ships in this W8A16 fp8 scheme by default.
         self.weight_fp = _resolve_weight_fp(self.act_fp, quantization, self.config)
+        # MoE expert weights may be quantized more aggressively than dense
+        # weights — e.g. DeepSeek-V4 ships fp8 dense + fp4 experts via the
+        # top-level ``expert_dtype`` field. Falls back to ``weight_fp`` for
+        # every other model.
+        self.moe_weight_fp = _resolve_moe_weight_fp(self.act_fp, self.weight_fp, self.config)
         self.n_embd = self.config['hidden_size']
         self.n_layer = self.config['num_hidden_layers']
         self.n_head = self.config['num_attention_heads']
@@ -151,6 +178,7 @@ class MemoryModel():
         ep = self.ep_size
         fp = self.act_fp
         wfp = self.weight_fp
+        mwfp = self.moe_weight_fp
         weight = 0
 
         _, embedding, _ = calculate_sizes(self.model, 'embedding', 1, parallel=tp, fp=fp, weight_fp=wfp)
@@ -162,11 +190,11 @@ class MemoryModel():
         if self.is_moe and self.first_k_dense_replace > 0:
             n_dense = self.first_k_dense_replace
             n_moe = self.n_layer - n_dense
-            weight += self._get_weight_per_block(tp, ep, fp, wfp, mlp_type='dense') * n_dense
-            weight += self._get_weight_per_block(tp, ep, fp, wfp, mlp_type='moe') * n_moe
+            weight += self._get_weight_per_block(tp, ep, fp, wfp, mwfp, mlp_type='dense') * n_dense
+            weight += self._get_weight_per_block(tp, ep, fp, wfp, mwfp, mlp_type='moe') * n_moe
         else:
             mlp_type = 'moe' if self.is_moe else 'dense'
-            weight += self._get_weight_per_block(tp, ep, fp, wfp, mlp_type=mlp_type) * self.n_layer
+            weight += self._get_weight_per_block(tp, ep, fp, wfp, mwfp, mlp_type=mlp_type) * self.n_layer
         _, ln_f, _ = calculate_sizes(self.model, 'final_layernorm', 1, parallel=tp, fp=fp, weight_fp=wfp)
         weight += ln_f
         _, lm_head, _ = calculate_sizes(self.model, 'lm_head', 1, parallel=tp, fp=fp, weight_fp=wfp)
@@ -178,15 +206,17 @@ class MemoryModel():
         )
         return weight
 
-    def _get_weight_per_block(self, tp, ep, fp, wfp, mlp_type):
+    def _get_weight_per_block(self, tp, ep, fp, wfp, mwfp, mlp_type):
         """Per-block weight: dense layers use TP, MoE experts use EP.
 
         ``mlp_type`` selects whether this layer's MLP is the plain dense
         FFN or the MoE block — needed for hybrid models (DeepSeek-V3)
         where layer index decides.
         ``wfp`` is the weight-quantized bytes/element used for GEMM weights;
-        layernorms keep ``fp`` (the activation dtype) since RMSNorm scales are
-        not quantized.
+        ``mwfp`` is the (possibly more aggressive) bytes/element used for
+        routed-MoE-expert weights — falls back to ``wfp`` when the model
+        doesn't declare a separate ``expert_dtype``. Layernorms keep ``fp``
+        (the activation dtype) since RMSNorm scales are not quantized.
         """
         block_weight = 0
         _, ln_w, _ = calculate_sizes(self.model, 'layernorm', 1, parallel=tp, fp=fp, weight_fp=wfp)
@@ -206,7 +236,8 @@ class MemoryModel():
             block_weight += o_w
         block_weight += ln_w  # post layernorm (same weight size)
         if mlp_type == 'moe':
-            _, moe_w, _ = calculate_sizes(self.model, 'moe', 1, parallel=ep, fp=fp, weight_fp=wfp)
+            _, moe_w, _ = calculate_sizes(self.model, 'moe', 1, parallel=ep, fp=fp,
+                                          weight_fp=wfp, moe_weight_fp=mwfp)
             block_weight += moe_w
         else:
             _, ffn1_w, _ = calculate_sizes(self.model, 'gate_up_proj', 1, parallel=tp, fp=fp, weight_fp=wfp)
@@ -716,7 +747,8 @@ class MemoryModel():
 
         
 # calculate the per-rank input, weight, output size of each layer
-def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2, weight_fp=None):
+def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2,
+                    weight_fp=None, moe_weight_fp=None):
     """Calculate input, weight, and output tensor sizes for a given layer.
 
     Args:
@@ -727,13 +759,21 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
             and unquantized parameters.
         weight_fp: bytes per element for quantizable GEMM weights
             (qkv_proj, o_proj, gate_up_proj, down_proj, MLA B-projections,
-            routed/shared experts, lm_head). When ``None`` (default), falls
-            back to ``fp`` — i.e. no weight quantization. Set to ``1`` for
-            fp8/int8, ``0.5`` for int4/AWQ/GPTQ. Modelling W8A16 (DeepSeek-R1):
+            lm_head). When ``None`` (default), falls back to ``fp`` —
+            i.e. no weight quantization. Set to ``1`` for fp8/int8,
+            ``0.5`` for int4/fp4/AWQ/GPTQ. Modelling W8A16 (DeepSeek-R1):
             ``fp=2, weight_fp=1``.
+        moe_weight_fp: bytes per element for routed-MoE-expert weights
+            specifically. Distinct from ``weight_fp`` because some
+            checkpoints (DeepSeek-V4) quantize experts more aggressively
+            than the dense path (fp8 dense + fp4 experts). Only consumed
+            by the ``moe`` layer branch. When ``None`` (default), falls
+            back to ``weight_fp``.
     """
     if weight_fp is None:
         weight_fp = fp
+    if moe_weight_fp is None:
+        moe_weight_fp = weight_fp
     config = get_config(model)
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
@@ -910,12 +950,17 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         experts_per_rank = num_local_experts // p
         input_size = length * n_embd * fp
         # Router gate stays at compute dtype (replicated, not quantized in
-        # vLLM's fp8 scheme). Routed experts and replicated shared experts
-        # (DeepSeek-V3, n_shared_experts=1) use ``weight_fp``. Shared experts
-        # share dims with routed experts but are NOT divided by EP.
+        # vLLM's fp8 scheme). Routed and shared experts use ``moe_weight_fp``
+        # — distinct from ``weight_fp`` for models where the routed experts
+        # are quantized more aggressively than the dense path (DeepSeek-V4:
+        # fp8 dense + fp4 experts). For every existing model
+        # (Mixtral / Qwen3-MoE / DeepSeek-R1 / phi-mini-MoE), the resolver
+        # collapses ``moe_weight_fp == weight_fp`` so behaviour is unchanged.
+        # Shared experts share dims with routed experts but are NOT divided
+        # by EP.
         gate_w = n_embd * num_local_experts * fp
-        routed_w = experts_per_rank * 3 * n_embd * moe_ffn_dim * weight_fp
-        shared_w = n_shared_experts * 3 * n_embd * moe_ffn_dim * weight_fp
+        routed_w = experts_per_rank * 3 * n_embd * moe_ffn_dim * moe_weight_fp
+        shared_w = n_shared_experts * 3 * n_embd * moe_ffn_dim * moe_weight_fp
         weight_size = gate_w + routed_w + shared_w
         output_size = length * n_embd * fp
 
