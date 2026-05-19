@@ -630,6 +630,26 @@ class MemoryModel():
         return (self.npu_prefix_cache.return_prefix_info(), self.second_tier_prefix_cache.return_prefix_info())
 
         
+def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
+    """Bytes of KV cache per token aggregated over the full TP cluster.
+
+    Mirrors MemoryModel.get_kv(1) * num_npus but computes directly, avoiding
+    the per-rank floor-division roundoff. ``fp`` is the model weight dtype
+    in bits (16, 32, ...). ``kv_cache_dtype='fp8'`` forces 1 byte per element
+    for the KV cache regardless of weight dtype.
+    """
+    config = get_config(model)
+    n_embd = config['hidden_size']
+    n_head = config['num_attention_heads']
+    head_dim = config.get('head_dim', n_embd // n_head)
+    kv_head = config.get('num_key_value_heads', n_head)
+    kv_dim = kv_head * head_dim
+    n_layer = config['num_hidden_layers']
+    kv_fp = 1 if kv_cache_dtype == 'fp8' else fp // 8
+    # 2 (K + V) * kv_dim * n_layer * bytes_per_elem
+    return 2 * kv_dim * n_layer * kv_fp
+
+
 # calculate the per-rank input, weight, output size of each layer
 def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2):
     """Calculate input, weight, and output tensor sizes for a given layer.
