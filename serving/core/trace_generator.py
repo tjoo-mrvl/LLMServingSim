@@ -113,6 +113,8 @@ class TraceCtx:
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
     first_k_dense_replace: int  # DeepSeek-V3-style hybrid MoE: layers [0, first_k_dense_replace) run mlp_dense, the rest run mlp_moe. 0 disables (use is_moe flag globally).
+    sliding_window: int  # DeepSeek-V4: attention KV is bounded to the last ``sliding_window`` tokens. 0 disables (V3 / dense, unbounded KV).
+    compress_ratios: list  # DeepSeek-V4: per-layer compression factors. Layers with value 4 instantiate a DeepseekV4Indexer (use ``pre_attn_indexed`` sequence); other values skip the indexer (use ``pre_attn`` sequence). Empty list disables (non-V4 models).
 
 
 @dataclass
@@ -716,6 +718,7 @@ def _skew_alpha(
 def _lookup_attention_with_skew(
     perf_db, tp, prefill_chunk, kv_prefill,
     n_decode, kv_decode_mean, kv_decode_max, kv_decode_min,
+    sliding_window=0,
 ):
     """Attention lookup with skew correction applied.
 
@@ -729,7 +732,18 @@ def _lookup_attention_with_skew(
     ``_lookup_attention`` produces a float, and the skew formula
     compounds that; the Chakra trace converter requires integer
     ``comp_time`` so we round here.
+
+    ``sliding_window`` (DeepSeek-V4): caps every kv_* axis at the
+    given window size before the 4D interpolation. Without this, V4's
+    long-context regimes would extrapolate the CSV beyond what the
+    kernel actually runs in (the kernel internally caps at the same
+    window). 0 disables (V3 / dense / pre-V4 models).
     """
+    if sliding_window > 0:
+        kv_prefill = min(kv_prefill, sliding_window)
+        kv_decode_mean = min(kv_decode_mean, sliding_window)
+        kv_decode_max = min(kv_decode_max, sliding_window)
+        kv_decode_min = min(kv_decode_min, sliding_window)
     t_mean = _lookup_attention(
         perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode_mean,
     )
@@ -857,6 +871,10 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pim_channels = int(pim_config["mem_size"] // pim_config["dimm_size"])
 
     first_k_dense_replace = int(config.get('first_k_dense_replace', 0) or 0)
+    # DeepSeek-V4: sliding-window attention + per-layer indexer dispatch.
+    # Empty list / 0 disables both features for every other model.
+    sliding_window = int(config.get('sliding_window', 0) or 0)
+    compress_ratios = list(config.get('compress_ratios') or [])
     # Default weight_fp to activation dtype so unquantized callers behave
     # exactly as before (no change to weight_size in the emitted trace).
     if weight_fp is None:
@@ -878,6 +896,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
         first_k_dense_replace=first_k_dense_replace,
+        sliding_window=sliding_window, compress_ratios=compress_ratios,
     )
 
 
@@ -953,6 +972,7 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
             bctx.prefill_chunk, bctx.kv_prefill,
             bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
             bctx.kv_decode_min,
+            sliding_window=ctx.sliding_window,
         )
     else:  # dense
         latency_ns = _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
@@ -1191,7 +1211,18 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
 
 
 def _emit_pre_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_tag='NONE'):
-    _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, "pre_attn"),
+    # DeepSeek-V4 dispatch: layers with ``compress_ratios[layer_num] == 4``
+    # instantiate a DeepseekV4Indexer overlay and need the longer
+    # ``pre_attn_indexed`` sequence; other layers run plain MLA via
+    # ``pre_attn``. Falls back to ``pre_attn`` for every non-V4 model
+    # (their config has no compress_ratios -> empty list -> never indexed).
+    use_indexer = (
+        ctx.compress_ratios
+        and layer_num < len(ctx.compress_ratios)
+        and ctx.compress_ratios[layer_num] == 4
+    )
+    seq_name = "pre_attn_indexed" if use_indexer else "pre_attn"
+    _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, seq_name),
                    lines, power_acc, batch_tag)
 
 
@@ -1241,6 +1272,7 @@ def _layer_latency_for_power(ctx, bctx, layer_name):
             bctx.prefill_chunk, bctx.kv_prefill,
             bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
             bctx.kv_decode_min,
+            sliding_window=ctx.sliding_window,
         )
     return _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
 
@@ -1338,8 +1370,19 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
         # Hybrid FFN models (DeepSeek-V3) must iterate every layer so
         # the dense/MoE dispatch in _emit_post_attn_layers actually
         # produces both block kinds — block_copy is unsafe here.
+        # DeepSeek-V4 hybrid attention: ``pre_attn`` vs ``pre_attn_indexed``
+        # dispatch in _emit_pre_attn_layers needs every layer to be
+        # emitted so the right sequence runs per compress_ratios entry.
+        # ``hybrid_attn`` true only when the compress_ratios array mixes
+        # 4 and non-4 values (V4's actual pattern); a uniform array
+        # would still allow block_copy.
         hybrid_ffn = ctx.first_k_dense_replace > 0
-        iter_count, copy_count = (num_layers, 1) if (block_mode_on or hybrid_ffn) else (1, num_layers)
+        hybrid_attn = (
+            bool(ctx.compress_ratios)
+            and any(r == 4 for r in ctx.compress_ratios)
+            and any(r != 4 for r in ctx.compress_ratios)
+        )
+        iter_count, copy_count = (num_layers, 1) if (block_mode_on or hybrid_ffn or hybrid_attn) else (1, num_layers)
 
         for layer_num in range(iter_count):
             block_lines, block_power = _build_transformer_block(ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
@@ -1348,13 +1391,16 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
             # opts into block copy (BALANCED is deterministic; others
             # carry tiny per-layer variance that block_copy swallows
             # for the sake of trace-generation speed). Hybrid models
-            # (DeepSeek-V3 with first_k_dense_replace>0) have a different
-            # MLP stack on the early layers, so block-copying the first
-            # block to all layers is structurally wrong — disable it.
+            # (DeepSeek-V3 with first_k_dense_replace>0, DeepSeek-V4
+            # with alternating compress_ratios) have a different
+            # pre/post sequence on some layers, so block-copying the
+            # first block to all layers is structurally wrong —
+            # disable it.
             can_copy = (
                 (not ctx.is_moe or ctx.gate.block_copy)
                 and not block_mode_on
                 and ctx.first_k_dense_replace == 0
+                and not hybrid_attn
             )
             if can_copy:
                 for _ in range(copy_count):
@@ -1427,7 +1473,12 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
         # MIDDLE LAYERS: interleaved post_attn + pre_attn
         middle_layers = num_layers - 1
         hybrid_ffn = ctx.first_k_dense_replace > 0
-        iter_count, copy_count = (middle_layers, 1) if (block_mode_on or hybrid_ffn) else (1, middle_layers)
+        hybrid_attn = (
+            bool(ctx.compress_ratios)
+            and any(r == 4 for r in ctx.compress_ratios)
+            and any(r != 4 for r in ctx.compress_ratios)
+        )
+        iter_count, copy_count = (middle_layers, 1) if (block_mode_on or hybrid_ffn or hybrid_attn) else (1, middle_layers)
 
         for layer_num in range(iter_count):
             block_lines = []
@@ -1445,12 +1496,15 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
             # opts into block copy (BALANCED is deterministic; others
             # carry tiny per-layer variance that block_copy swallows
             # for the sake of trace-generation speed). Hybrid models
-            # (DeepSeek-V3) disable block_copy because the first
-            # ``first_k_dense_replace`` layers run a different MLP.
+            # (DeepSeek-V3 with first_k_dense_replace>0; DeepSeek-V4
+            # with alternating compress_ratios) disable block_copy
+            # because some layers run a different MLP / pre_attn
+            # sequence than the layer used as the template.
             can_copy = (
                 (not ctx.is_moe or ctx.gate.block_copy)
                 and not block_mode_on
                 and ctx.first_k_dense_replace == 0
+                and not hybrid_attn
             )
             if can_copy:
                 for _ in range(copy_count):
