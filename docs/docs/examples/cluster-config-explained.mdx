@@ -69,13 +69,15 @@ The file has three nested levels. We'll walk through them top-down.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `num_nodes` | int | Number of physical nodes in the cluster |
-| `link_bw` | float | Inter-node link bandwidth in **GB/s** |
-| `link_latency` | float | Inter-node link latency in **ns** |
+| `link_bw` | float or float[] | ASTRA-Sim topology link bandwidth in **GB/s** |
+| `link_latency` | float or float[] | ASTRA-Sim topology link latency in **ns** |
 | `nodes` | array | One entry per node (length must match `num_nodes`) |
 
 For multi-node setups (e.g., two boxes in a rack), set `num_nodes: 2`
-and add a second node entry. Inter-node communication uses
-`link_bw` / `link_latency`.
+and add a second node entry. `link_bw` / `link_latency` can be either:
+
+- a scalar, broadcast to every ASTRA-Sim topology dimension
+- an array, with one value per final `network.yml::npus_count` dimension
 
 **Optional top-level fields:**
 
@@ -218,6 +220,7 @@ example in this section uses one of them:
 | `single_node_pim_instance.json` | [PIM attention offload](./disaggregated/pim-attention-offload) |
 | `single_node_power_instance.json` | [Power modeling](./advanced/power-modeling) |
 | `dual_node_multi_instance.json` | Multi-node setups |
+| `dual_node_moe_dp_ep_intra_inter_instance.json` | Two-node DP+EP MoE with per-dimension intra/inter `link_bw` / `link_latency` |
 | ... | ... |
 
 ## What's next

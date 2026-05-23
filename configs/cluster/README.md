@@ -44,8 +44,8 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | Field | Type | Description |
 | --- | --- | --- |
 | `num_nodes` | Integer | Number of nodes in the cluster |
-| `link_bw` | Float | Inter-GPU link bandwidth in GB/s |
-| `link_latency` | Float | Inter-GPU link latency in ns |
+| `link_bw` | Float or Array<Float> | ASTRA-Sim topology link bandwidth in GB/s. A scalar is broadcast to all topology dimensions; an array must match the final `npus_count` rank |
+| `link_latency` | Float or Array<Float> | ASTRA-Sim topology link latency in ns. A scalar is broadcast to all topology dimensions; an array must match the final `npus_count` rank |
 
 ### Per-node fields
 
@@ -111,3 +111,4 @@ weights are sharded by `ep_size` (each instance holds `num_local_experts // ep_s
 | `single_node_pim_instance.json` | Single node with PIM-enabled memory + power model |
 | `single_node_power_instance.json` | Single node with power modeling enabled |
 | `dual_node_multi_instance.json` | Two nodes, two instances each |
+| `dual_node_moe_dp_ep_intra_inter_instance.json` | Two-node MoE DP+EP example with per-dimension intra/inter link settings |
