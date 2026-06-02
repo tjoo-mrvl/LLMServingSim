@@ -16,6 +16,13 @@ yaml.add_representer(FlowStyleList, represent_flowstyle_list)
 
 logger = get_logger("ConfigBuilder")
 
+_COLLECTIVE_IMPL_KEYS = [
+    "all-reduce-implementation",
+    "all-gather-implementation",
+    "reduce-scatter-implementation",
+    "all-to-all-implementation",
+]
+
 
 def _resolve_parallelism(instance, model_config):
     """Infer and validate tp_size, pp_size, ep_size from partial config.
@@ -145,6 +152,86 @@ def _resolve_dp_groups(all_instances):
             inst["ep_total"] = inst["ep_size"]
             inst["tp_dim"] = None
             inst["ep_dim"] = None
+
+
+def _compute_network_dims(instances):
+    """Infer ASTRA-Sim topology dimensions from resolved instances."""
+    dp_groups = {}
+    for inst in instances:
+        dg = inst.get("dp_group")
+        if dg is not None:
+            dp_groups.setdefault(dg, []).append(inst)
+
+    if dp_groups:
+        # DP group mode: topology = [tp_size, dp_group_size]
+        # All instances in DP group must have same tp_size (validated by
+        # _resolve_dp_groups).
+        first_group = next(iter(dp_groups.values()))
+        dims = [first_group[0]["tp_size"], len(first_group)]
+    else:
+        # Independent instances: standard topology.
+        total_npu = sum(
+            inst["num_npus"] if inst.get("pd_type") != "prefill"
+            else inst["num_npus"] * 2
+            for inst in instances
+        )
+        total_pp = sum(
+            inst["pp_size"] if inst.get("pd_type") != "prefill"
+            else inst["pp_size"] * 2
+            for inst in instances
+        )
+        num_instances = len(instances) + sum(
+            1 for inst in instances if inst.get("pd_type") == "prefill"
+        )
+        if total_npu == total_pp:
+            npus_per_group = total_npu // num_instances
+            dims = [npus_per_group, num_instances]
+        else:
+            npus_per_group = total_npu // total_pp
+            dims = [npus_per_group, total_pp]
+
+    # Remove trailing 1s (single-element dimensions are unnecessary).
+    while len(dims) > 1 and dims[-1] == 1:
+        dims.pop()
+    return dims
+
+
+def _normalize_network_dim_values(raw_value, num_dims, field_name):
+    """Normalize scalar-or-list network settings to one float per topology dim."""
+    if isinstance(raw_value, list):
+        if len(raw_value) != num_dims:
+            raise ValueError(
+                f"'{field_name}' must have exactly {num_dims} value(s) to match "
+                f"the ASTRA-Sim topology dimensions, but got {len(raw_value)}."
+            )
+        values = raw_value
+    elif isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        values = [raw_value] * num_dims
+    else:
+        raise TypeError(
+            f"'{field_name}' must be a number or a list of numbers, "
+            f"got {type(raw_value).__name__}."
+        )
+
+    try:
+        return FlowStyleList([float(v) for v in values])
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"'{field_name}' must contain only numeric values."
+        ) from exc
+
+
+def _sync_system_collective_dims(system_config_path, instances):
+    """Match system collective implementation arity to final topology dims."""
+    with open(system_config_path) as f:
+        system_config = json.load(f)
+
+    num_dims = len(_compute_network_dims(instances))
+    for key in _COLLECTIVE_IMPL_KEYS:
+        system_config[key] = ["ring"] * num_dims
+
+    with open(system_config_path, "w", encoding="utf-8") as f:
+        json.dump(system_config, f, ensure_ascii=False, indent=2)
 
 
 # parse cluster configuration from JSON file and build config file for astra-sim
@@ -395,14 +482,6 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                 # sync local-mem-bw in system config with npu_mem bw
                 system_config["local-mem-bw"] = int(npu_mem["mem_bw"])
 
-                # Match collective implementation entries to topology dimensions
-                # (ASTRA-Sim creates one topology per implementation entry)
-                has_dp = any(inst.get("dp_group") for inst in instances)
-                num_dims = 2 if has_dp else 1
-                for key in ["all-reduce-implementation", "all-gather-implementation",
-                            "reduce-scatter-implementation", "all-to-all-implementation"]:
-                    system_config[key] = ["ring"] * num_dims
-
                 with open(system_config_path, "w", encoding="utf-8") as f:
                     json.dump(system_config, f, ensure_ascii=False, indent=2)
                 
@@ -503,22 +582,27 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             block_mode_on.append(block_mode)
 
         
-        total_npu = sum(inst["num_npus"] if inst["pd_type"] != "prefill" else inst["num_npus"] * 2 for inst in total_instances)
-
-        # Resolve DP groups across all instances
-        _resolve_dp_groups(total_instances)
-
-        # create network config file
-        _create_network_config(network_config_path, total_instances, link_bw, link_latency)
-
-        # generate memory config file
-        with open(memory_config_path, "w", encoding="utf-8") as f:
-            json.dump(memory_config, f, ensure_ascii=False, indent=2)
-
-        # validate memory config file against placement
-        _validate_memory_config(memory_config_path, placement, enable_local_offloading)
-
         node_id += 1
+
+    total_npu = sum(
+        inst["num_npus"] if inst["pd_type"] != "prefill"
+        else inst["num_npus"] * 2
+        for inst in total_instances
+    )
+
+    # Resolve DP groups across all instances.
+    _resolve_dp_groups(total_instances)
+
+    # Keep collective implementation arity aligned with the final global
+    # ASTRA-Sim topology, while preserving the default ring implementation.
+    _sync_system_collective_dims(system_config_path, total_instances)
+
+    # Generate the final ASTRA-Sim input files after all instances are known.
+    _create_network_config(network_config_path, total_instances, link_bw, link_latency)
+    with open(memory_config_path, "w", encoding="utf-8") as f:
+        json.dump(memory_config, f, ensure_ascii=False, indent=2)
+    _validate_memory_config(memory_config_path, placement, enable_local_offloading)
+
     cluster = {
         "num_nodes": num_nodes,
         "num_instances": total_num_instances,
@@ -554,42 +638,13 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
       - For independent instances: [tp_size, num_groups] — dim 0 for TP, dim 1 for PP/instances
       - Single GPU instances: [1]
     """
-    # Check for DP groups
-    dp_groups = {}
-    for inst in instances:
-        dg = inst.get("dp_group")
-        if dg is not None:
-            dp_groups.setdefault(dg, []).append(inst)
-
-    if dp_groups:
-        # DP group mode: topology = [tp_size, dp_group_size]
-        # All instances in DP group must have same tp_size (validated by _resolve_dp_groups)
-        first_group = next(iter(dp_groups.values()))
-        tp_size = first_group[0]["tp_size"]
-        dp_size = len(first_group)
-        dims = [tp_size, dp_size]
-    else:
-        # Independent instances: standard topology
-        total_npu = sum(inst["num_npus"] if inst.get("pd_type") != "prefill" else inst["num_npus"] * 2 for inst in instances)
-        total_pp = sum(inst["pp_size"] if inst.get("pd_type") != "prefill" else inst["pp_size"] * 2 for inst in instances)
-        num_instances = len(instances) + sum(1 for inst in instances if inst.get("pd_type") == "prefill")
-        if total_npu == total_pp:
-            npus_per_group = total_npu // num_instances
-            dims = [npus_per_group, num_instances]
-        else:
-            npus_per_group = total_npu // total_pp
-            dims = [npus_per_group, total_pp]
-
-    # Remove trailing 1s (single-element dimensions are unnecessary)
-    while len(dims) > 1 and dims[-1] == 1:
-        dims.pop()
-
+    dims = _compute_network_dims(instances)
     num_dims = len(dims)
     topology_data = {
         "topology": FlowStyleList(["FullyConnected"] * num_dims),
         "npus_count": FlowStyleList(dims),
-        "bandwidth": FlowStyleList([float(link_bw)] * num_dims),
-        "latency": FlowStyleList([float(link_latency)] * num_dims),
+        "bandwidth": _normalize_network_dim_values(link_bw, num_dims, "link_bw"),
+        "latency": _normalize_network_dim_values(link_latency, num_dims, "link_latency"),
     }
 
     with open(network_config_path, 'w') as yaml_file:

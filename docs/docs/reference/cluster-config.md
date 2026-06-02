@@ -33,10 +33,14 @@ generates derived ASTRA-Sim input files (`network.yml`,
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `num_nodes` | int | ✓ |  | Number of physical nodes in the cluster |
-| `link_bw` | float | ✓ |  | Inter-node link bandwidth in **GB/s** |
-| `link_latency` | float | ✓ |  | Inter-node link latency in **ns** |
+| `link_bw` | float or float[] | ✓ |  | ASTRA-Sim topology link bandwidth in **GB/s**. Scalars apply to every topology dimension; arrays must match the final `network.yml::npus_count` rank |
+| `link_latency` | float or float[] | ✓ |  | ASTRA-Sim topology link latency in **ns**. Scalars apply to every topology dimension; arrays must match the final `network.yml::npus_count` rank |
 | `nodes` | array | ✓ |  | Length must equal `num_nodes` |
 | `cxl_mem` | object | optional | absent | CXL memory expansion (see below) |
+
+Example: if `network.yml` will end up with `npus_count: [4, 2]`, you may set
+`link_bw: [900, 100]` and `link_latency: [0, 20000]` to assign different
+bandwidth/latency per topology dimension.
 
 ## `cxl_mem` (top-level, optional)
 
