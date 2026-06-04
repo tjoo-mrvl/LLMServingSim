@@ -69,6 +69,19 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | `pp_size` | Integer | No | Pipeline parallel degree (default: 1) |
 | `ep_size` | Integer | No | Expert parallel degree (default: `tp_size` for MoE, 1 for dense) |
 | `dp_group` | String/null | No | DP group ID. Instances with the same string share experts via cross-instance ALLTOALL |
+| `max_num_seqs` | Integer | No | Per-instance override for `--max-num-seqs` (`0` = unlimited) |
+| `max_num_batched_tokens` | Integer | No | Per-instance override for `--max-num-batched-tokens` (`0` = unlimited) |
+| `long_prefill_token_threshold` | Integer | No | Per-instance override for `--long-prefill-token-threshold` |
+| `block_size` | Integer | No | Per-instance override for `--block-size` |
+| `dtype` | String | No | Per-instance override for `--dtype` |
+| `kv_cache_dtype` | String | No | Per-instance override for `--kv-cache-dtype` |
+| `enable_chunked_prefill` | Boolean | No | Per-instance override for `--enable-chunked-prefill` |
+| `enable_prefix_caching` | Boolean | No | Per-instance override for `--enable-prefix-caching` |
+| `prioritize_prefill` | Boolean | No | Per-instance override for `--prioritize-prefill` |
+| `enable_local_offloading` | Boolean | No | Per-instance override for `--enable-local-offloading` |
+| `enable_attn_offloading` | Boolean | No | Per-instance override for `--enable-attn-offloading` |
+| `enable_sub_batch_interleaving` | Boolean | No | Per-instance override for `--enable-sub-batch-interleaving` |
+| `enable_block_copy` | Boolean | No | Per-instance override for `--enable-block-copy` |
 
 \* At least one of `num_npus` or `tp_size` must be provided. The other is inferred.
 
@@ -103,6 +116,7 @@ weights are sharded by `ep_size` (each instance holds `num_local_experts // ep_s
 | `single_node_single_instance_H100.json` | Single node on H100 with TP=4 |
 | `single_node_multi_instance.json` | Single node, two instances |
 | `single_node_pd_instance.json` | Single node with prefill/decode disaggregation |
+| `single_node_pd_per_instance_config.json` | P/D disaggregation with prefill/decode-specific runtime limits |
 | `single_node_moe_single_instance.json` | Single node, Qwen3-MoE with TP=2 EP=2 |
 | `single_node_moe_multi_instance.json` | Single node, two MoE instances |
 | `single_node_moe_pd_instance.json` | Single node, MoE with P/D disaggregation |

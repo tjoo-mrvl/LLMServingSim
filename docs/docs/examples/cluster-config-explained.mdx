@@ -206,7 +206,7 @@ the cluster config.
 
 ## Provided configs
 
-The repo ships 13 worked configs under `configs/cluster/`. Each
+The repo ships 15 worked configs under `configs/cluster/`. Each
 example in this section uses one of them:
 
 | Config | Used by |
@@ -214,6 +214,7 @@ example in this section uses one of them:
 | `single_node_single_instance.json` | [Tensor parallel](./parallelism/tensor-parallel) (with `tp_size=2`) |
 | `single_node_multi_instance.json` | [Multi-instance LOAD routing](./disaggregated/multi-instance) |
 | `single_node_pd_instance.json` | [Prefill/decode split](./disaggregated/prefill-decode-split) |
+| `single_node_pd_per_instance_config.json` | P/D split with per-instance runtime limits |
 | `single_node_moe_single_instance.json` | [Expert parallel](./parallelism/expert-parallel) |
 | `single_node_moe_dp_ep_instance.json` | [DP+EP MoE](./parallelism/dp-ep-moe) |
 | `single_node_cxl_instance.json` | [CXL memory tier](./memory-tiers/cxl-memory) |

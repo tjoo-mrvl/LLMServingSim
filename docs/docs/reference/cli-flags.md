@@ -18,6 +18,10 @@ Complete reference for every command-line flag accepted by
 
 ## Batching and scheduling
 
+These flags are deployment defaults. A cluster config can override the
+matching runtime knobs per `instances[i]`; see
+**[Cluster config](./cluster-config#runtime-overrides-optional)**.
+
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--max-num-seqs` | int | `128` | Max sequences in a batch. `0` = unlimited |
