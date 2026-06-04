@@ -816,9 +816,18 @@ class Scheduler:
     
     # add decode request to decode instance from prefill instnace
     def add_decode(self, req):
+        req.instance_id = self.instance_id
         self.request.append(req)
-        kv_size = self.memory.get_total_kv(req)
-        self.memory.allocate(kv_size, Device.NPU)
+        if self.enable_prefix_caching:
+            self.memory.prefix_match(req)
+            kv_size = self.memory.get_evict_kv(req)
+            evict_size = max(0, kv_size - self.memory.avail_size(Device.NPU))
+            if evict_size > 0:
+                self.memory.evict_prefix_cache(evict_size, Device.NPU)
+            self.memory.cache_unfinished_req(req, Device.NPU)
+        else:
+            kv_size = self.memory.get_total_kv(req)
+            self.memory.allocate(kv_size, Device.NPU)
     
     # get first request's arrival time
     def get_first_arrival_time(self):
