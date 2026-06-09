@@ -144,14 +144,21 @@ def _resolve_dp_groups(all_instances):
             m["tp_dim"] = tp_dim
             m["ep_dim"] = ep_dim
 
-    # Non-DP instances
+    # Non-DP instances. Independent multi-instance configs still use a
+    # multi-dimensional topology ([tp_size, num_groups]); local collectives
+    # must be scoped to dim 0 so they do not cross instance/PP groups.
+    network_dims = _compute_network_dims(all_instances)
+    local_dim = None
+    if len(network_dims) > 1:
+        local_dim = [True] + [False] * (len(network_dims) - 1)
+
     for inst in all_instances:
         if inst.get("dp_group") is None:
             inst["dp_group_size"] = 1
             inst["local_ep"] = inst["ep_size"]
             inst["ep_total"] = inst["ep_size"]
-            inst["tp_dim"] = None
-            inst["ep_dim"] = None
+            inst["tp_dim"] = local_dim
+            inst["ep_dim"] = local_dim if inst["ep_size"] > 1 else None
 
 
 def _compute_network_dims(instances):
