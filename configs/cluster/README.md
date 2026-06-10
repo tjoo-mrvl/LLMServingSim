@@ -85,14 +85,56 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 
 \* At least one of `num_npus` or `tp_size` must be provided. The other is inferred.
 
-**Parallelism rules:**
+### Per-instance runtime overrides
+
+The 13 runtime fields listed above (`max_num_seqs`, `max_num_batched_tokens`, etc.) support **per-instance overrides** in the cluster config. This enables heterogeneous deployments where different instances in the same cluster use different scheduler limits.
+
+**Precedence rule:**
+```
+per-instance value (from cluster config) > global CLI value (from --flag)
+```
+
+For each field, the runtime reads `instance.get("<field>", args.<field>)` — if the field is present in the cluster config, it takes precedence; otherwise the global CLI value is used.
+
+**Unlimited semantics:**
+Setting a numeric field to `0` means "unlimited" (via the `_runtime_limit` helper). For example:
+- `max_num_seqs: 0` → no limit on concurrent sequences
+- `max_num_batched_tokens: 0` → no limit on batched tokens
+
+**Validation gates:**
+- `enable_sub_batch_interleaving: true` requires `enable_attn_offloading: true` (enforced at config load time)
+
+**Example: heterogeneous P/D instances**
+
+See `single_node_pd_per_instance_config.json` for a concrete example where the prefill instance uses `max_num_seqs: 32` (tight concurrency) and the decode instance uses `max_num_seqs: 256` (high throughput):
+
+```json
+{
+  "instances": [
+    {
+      "pd_type": "prefill",
+      "max_num_seqs": 32,
+      "max_num_batched_tokens": 8192,
+      "enable_chunked_prefill": true
+    },
+    {
+      "pd_type": "decode",
+      "max_num_seqs": 256,
+      "max_num_batched_tokens": 0,
+      "enable_chunked_prefill": false
+    }
+  ]
+}
+```
+
+### Parallelism rules:
 - `num_npus = tp_size * pp_size`
 - TP and EP share the same GPUs: non-MoE layers use TP (ALLREDUCE), MoE layers use EP (ALLTOALL)
 - DP is achieved via multiple instances with the same `dp_group`
 - Without `dp_group`: `ep_size <= tp_size`
 - For MoE models: `ep_size` must divide `num_local_experts`
 
-**DP+EP topology:**
+### DP+EP topology:
 When `dp_group` is set, `config_builder.py` generates a 2D ASTRA-Sim topology
 `[tp_size, dp_group_size]` with per-dimension collective routing via `involved_dim`.
 ALLREDUCE (TP) runs on dim 0 only, ALLTOALL (EP) runs on dim 1. All instances in a
