@@ -680,6 +680,7 @@ def main():
                                    inst_cfg["enable_attn_offloading"], power_model, pim_models[node_id],
                                    inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+                                   tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"])
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],

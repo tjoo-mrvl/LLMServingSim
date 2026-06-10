@@ -962,7 +962,8 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
         if wt_loc != 'LOCAL':
             power_acc.dram_weight_bytes += wt
         if comm_size > 0:
-            power_acc.link_data_bytes += total_ring_data(comm_size, ctx.tp_size, collective=comm_type.lower())
+            collective = comm_type.split(':', 1)[0].lower()
+            power_acc.link_data_bytes += total_ring_data(comm_size, ctx.tp_size, collective=collective)
 
     return latency_ns
 
