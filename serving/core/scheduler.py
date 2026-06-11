@@ -2,6 +2,7 @@ import bisect
 import pandas as pd
 from time import time
 import csv
+import os
 
 from .request import *
 from .utils import *
@@ -909,7 +910,11 @@ class Scheduler:
         
     # save requests information to an output file
     def save_output(self, output_file, is_append=False):
-        output_file = f'../{output_file}'
+        if not os.path.isabs(output_file):
+            output_file = f'../{output_file}'
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
         mode = 'a' if is_append else 'w'
         with open(output_file, mode=mode, newline='') as file:
             # Initialize the CSV writer

@@ -25,6 +25,7 @@ from serving.core.config_builder import *
 from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
+from serving.core.run_paths import build_run_paths, resolve_run_id
 import sys as flush
 
 from pyinstrument import Profiler
@@ -73,6 +74,44 @@ def _cluster_config_path(path):
 def _load_cluster_config_for_overrides(path):
     with open(_cluster_config_path(path), "r") as f:
         return json.load(f)
+
+
+def _resolve_output_file(path, run_id):
+    if path is None:
+        return None
+    return path.replace("{run_id}", run_id)
+
+
+def _prepare_ns3_config(astra_sim, run_paths):
+    template = os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/config/config.txt")
+    output_dir = os.path.join(run_paths.inputs_root, "ns3", "output")
+    config_path = os.path.join(run_paths.inputs_root, "ns3", "config.txt")
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+    replacements = {
+        "FLOW_FILE": os.path.join(output_dir, "flow.txt"),
+        "TRACE_FILE": os.path.join(output_dir, "trace.txt"),
+        "TRACE_OUTPUT_FILE": os.path.join(output_dir, "mix.tr"),
+        "FCT_OUTPUT_FILE": os.path.join(output_dir, "fct.txt"),
+        "PFC_OUTPUT_FILE": os.path.join(output_dir, "pfc.txt"),
+        "QLEN_MON_FILE": os.path.join(output_dir, "qlen.txt"),
+    }
+
+    for path in (replacements["FLOW_FILE"], replacements["TRACE_FILE"]):
+        open(path, "w").close()
+
+    with open(template, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        for line in lines:
+            parts = line.split(maxsplit=1)
+            if parts and parts[0] in replacements:
+                f.write(f"{parts[0]} {replacements[parts[0]]}\n")
+            else:
+                f.write(line)
+    return config_path
 
 
 def _iter_raw_instances(cluster_config):
@@ -210,7 +249,13 @@ def main():
                         'If None, requests must be added manually in serving/__main__.py')
     parser.add_argument('--output', type=str, default=None,
                         help='path for per-request CSV output with latency metrics (TTFT, TPOT, ITL). '
-                        'If None, results are printed to stdout only')
+                        'If None, results are printed to stdout only. Supports {run_id} placeholder')
+    parser.add_argument('--run-id', type=str, default=None,
+                        help='unique id for this simulation run. Intermediate ASTRA-Sim inputs are written under '
+                        'astra-sim/inputs/runs/<run-id>. If omitted, a process-unique id is generated')
+    parser.add_argument('--inputs-root', type=str, default=None,
+                        help='override the root directory for generated ASTRA-Sim inputs. Defaults to '
+                        'astra-sim/inputs/runs/<run-id>')
     parser.add_argument('--skip-prefill', action='store_true', default=False,
                         help='skip the prefill phase, running decode only')
     parser.add_argument('--num-reqs', type=int, default=0,
@@ -228,6 +273,11 @@ def main():
 
     args = parser.parse_args()
     
+    args.run_id = resolve_run_id(args.run_id)
+    run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
+    args.inputs_root = run_paths.inputs_root
+    args.output = _resolve_output_file(args.output, args.run_id)
+
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
     print_banner()
@@ -254,7 +304,8 @@ def main():
         inst.get("enable_attn_offloading", False) for inst in raw_instances)
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(
-        astra_sim, args.cluster_config, build_enable_local_offloading, build_enable_attn_offloading)
+        astra_sim, args.cluster_config, build_enable_local_offloading, build_enable_attn_offloading,
+        inputs_root=run_paths.inputs_root)
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
     instances = cluster["instances"]
@@ -278,20 +329,15 @@ def main():
     # Automatic network, memory configuration
     # If you want to set more specific information such as latency, look at config.py and each json file
     if network_backend == 'analytical':
-        network=os.path.join(astra_sim, "inputs/network/network.yml")
+        network=run_paths.network_config
         binary=os.path.join(astra_sim, "build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra")
     elif network_backend == 'ns3':
-        network=os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/config/config.txt")
+        network=_prepare_ns3_config(astra_sim, run_paths)
         binary=os.path.join(astra_sim, "extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default")
-        # make output files
-        output_dir = os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/output")
-        os.makedirs(output_dir, exist_ok=True)
-        open(os.path.join(output_dir, "flow.txt"), "w").close()
-        open(os.path.join(output_dir, "trace.txt"), "w").close()
     else:
         raise NotImplementedError("Only analytical and ns3 network backend are supported")
-    memory=os.path.join(astra_sim, 'inputs/memory/memory_expansion.json')
-    system=os.path.join(astra_sim, "inputs/system/system.json")
+    memory=run_paths.memory_config
+    system=run_paths.system_config
     # ------------------------------------- Prepare simulation -------------------------------------
     # Need to extract each instance's memory accessability 
     node2inst_mapping = defaultdict(list)
@@ -445,11 +491,11 @@ def main():
         event_time = first_arival_time
     else:
         event_time = INTERVAL
-    generate_event(int(event_time))
+    generate_event(int(event_time), inputs_root=run_paths.inputs_root)
     # Make Chakra Grapth
-    generate_graph(None, None, total_npu, event=True)
+    generate_graph(None, None, total_npu, event=True, inputs_root=run_paths.inputs_root)
     # set first workload file
-    workload = get_workload(None, None, event=True)
+    workload = get_workload(None, None, event=True, inputs_root=run_paths.inputs_root)
     # run subprocess
     args = [binary, "--workload-configuration="+workload, "--system-configuration="+system, "--network-configuration="+network, "--memory-configuration="+memory]
     if start_npu_ids != "":
@@ -588,18 +634,22 @@ def main():
                                        dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                        dp_sum_total_len=sum_total_len,
-                                       enable_block_copy=inst_cfg["enable_block_copy"])
+                                       enable_block_copy=inst_cfg["enable_block_copy"],
+                                       inputs_root=run_paths.inputs_root)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
-                                       workload_name=dp_workload_name)
+                                       workload_name=dp_workload_name,
+                                       inputs_root=run_paths.inputs_root)
                         if inst_id != instance_id:
                             dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
-                                                                    workload_name=dp_workload_name)
+                                                                    workload_name=dp_workload_name,
+                                                                    inputs_root=run_paths.inputs_root)
 
                     dp_pending[dg].clear()
                     workload = get_workload(dummy, instances[instance_id]["hardware"], instance_id,
-                                            workload_name=dp_workload_name)
+                                            workload_name=dp_workload_name,
+                                            inputs_root=run_paths.inputs_root)
                     controller.write_flush(p, workload)
                     responded = True
                 else:
@@ -650,18 +700,22 @@ def main():
                                            dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                            dp_sum_total_len=sum_total_len,
-                                           enable_block_copy=inst_cfg["enable_block_copy"])
+                                           enable_block_copy=inst_cfg["enable_block_copy"],
+                                           inputs_root=run_paths.inputs_root)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
-                                           workload_name=dp_workload_name)
+                                           workload_name=dp_workload_name,
+                                           inputs_root=run_paths.inputs_root)
                             if inst_id != instance_id:
                                 dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
-                                                                        workload_name=dp_workload_name)
+                                                                        workload_name=dp_workload_name,
+                                                                        inputs_root=run_paths.inputs_root)
 
                         dp_pending[dg].clear()
                         workload = get_workload(new_req, instance["hardware"], instance_id,
-                                                workload_name=dp_workload_name)
+                                                workload_name=dp_workload_name,
+                                                inputs_root=run_paths.inputs_root)
                         controller.write_flush(p, workload)
                     else:
                         # Waiting for other DP members — send pass
@@ -681,15 +735,19 @@ def main():
                                    inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
-                                   enable_block_copy=inst_cfg["enable_block_copy"])
+                                   enable_block_copy=inst_cfg["enable_block_copy"],
+                                   inputs_root=run_paths.inputs_root)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
-                                   inst_cfg["enable_local_offloading"])
-                    workload = get_workload(new_req, instance["hardware"], instance_id)
+                                   inst_cfg["enable_local_offloading"],
+                                   inputs_root=run_paths.inputs_root)
+                    workload = get_workload(new_req, instance["hardware"], instance_id,
+                                            inputs_root=run_paths.inputs_root)
                     controller.write_flush(p, workload)
             elif new_req is not None:
                 # Non-first NPU: pick up existing batch workload
-                workload = get_workload(new_req, instances[instance_id]["hardware"], instance_id)
+                workload = get_workload(new_req, instances[instance_id]["hardware"], instance_id,
+                                        inputs_root=run_paths.inputs_root)
                 controller.write_flush(p, workload)
 
         # check time to store throughput (only print on start NPU to avoid transient states)
