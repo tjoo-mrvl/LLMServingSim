@@ -164,8 +164,8 @@ matching `sequence:` rather than editing this file.
 
 ### `config_builder.py`
 Parses the user-provided cluster config JSON from `configs/cluster/` and generates the
-ASTRA-Sim input files: `astra-sim/inputs/network/network.yml`,
-`astra-sim/inputs/memory/memory_expansion.json`, and `astra-sim/inputs/system/system.json`.
+ASTRA-Sim input files under `astra-sim/inputs/runs/<run_id>/`: `network/network.yml`,
+`memory/memory_expansion.json`, and `system/system.json`.
 For DP groups, generates a 2D network topology `[tp_size, dp_group_size]` and sets
 `system.json` collective implementations to match the number of topology dimensions.
 Computes `tp_dim`/`ep_dim` per instance for `involved_dim` scoping.

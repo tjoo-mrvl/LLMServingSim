@@ -16,10 +16,11 @@ For the *internals* of how this trace is produced, see
 ## File location
 
 ```
-astra-sim/inputs/trace/<hardware>/<model>/instance_<i>_batch_<b>.txt
+astra-sim/inputs/runs/<run_id>/trace/<hardware>/<model>/instance_<i>_batch_<b>.txt
 ```
 
-One file per (instance × batch). Regenerated every iteration.
+One file per (instance × batch), under the run-specific ASTRA-Sim input
+root. Regenerated every iteration.
 
 ## File structure
 

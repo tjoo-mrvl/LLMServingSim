@@ -64,7 +64,18 @@ matching runtime knobs per `instances[i]`; see
 | --- | --- | --- | --- |
 | `--dataset` | path | `None` | JSONL workload file. See **[Workloads → JSONL format](/docs/workloads/jsonl-format)** |
 | `--num-reqs` | int | `0` | Entries to load from the dataset (`0` = all). For agentic, each entry is a session |
-| `--output` | path | `None` | Per-request CSV output path. Stdout only if `None` |
+| `--output` | path | `None` | Per-request CSV output path. Stdout only if `None`. The literal `{run_id}` is replaced with the active run id |
+
+## Run isolation
+
+Each invocation writes ASTRA-Sim intermediates under a run-specific input
+root so parallel simulations do not overwrite each other's generated
+configs, traces, or Chakra workloads.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--run-id` | string | auto-generated | Path-safe id for this simulation run. Used in `astra-sim/inputs/runs/<run-id>` and the `{run_id}` output placeholder |
+| `--inputs-root` | path | `astra-sim/inputs/runs/<run-id>` | Override the generated ASTRA-Sim input root, for example to place intermediates on local SSD or tmpfs |
 
 ## Logging
 

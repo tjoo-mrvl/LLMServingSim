@@ -90,7 +90,7 @@ column set.
   interleaving silently no-ops (you can't split a single request
   into two halves without breaking the per-request semantics).
 - **Trace tags.** If you read the generated trace file
-  (`astra-sim/inputs/trace/...`), each layer carries a `BATCH_1`
+  (`astra-sim/inputs/runs/<run_id>/trace/...`), each layer carries a `BATCH_1`
   or `BATCH_2` misc tag instead of the usual `NONE`. Confirms
   interleaving is actually emitted.
 

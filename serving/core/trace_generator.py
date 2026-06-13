@@ -10,6 +10,7 @@ from .config_builder import get_device
 from .power_model import PowerModel, total_ring_data
 from .pim_model import PIMModel
 from .logger import get_logger
+from .run_paths import input_path
 import bisect
 from dataclasses import dataclass, field
 
@@ -1449,7 +1450,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True):
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None):
 
     model = batch.model
     config = get_config(model)
@@ -1461,7 +1462,12 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     load_size = batch.load
     evict_size = batch.evict
 
-    output_path = f"inputs/trace/{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}.txt"
+    if inputs_root is None:
+        inputs_root = os.path.join(os.getcwd(), "inputs")
+    output_path = input_path(
+        inputs_root, "trace", hardware, batch.model,
+        f"instance{instance_id}_batch{batch.batch_id}.txt",
+    )
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # make trace — accept either the Mistral-style ``num_local_experts``
@@ -1560,7 +1566,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
 
 
 # generate event for first request arrival
-def generate_event(alarm):
+def generate_event(alarm, inputs_root=None):
 
     # make inputs for text file
     result = []
@@ -1579,7 +1585,10 @@ def generate_event(alarm):
     result.append([layer_name, comp_time, input_loc, input_size, weight_loc, weight_size, output_loc, output_size, comm_type, comm_size, misc])
 
     # write to the text file
-    output_path = f"inputs/trace/event_handler.txt"
+    if inputs_root is None:
+        inputs_root = os.path.join(os.getcwd(), "inputs")
+    output_path = input_path(inputs_root, "trace", "event_handler.txt")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
         f.write(f"EVENT\n")
         f.write(f'{len(result)}'+'\n') # length of the text is 1
