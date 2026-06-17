@@ -58,6 +58,13 @@ class Scheduler:
         else:
             return self.schedule_base(current, sys, batch_id)
 
+    def _get_reload_size(self, batch_req, batch_len):
+        load_size = 0
+        for req in batch_req[:batch_len]:
+            if req.evict:
+                load_size += self.memory.get_evict_kv(req)
+        return load_size
+
     # batch the request scheduling method
     def schedule_base(self, current, sys, batch_id=-1):
         # first NPU to process new batch
@@ -176,7 +183,8 @@ class Scheduler:
             temp_len = batch_len
             for i in range(batch_len, -1, -1):
                 kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                if self.memory.is_avail(kv_size, Device.NPU):
+                load_size = self._get_reload_size(batch_req, i)
+                if self.memory.is_avail(kv_size + load_size, Device.NPU):
                     temp_len = i
                     break
             
@@ -193,16 +201,18 @@ class Scheduler:
                     continue
 
                 # else
-                evict_size += self.memory.get_evict_kv(gen_req[-1])
-                gen_req[-1].evict = True
-                self.logger.info("Eviction of the request #%d", gen_req[-1].id)
+                req_to_evict = gen_req[-1]
+                evicted_kv_size = self.memory.get_evict_kv(req_to_evict)
+                evict_size += evicted_kv_size
+                req_to_evict.evict = True
+                self.logger.info("Eviction of the request #%d", req_to_evict.id)
                 gen_req = gen_req[:-1]
                 # spill to cpu (host) memory. get_evict_kv returns per-rank
                 # bytes; cpu_used is tracked in full-cluster bytes (matches
                 # MemoryModel.apply_kv_cache_events convention), so scale by
                 # num_npus when crossing the NPU->CPU boundary.
-                self.memory.free(evict_size, Device.NPU)
-                self.memory.allocate(evict_size * self.num_npus, Device.CPU)
+                self.memory.free(evicted_kv_size, Device.NPU)
+                self.memory.allocate(evicted_kv_size * self.num_npus, Device.CPU)
 
                 if len(gen_req) < batch_len:
                     batch_len = len(gen_req)
@@ -210,16 +220,17 @@ class Scheduler:
                 # check if can batch
                 for i in range(batch_len, -1, -1):
                     kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                    if self.memory.is_avail(kv_size, Device.NPU):
+                    load_size = self._get_reload_size(batch_req, i)
+                    if self.memory.is_avail(kv_size + load_size, Device.NPU):
                         temp_len = i
                         break
 
             batch_len = temp_len
             batch_req = batch_req[:batch_len]
-            load_size = 0
 
             # Recompute kv_size for final batch
             kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
+            load_size = self._get_reload_size(batch_req, batch_len)
 
             # delete from request queue
             for req in batch_req:
@@ -229,18 +240,17 @@ class Scheduler:
                         break
 
                 if req.evict:
-                    # load evicted kv cache
-                    load_size += self.memory.get_evict_kv(req)
                     req.evict = False
                     self.logger.info("Loading the request #%d", req.id)
 
             # ============ STEP 4: Allocate memory ============
             if kv_size > 0:
                 self.memory.allocate(kv_size, Device.NPU)
-            
-            # load memory from cpu (host); see offload comment above —
+
+            # Reload evicted KV to NPU and remove the spilled copy from CPU.
             # load_size is per-rank, cpu_used is full-cluster.
             if load_size > 0:
+                self.memory.allocate(load_size, Device.NPU)
                 self.memory.free(load_size * self.num_npus, Device.CPU)
             
             # ============ STEP 5: Build batch with lists ============
