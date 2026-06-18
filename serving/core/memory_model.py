@@ -172,7 +172,9 @@ class MemoryModel():
         for i in range(batch_len):
             req = batch_req[i]
             if req.evict or req.is_prefill():
-                # (decode + evict) or (prefill) should load all of KV caches
+                # Prefill and reloaded decode requests may allocate newly
+                # computed blocks. Existing evicted KV is reloaded separately
+                # by Scheduler.load_size.
                 hit = req.npu_cache_hit if self.enable_prefix_caching else 0
                 
                 if scheduled_tokens and req.id in scheduled_tokens:
