@@ -25,6 +25,8 @@ volunteered their effort to make LLMServingSim better for everyone. 🙏
   - Non-DP multi-instance collective scoping ([#39](https://github.com/casys-kaist/LLMServingSim/pull/39))
   - Run-isolated ASTRA-Sim input paths ([#43](https://github.com/casys-kaist/LLMServingSim/pull/43))
   - KV eviction/reload accounting ([#48](https://github.com/casys-kaist/LLMServingSim/pull/48))
+- **[@Veilwalker](https://github.com/Veilwalker)**
+  - Avoid duplicate prefix-cache hit accounting under chunked prefill ([#49](https://github.com/casys-kaist/LLMServingSim/pull/49))
 - **[@zsxh1990](https://github.com/zsxh1990)**
   - Docs for per-instance runtime overrides ([#38](https://github.com/casys-kaist/LLMServingSim/pull/38))
   - Generalized PIM latency model for arbitrary architectures ([#45](https://github.com/casys-kaist/LLMServingSim/pull/45))
