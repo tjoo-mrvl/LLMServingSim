@@ -542,8 +542,8 @@ class Scheduler:
                         break
 
                 # Load prefix cache from storage if needed
-                if req.is_prefill() and req.storage_cache_hit > req.prefix_cache_hit:
-                    prefix_load_size += (req.storage_cache_hit - req.prefix_cache_hit) * self.memory.get_kv(1)
+                if req.is_prefill() and req.storage_cache_hit > req.npu_cache_hit:
+                    prefix_load_size += (req.storage_cache_hit - req.npu_cache_hit) * self.memory.get_kv(1)
 
                 # Handle evicted requests
                 if req.evict:
