@@ -162,7 +162,7 @@ class Category(ABC):
 def _entry_dict(entries: dict[str, LayerEntry]) -> dict[str, dict]:
     """Serialize a catalog group for RPC transport."""
     return {
-        name: {"vllm": e.vllm, "within": e.within, "tp_stable": e.tp_stable}
+        name: {"vllm": e.vllm, "within": e.within, "repr_match": e.repr_match, "tp_stable": e.tp_stable}
         for name, e in entries.items()
     }
 

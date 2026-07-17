@@ -57,17 +57,21 @@ catalog:
     q_a_layernorm:
       vllm: RMSNorm
       within: DeepseekV2MLAAttention
+      repr_match: "1536"   # normalizes q_lora_rank; distinguishes from kv_a_layernorm (512)
       tp_stable: true
     q_b_proj:
       vllm: ColumnParallelLinear
       within: DeepseekV2MLAAttention
+      repr_match: "1536"   # in_features = q_lora_rank; distinguishes from kv_b_proj (512)
     kv_a_layernorm:
       vllm: RMSNorm
       within: DeepseekV2MLAAttention
+      repr_match: "512"    # normalizes kv_lora_rank; distinguishes from q_a_layernorm (1536)
       tp_stable: true
     kv_b_proj:
       vllm: ColumnParallelLinear
       within: DeepseekV2MLAAttention
+      repr_match: "512"    # in_features = kv_lora_rank; distinguishes from q_b_proj (1536)
     rotary_emb:
       vllm: DeepseekScalingRotaryEmbedding
       within: DeepseekV2MLAAttention

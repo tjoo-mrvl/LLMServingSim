@@ -61,6 +61,7 @@ def _strip_class_name(raw: str) -> str:
 
 def _match_slice(
     node_class: str,
+    raw_name: str,
     ancestors: list[str],
     slice_: dict[str, dict[str, Any]],
 ) -> str | None:
@@ -84,6 +85,13 @@ def _match_slice(
     best_depth = -2  # within=None → depth -1; any match wins over no match
     for canonical, spec in slice_.items():
         if spec["vllm"] != node_class:
+            continue
+        # Optional repr disambiguator: skip this entry unless its
+        # ``repr_match`` substring appears in the module's un-stripped repr
+        # (e.g. an input dim like "1536" separating q_b_proj from kv_b_proj,
+        # which share (vllm, within) = (ColumnParallelLinear, DeepseekV2MLAAttention)).
+        repr_match = spec.get("repr_match")
+        if repr_match is not None and repr_match not in raw_name:
             continue
         within = spec.get("within")
         if within is None:
@@ -121,7 +129,7 @@ def extract_samples(
             cls = _strip_class_name(raw_name)
 
             # Try to match this node against the requested slice.
-            canonical = _match_slice(cls, ancestors, slice_)
+            canonical = _match_slice(cls, raw_name, ancestors, slice_)
             if canonical is not None:
                 cuda_us = float(node["entry"]["cuda_time_us"])
                 invocations = max(1, int(node["entry"]["invocations"]))

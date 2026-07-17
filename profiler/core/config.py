@@ -101,6 +101,14 @@ class LayerEntry(BaseModel):
     same ``vllm`` class appears multiple times in the model (most
     commonly RMSNorm, which shows up as input/post/final layernorm)."""
 
+    repr_match: str | None = None
+    """Optional substring that must appear in the module's stringified
+    repr (e.g. an input dimension like ``"1536"``) to disambiguate two
+    modules that share the same ``(vllm, within)`` — e.g. DeepSeek MLA's
+    ``q_a_layernorm`` vs ``kv_a_layernorm`` (both RMSNorm) or ``q_b_proj``
+    vs ``kv_b_proj`` (both ColumnParallelLinear), all inside
+    DeepseekV2MLAAttention. Matched against the un-stripped node name."""
+
     tp_stable: bool = False
     """If True, profile this layer only at TP=1 and replicate the
     results into every tp{N}/ folder."""
@@ -181,17 +189,17 @@ class Architecture(BaseModel):
                 f"{len(self.catalog.attention)}"
             )
 
-        # (vllm, within) pairs globally unique so layer matching is
-        # deterministic. (Multiple catalog-tree nodes can match one
-        # entry, that's fine — their timings get averaged by the sink.)
-        pairs: dict[tuple[str, str | None], str] = {}
+        # (vllm, within, repr_match) triples globally unique so layer
+        # matching is deterministic. (Multiple catalog-tree nodes can match
+        # one entry, that's fine — their timings get averaged by the sink.)
+        pairs: dict[tuple[str, str | None, str | None], str] = {}
         for _, name, entry in self.catalog.all_entries():
-            key = (entry.vllm, entry.within)
+            key = (entry.vllm, entry.within, entry.repr_match)
             if key in pairs:
                 raise ValueError(
                     f"Ambiguous layer binding: {name!r} and {pairs[key]!r} "
                     f"both resolve to (vllm={entry.vllm!r}, "
-                    f"within={entry.within!r})"
+                    f"within={entry.within!r}, repr_match={entry.repr_match!r})"
                 )
             pairs[key] = name
 
