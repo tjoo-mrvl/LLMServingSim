@@ -145,6 +145,11 @@ class Sequence(BaseModel):
 
     prologue: list[str] = Field(default_factory=list)
     pre_attn: list[str] = Field(default_factory=list)
+    # Alternate pre-attention pipeline for models that swap the attention
+    # front-end per layer (DeepSeek-V4: the sparse-indexer "C4A" layers,
+    # compress_ratios[layer]==4). The simulator dispatches pre_attn vs
+    # pre_attn_indexed by layer index; empty for models without it.
+    pre_attn_indexed: list[str] = Field(default_factory=list)
     post_attn: list[str] = Field(default_factory=list)
     mlp_dense: list[str] = Field(default_factory=list)
     mlp_moe: list[str] = Field(default_factory=list)
@@ -152,7 +157,7 @@ class Sequence(BaseModel):
 
     def all_layers(self) -> list[str]:
         return [
-            *self.prologue, *self.pre_attn, *self.post_attn,
+            *self.prologue, *self.pre_attn, *self.pre_attn_indexed, *self.post_attn,
             *self.mlp_dense, *self.mlp_moe, *self.head,
         ]
 
