@@ -81,6 +81,7 @@ TARGET="${TARGET:-r1}"          # r1 | v4flash
 STAGE="${STAGE:-full}"          # full | fast | skew   (R1 only; V4 is always skip-skew)
 HARDWARE="${HARDWARE:-H200}"
 DTYPE="${DTYPE:-bfloat16}"      # bf16 activations; vLLM auto-applies the fp8 weights from quantization_config
+FLASHINFER_MOE_FP8="${FLASHINFER_MOE_FP8:-1}"   # 1 => export VLLM_USE_FLASHINFER_MOE_FP8=1 for R1 (match the vLLM recipe/bench); 0 to disable
 FORCE="${FORCE:-}"             # FORCE=1 -> wipe + re-profile from scratch (default: resume)
 VERBOSITY="${VERBOSITY:-}"     # e.g. VERBOSITY=--verbose  (DEBUG + vLLM stdout)
 
@@ -154,6 +155,18 @@ case "$TARGET" in
       full) stage_flags=("${skew_factor_flags[@]}") ;;
       *)    echo "ERROR: unknown STAGE='$STAGE' (use full|fast|skew)" >&2; exit 2 ;;
     esac
+
+    # Match the official vLLM R1 recipe's MoE kernel so profiled MoE timings line
+    # up with `bench`. Without it vLLM defaults to the (untuned) Triton FP8 MoE.
+    # Verify the vLLM log then says "Using FLASHINFER_... Fp8 MoE backend" (on some
+    # GPUs the flag is a no-op and stays on TRITON).
+    # GOTCHA: the MoE shot key is (tokens, activated_experts) — the backend is NOT
+    # part of it — so switching this on an existing profile needs FORCE=1 to
+    # actually re-measure MoE.
+    if [[ "$FLASHINFER_MOE_FP8" == "1" ]]; then
+      export VLLM_USE_FLASHINFER_MOE_FP8=1
+      echo ">>> VLLM_USE_FLASHINFER_MOE_FP8=1 (matching the vLLM R1 recipe)"
+    fi
 
     echo ">>> Profiling DeepSeek-R1 on $HARDWARE  (tp=$TP_DEGREES, STAGE=$STAGE)"
     run_profile "$MODEL" "" "$HF_OVERRIDES" "${stage_flags[@]}"
