@@ -176,7 +176,10 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
                 field_name,
             )
             continue
-        val = args.model_config[field_name]
+        # Honour a user --hf-overrides value for a shard field (e.g.
+        # DeepSeek-V4-Flash num_key_value_heads 1 -> 8 so it divides by tp);
+        # fall back to the model config otherwise.
+        val = hf_overrides.get(field_name, args.model_config[field_name])
         if not isinstance(val, int):
             raise TypeError(
                 f"shard field {field_name!r} must be an int; got "
