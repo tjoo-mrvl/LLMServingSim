@@ -49,6 +49,9 @@ def register_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--data-parallel-size", type=int, default=1,
                    dest="data_parallel_size",
                    help="vLLM data_parallel_size (DP across engines).")
+    p.add_argument("--pipeline-parallel-size", type=int, default=1,
+                   dest="pipeline_parallel_size",
+                   help="vLLM pipeline_parallel_size (PP across stages).")
     p.add_argument("--enable-expert-parallel", action="store_true",
                    dest="enable_expert_parallel", default=False,
                    help="vLLM enable_expert_parallel for MoE models.")
@@ -66,6 +69,8 @@ def register_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--kv-cache-dtype", default="auto",
                    dest="kv_cache_dtype",
                    help="vLLM kv_cache_dtype.")
+    p.add_argument("--load-format", default="auto", dest="load_format",
+                   help="vLLM load_format (auto | safetensors | fastsafetensors | runai_streamer).")
     p.add_argument("--seed", type=int, default=42,
                    help="Sampling seed for vLLM.")
     p.add_argument("--tick-seconds", type=float, default=1.0,
@@ -149,6 +154,7 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
     engine_args = AsyncEngineArgs(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
         data_parallel_size=args.data_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
         max_num_seqs=args.max_num_seqs,
@@ -156,6 +162,7 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
         max_model_len=args.max_model_len,
         dtype=args.dtype,
         kv_cache_dtype=args.kv_cache_dtype,
+        load_format=args.load_format,
         seed=args.seed,
         disable_log_stats=False,
     )
@@ -275,9 +282,10 @@ def _record_from_metrics(idx: int, req: dict, metrics) -> dict:
 
 def _engine_kwargs_for_meta(engine_args) -> dict:
     fields = (
-        "model", "tensor_parallel_size", "data_parallel_size",
-        "enable_expert_parallel", "max_num_seqs", "max_num_batched_tokens",
-        "max_model_len", "dtype", "kv_cache_dtype", "seed",
+        "model", "tensor_parallel_size", "pipeline_parallel_size",
+        "data_parallel_size", "enable_expert_parallel", "max_num_seqs",
+        "max_num_batched_tokens", "max_model_len", "dtype", "kv_cache_dtype",
+        "load_format", "seed",
     )
     return {k: getattr(engine_args, k, None) for k in fields}
 
