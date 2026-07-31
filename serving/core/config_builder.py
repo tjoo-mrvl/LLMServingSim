@@ -64,10 +64,12 @@ def _resolve_parallelism(instance, model_config):
         For dense models: ep_size defaults to 1
         Without dp_group: ep_size <= tp_size
     """
-    # Accept either the Mistral-style ``num_local_experts`` key or the
-    # HF/Qwen3 ``num_experts`` key — HF naming varies per model family
-    # and the profiler's configs track upstream.
-    is_moe = 'num_local_experts' in model_config or 'num_experts' in model_config
+    # Accept the Mistral-style ``num_local_experts`` key, the HF/Qwen3
+    # ``num_experts`` key, or the DeepSeek ``n_routed_experts`` key — HF
+    # naming varies per model family and the profiler's configs track
+    # upstream. (Same 3-key set memory_model.py recognizes.)
+    is_moe = ('num_local_experts' in model_config or 'num_experts' in model_config
+              or 'n_routed_experts' in model_config)
 
     num_npus = instance.get("num_npus")
     tp_size = instance.get("tp_size")
@@ -111,7 +113,8 @@ def _resolve_parallelism(instance, model_config):
         raise ValueError(f"ep_size ({ep_size}) > tp_size ({tp_size}) requires dp_group to be set")
     if is_moe:
         num_experts = model_config.get(
-            "num_local_experts", model_config.get("num_experts", 1)
+            "num_local_experts",
+            model_config.get("num_experts", model_config.get("n_routed_experts", 1)),
         )
         if num_experts % ep_size != 0:
             raise ValueError(

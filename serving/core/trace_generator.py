@@ -21,6 +21,16 @@ from dataclasses import dataclass, field
 # ----------------------------------------------------------------------
 _perf_db_cache = {}
 
+# Dense-layer aliases: canonical layers that are structurally identical to
+# another captured layer, which the profiler's repr-based matcher cannot tell
+# apart (identical module repr, so `repr_match` has nothing to key on). Hydrated
+# into the dense table at load time so both _layer_available() and
+# _lookup_dense() resolve them transparently, with no re-profiling.
+# DeepSeek's final RMSNorm ('model.norm', emitted as `final_layernorm`) has the
+# same repr as the per-layer `layernorm`, so it never gets its own profile row;
+# it is the same op with the same cost, so we alias it to `layernorm`.
+_DENSE_ALIASES = {"final_layernorm": "layernorm"}
+
 logger = get_logger("TraceGenerator")
 
 
@@ -365,6 +375,12 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
         dense_df = _read_category_csv(os.path.join(tp_dir, "dense.csv"), None)
         if dense_df is not None:
             tables["dense"] = _build_1d_table(dense_df, "layer", "tokens")
+            # Resolve dense aliases (see _DENSE_ALIASES): if an aliased layer
+            # was not captured but its source layer was, reuse the source row.
+            for alias, src in _DENSE_ALIASES.items():
+                d = tables["dense"]
+                if alias not in d and src in d:
+                    d[alias] = d[src]
 
         per_seq_df = _read_category_csv(os.path.join(tp_dir, "per_sequence.csv"), None)
         if per_seq_df is not None:
@@ -1077,7 +1093,9 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # ASTRA-Sim AG ``data_size`` is per-rank local chunk (sum / ep_total);
     # RS ``data_size`` is the pre-scatter total buffer.
     n_embd = ctx.config['hidden_size']
-    num_experts = ctx.config.get('num_local_experts', ctx.config.get('num_experts', 0))
+    num_experts = ctx.config.get('num_local_experts',
+                                 ctx.config.get('num_experts',
+                                                ctx.config.get('n_routed_experts', 0)))
     dispatch_per_token = (n_embd + num_experts) * ctx.fp
     combine_per_token = n_embd * ctx.fp
     ag_per_rank_tokens = max(1, effective_total_len_comm // max(ep_total, 1))
@@ -1568,10 +1586,14 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     )
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # make trace — accept either the Mistral-style ``num_local_experts``
-    # key or the HF/Qwen3 ``num_experts`` key so both family's configs
-    # resolve to a live GateRouter.
-    num_experts_cfg = config.get("num_local_experts", config.get("num_experts"))
+    # make trace — accept the Mistral-style ``num_local_experts`` key, the
+    # HF/Qwen3 ``num_experts`` key, or the DeepSeek ``n_routed_experts`` key
+    # so all three family's configs resolve to a live GateRouter. (Same
+    # 3-key fallback memory_model.py already uses.)
+    num_experts_cfg = config.get(
+        "num_local_experts",
+        config.get("num_experts", config.get("n_routed_experts")),
+    )
     if num_experts_cfg:
         gate = GateRouter(
             node_id, instance_id, num_experts_cfg,
