@@ -10,6 +10,7 @@
 #   TARGET=v4flash ./profiler/profile-deepseek-h200.sh     # DeepSeek-V4-Flash  (needs DeepGEMM)
 #
 # R1 staging (recommended for a bounded H200 window):
+#   SMOKE=1 ./profiler/profile-deepseek-h200.sh      # fast tp=1 pipeline check (tiny grid); verify BEFORE the full run
 #   STAGE=fast ./profiler/profile-deepseek-h200.sh   # 1) complete, SIMULATABLE profile (skew skipped) + meta.yaml
 #   STAGE=skew ./profiler/profile-deepseek-h200.sh   # 2) add the skew sweep (resume-safe; the long pole)
 #   STAGE=full ./profiler/profile-deepseek-h200.sh   # everything in one shot (default)
@@ -122,21 +123,36 @@ case "$TARGET" in
     # tp=1 is MANDATORY (the CLI rejects a --tp list without it): it supplies
     # the MoE profile (profiled only at tp=1) and every tp_stable layer, which
     # get replicated into tp8/. tp=8 is the deployment sharding.
-    TP_DEGREES="1,8"
     # 2-layer override so ONE run materialises a dense (layer 0) AND an MoE
     # (layer 1) block; default num_hidden_layers=1 + R1's first_k_dense_replace=3
     # would give no MoE layer -> the MoE hook raises "got 0".
     HF_OVERRIDES='{"num_hidden_layers": 2, "first_k_dense_replace": 1}'
 
-    # ---- decided params (rationale in the header) ----
-    # Sized to the SWE-bench trace (max ~21.7K ctx). Raise ATTENTION_MAX_KV to
-    # 65536 if you regenerate with R1 --use-vllm / longer outputs (measure first).
-    ATTENTION_MAX_KV=32768
-    ATTENTION_CHUNK_FACTOR=1.5
-    ATTENTION_KV_FACTOR=2.0
-    MAX_NUM_BATCHED_TOKENS=4096
-    MAX_NUM_SEQS=256
-    MEASUREMENT_ITERATIONS=3
+    # ---- params (all overridable via env; SMOKE=1 = fast pipeline check) ----
+    if [[ "${SMOKE:-}" == "1" ]]; then
+      # Tiny 4D grid, tp=1, no skew, 1 iter -> a few minutes. Verifies the whole
+      # path (CSVs written, repr_match, FlashInfer MoE) — NOT real timing numbers.
+      TP_DEGREES="${TP_DEGREES:-1}"; STAGE="fast"
+      ATTENTION_MAX_KV="${ATTENTION_MAX_KV:-2048}"
+      ATTENTION_CHUNK_FACTOR="${ATTENTION_CHUNK_FACTOR:-2.0}"
+      ATTENTION_KV_FACTOR="${ATTENTION_KV_FACTOR:-2.0}"
+      MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1024}"
+      MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+      MEASUREMENT_ITERATIONS="${MEASUREMENT_ITERATIONS:-1}"
+    else
+      TP_DEGREES="${TP_DEGREES:-1,8}"
+      # Sized to the SWE-bench trace (max ~21.7K ctx). NOTE: chunk-factor 1.5 +
+      # MSQ 256 makes a ~19k-shot attention grid (~4h/TP). For a bounded window,
+      # override ATTENTION_CHUNK_FACTOR=2.0 and MAX_NUM_SEQS=64 (SWE-bench is
+      # low-concurrency) to cut it to ~1-1.5h/TP. Raise ATTENTION_MAX_KV to 65536
+      # only for longer traces (measure first).
+      ATTENTION_MAX_KV="${ATTENTION_MAX_KV:-32768}"
+      ATTENTION_CHUNK_FACTOR="${ATTENTION_CHUNK_FACTOR:-1.5}"
+      ATTENTION_KV_FACTOR="${ATTENTION_KV_FACTOR:-2.0}"
+      MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+      MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
+      MEASUREMENT_ITERATIONS="${MEASUREMENT_ITERATIONS:-3}"
+    fi
     # skew density (only consulted when skew runs). Bump kvs/kp to 4.0 if the
     # skew sweep is too slow at ATTENTION_MAX_KV=65536.
     SKEW_N_FACTOR="${SKEW_N_FACTOR:-2.0}"
