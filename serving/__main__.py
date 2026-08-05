@@ -559,6 +559,27 @@ def main():
     # Pre-generated workloads ready to submit on next "Waiting"
     dp_ready_workloads = {}  # instance_id -> workload_path
 
+    # Bound on-disk .et traces: keep at most the current + previous wave per
+    # consumer (instance<i>_batch<M> / dp_<dg>_batch<M>), reaping older waves as
+    # new ones are submitted. Without this every decode iteration's trace dir
+    # accumulates until the end-of-run sweep, filling disk on long-decode runs
+    # (a full 4096-token MoE decode crashed with "No space left"). Deleting only
+    # the fully-superseded previous wave is safe: ASTRA-Sim swaps ETFeeders on
+    # the next submit (Workload.cc), and an open fd keeps an unlinked file alive.
+    _recent_trace_dirs = {}  # consumer prefix -> [batch_dir, ...] (most recent last)
+
+    def _reap_stale_traces(workload_path):
+        if not args.cleanup_inputs or not workload_path or workload_path == "pass":
+            return
+        cur = os.path.dirname(workload_path)      # .../instanceX_batchM or .../dp_G_batchM
+        key = cur.rsplit('_batch', 1)[0]          # group waves by consumer
+        dirs = _recent_trace_dirs.setdefault(key, [])
+        if dirs and dirs[-1] == cur:
+            return                                # same wave (multi-NPU re-submit)
+        dirs.append(cur)
+        while len(dirs) > 2:                      # keep current + 1 previous
+            shutil.rmtree(dirs.pop(0), ignore_errors=True)
+
     # ----------------------------------- Start simulation loop ------------------------------------
     # Starting simulation, one while loop processes one iteration
     while True:
@@ -616,7 +637,9 @@ def main():
 
         # Check if a pre-generated workload is ready for this instance (from DP sync)
         if new_req is None and instance_id in dp_ready_workloads:
-            controller.write_flush(p, dp_ready_workloads.pop(instance_id))
+            _dp_wl = dp_ready_workloads.pop(instance_id)
+            controller.write_flush(p, _dp_wl)
+            _reap_stale_traces(_dp_wl)
             responded = True
         # DP group: truly idle instance (no inflight batch) — create dummy batch so ALLTOALL syncs
         elif new_req is None and instance_id in inst_dp_group and sys == inst2npu_mapping[instance_id] and len(schedulers[instance_id].inflight) == 0:
@@ -689,6 +712,7 @@ def main():
                                             workload_name=dp_workload_name,
                                             inputs_root=run_paths.inputs_root)
                     controller.write_flush(p, workload)
+                    _reap_stale_traces(workload)
                     responded = True
                 else:
                     controller.write_flush(p, "pass")
@@ -757,6 +781,7 @@ def main():
                                                 workload_name=dp_workload_name,
                                                 inputs_root=run_paths.inputs_root)
                         controller.write_flush(p, workload)
+                        _reap_stale_traces(workload)
                     else:
                         # Waiting for other DP members — send pass
                         controller.write_flush(p, "pass")
@@ -786,11 +811,13 @@ def main():
                     workload = get_workload(new_req, instance["hardware"], instance_id,
                                             inputs_root=run_paths.inputs_root)
                     controller.write_flush(p, workload)
+                    _reap_stale_traces(workload)
             elif new_req is not None:
                 # Non-first NPU: pick up existing batch workload
                 workload = get_workload(new_req, instances[instance_id]["hardware"], instance_id,
                                         inputs_root=run_paths.inputs_root)
                 controller.write_flush(p, workload)
+                _reap_stale_traces(workload)
 
         # check time to store throughput (only print on start NPU to avoid transient states)
         if current > last_log + INTERVAL and sys == inst2npu_mapping[instance_id]:
