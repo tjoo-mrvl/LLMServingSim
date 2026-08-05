@@ -171,13 +171,12 @@ class GateRouter:
             pairs to go around; beyond saturation the count is
             capped at ``E / ep_size``.
 
-        Per-rank token count uses the probability a given token hits
-        at least one of rank r's experts:
-
-          P(token hits r) = 1 − ((ep − 1) / ep) ** k
-
-        which collapses to ~1 when ``k ≫ ep`` (so every token reaches
-        every rank) and degrades gracefully for small-k / large-ep.
+        Per-rank token count is the rank's grouped-GEMM row load expressed
+        in the profile's ``tokens`` unit. Because ``moe[T, A]`` bakes in the
+        ``top_k`` fan-out, the per-rank argument is
+        ``pairs_per_rank / k = total_len / ep_size`` — NOT the number of
+        distinct tokens reaching the rank, which would double-count the
+        fan-out and over-charge the MoE lookup by ``~ep * hit_prob``.
         """
         k = self.k
         E_rank = max(1, self.E // ep_size)
@@ -186,10 +185,21 @@ class GateRouter:
         activated_per_rank = min(int(round(pairs_per_rank)), E_rank)
         activated_counts = [activated_per_rank] * ep_size
 
-        if ep_size <= 1:
-            hit_prob = 1.0
-        else:
-            hit_prob = 1.0 - ((ep_size - 1) / ep_size) ** k
-        tokens_to_r = int(round(total_len * hit_prob))
+        # Per-rank token argument for the moe.csv lookup. The profiled
+        # ``moe[T, A]`` already bakes in the ``top_k`` fan-out (it runs
+        # ``T * top_k`` grouped-GEMM rows over ``A`` experts, see
+        # profiler/core/hooks/moe_hook.py), so the per-rank count must be the
+        # rank's grouped-GEMM rows de-scaled by ``top_k``:
+        #   pairs_per_rank / k = (total_len * k / ep) / k = total_len / ep.
+        # The earlier ``total_len * hit_prob`` counted *distinct* tokens
+        # reaching a rank; the profile then re-expanded that by ``top_k``,
+        # over-charging the MoE by ~``ep * hit_prob`` (5.25x for R1 ep=8,k=8).
+        # That inflation is invisible in the flat weight-load regime (small
+        # batches) but multiplicative on the compute-bound ramp (long prefill
+        # / large batch), which is why it blew up TTFT on long-context runs.
+        # Floor at 1: a rank that receives any pairs still pays the
+        # weight-load floor (moe.csv's tokens=1 row), so sub-1 shares round
+        # up rather than extrapolating below the profiled grid.
+        tokens_to_r = max(1, int(round(pairs_per_rank / k)))
         local_tokens = [tokens_to_r] * ep_size
         return local_tokens, activated_counts
