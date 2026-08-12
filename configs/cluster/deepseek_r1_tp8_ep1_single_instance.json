@@ -1,6 +1,6 @@
 {
     "num_nodes": 1,
-    "link_bw": 100,
+    "link_bw": 450,
     "link_latency": 1000,
     "nodes": [
         {
