@@ -44,8 +44,21 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | Field | Type | Description |
 | --- | --- | --- |
 | `num_nodes` | Integer | Number of nodes in the cluster |
-| `link_bw` | Float or Array<Float> | ASTRA-Sim topology link bandwidth in GB/s. A scalar is broadcast to all topology dimensions; an array must match the final `npus_count` rank |
-| `link_latency` | Float or Array<Float> | ASTRA-Sim topology link latency in ns. A scalar is broadcast to all topology dimensions; an array must match the final `npus_count` rank |
+| `link_bw` | Float or Array<Float> | Per-link **ring all-reduce bus bandwidth** in GB/s (`busbw = link_bw`; see note). A scalar broadcasts to all topology dimensions; an array must match the final `npus_count` rank, ordered `[scale-up (intra-node), scale-out (inter-node), …]`. |
+| `link_latency` | Float or Array<Float> | Per-hop link latency in ns, using the same dimension ordering as `link_bw`. Typical: NVLink ≈ 1000, inter-node fabric ≈ 5000. |
+
+> **Setting `link_bw` correctly.** ASTRA-Sim's analytical backend (`Congestion_Unaware`) models each
+> collective as a ring — all-reduce is `2(N−1)` steps of `size/N` with per-message delay
+> `hops·latency + bytes/link_bw` (`BasicTopology.cpp`, `Ring.cc`). The algebra makes the value you set
+> **exactly the achieved all-reduce *bus* bandwidth** on that dimension, so use the real per-*direction*
+> bus bandwidth, **not** the per-node aggregate:
+> - **dim0 — intra-node scale-up (NVLink), a per-GPU non-blocking fabric:** H200/H100 = **450**
+>   (= 900 GB/s bidirectional ÷ 2, per direction); RTXPRO6000 ≈ 16.
+> - **dim1 — inter-node scale-out (EFA / InfiniBand), a per-*node* fabric shared by its GPUs:** the
+>   node's fabric bandwidth ÷ the GPUs sharing it — e.g. p5en EFAv3 400 GB/s ÷ 8 GPUs = **50**.
+>
+> (The datasheet 900 GB/s NVLink figure is the per-node *bidirectional aggregate* and must not be set
+> directly.)
 
 ### Per-node fields
 

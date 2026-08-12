@@ -1,7 +1,7 @@
 {
     "num_nodes": 1,
-    "link_bw": 900,
-    "link_latency": 0,
+    "link_bw": 450,
+    "link_latency": 1000,
     "nodes": [
         {
             "num_instances": 1,
