@@ -78,6 +78,38 @@ def probe_moe_params(hf_cfg: dict[str, Any]) -> tuple[int, int] | None:
     return (int(num_experts), int(top_k))
 
 
+def moe_per_rank_overrides(model_config: dict[str, Any], tp: int, ep: int) -> dict[str, Any]:
+    """hf_overrides that shrink the MoE to a single (tp, ep) rank's shape, for the
+    per-rank MoE profiling pass (the clean Fix 2 / Fix 4):
+
+      * ``num_experts //= ep``               — each EP rank owns E/ep experts
+      * ``moe_intermediate_size //= moe_tp``  where ``moe_tp = max(1, tp // ep)``
+                                              — TP-sharding of the expert GEMM (EP-off / hybrid)
+
+    Returns ``{}`` for (tp, ep) == (1, 1) (== the full-model tp1 profile). Raises if a
+    divisor does not divide evenly (mirrors the SHARD_FIELDS check in fuse_engine_kwargs).
+    """
+    tp = max(1, int(tp))
+    ep = max(1, int(ep))
+    moe_tp = max(1, tp // ep)
+    ov: dict[str, Any] = {}
+    if ep > 1:  # ep==1 (EP-off / dense) keeps ALL experts on the rank — no reshape
+        for k in MOE_NUM_EXPERTS_KEYS:
+            v = model_config.get(k)
+            if isinstance(v, int):
+                if v % ep != 0:
+                    raise ValueError(f"num_experts {k}={v} is not divisible by ep={ep}")
+                ov[k] = v // ep
+    if moe_tp > 1:
+        key = "moe_intermediate_size" if "moe_intermediate_size" in model_config else "intermediate_size"
+        v = model_config.get(key)
+        if isinstance(v, int):
+            if v % moe_tp != 0:
+                raise ValueError(f"{key}={v} is not divisible by moe_tp={moe_tp} (tp={tp}, ep={ep})")
+            ov[key] = v // moe_tp
+    return ov
+
+
 # ---------------------------------------------------------------------------
 # Catalog (loaded from architecture yaml)
 # ---------------------------------------------------------------------------
@@ -370,6 +402,12 @@ class ProfileArgs:
 
     # TP sweep
     tp_degrees: list[int] = field(default_factory=lambda: [1])
+
+    # EP sweep for per-rank-shape MoE profiling. For each (tp, ep) the MoE is
+    # profiled single-GPU with num_experts=E/ep and moe_intermediate/=max(1, tp//ep),
+    # written to variant/moe/tp{tp}_ep{ep}/moe.csv. Default [1] = no per-rank pass
+    # (the tp1/moe.csv full-model profile is used). See MOE_PER_RANK_PROFILING.md.
+    ep_degrees: list[int] = field(default_factory=lambda: [1])
 
     # Output variant
     variant: str | None = None

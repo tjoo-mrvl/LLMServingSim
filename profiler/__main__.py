@@ -52,7 +52,7 @@ from profiler.core.config import (
     read_model_config,
     resolve_architecture_by_model_type,
 )
-from profiler.core.runner import run_full, run_slice
+from profiler.core.runner import run_full, run_moe_per_rank, run_slice
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +87,15 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
         default="1",
         help="Comma-separated TP degrees to sweep, e.g. '1,2,4'. "
              "Must include 1. Default: '1'.",
+    )
+    p.add_argument(
+        "--ep",
+        default="1",
+        help="Comma-separated EP degrees for per-rank-shape MoE profiling, e.g. "
+             "'1,8'. For each (tp, ep) the MoE is profiled single-GPU at the local "
+             "shape (num_experts=E/ep, moe_intermediate/=max(1,tp//ep)) -> "
+             "perf/.../moe/tp{tp}_ep{ep}/moe.csv (the clean Fix 2 / Fix 4). "
+             "Default: '1' (no per-rank pass; simulator uses tp1/moe.csv).",
     )
     p.add_argument(
         "--variant",
@@ -322,6 +331,13 @@ def _parse_tp(tp_str: str) -> list[int]:
     return tps
 
 
+def _parse_ep(ep_str: str) -> list[int]:
+    """Parse --ep (per-rank MoE profiling EP degrees). Unlike --tp, need not
+    include 1; (tp, ep)==(1, 1) is simply the existing tp1/moe.csv."""
+    eps = [int(x.strip()) for x in ep_str.split(",") if x.strip()]
+    return eps or [1]
+
+
 def _build_profile_args(
     ns: argparse.Namespace,
     hf_id: str,
@@ -333,6 +349,7 @@ def _build_profile_args(
         model=hf_id,
         hardware=ns.hardware,
         tp_degrees=_parse_tp(ns.tp),
+        ep_degrees=_parse_ep(getattr(ns, "ep", "1")),
         variant=ns.variant,
         dtype=ns.dtype,
         kv_cache_dtype=ns.kv_cache_dtype,
@@ -448,6 +465,9 @@ def main(argv: list[str] | None = None) -> int:
     # 5. Dispatch.
     if ns.cmd == "profile":
         run_full(arch_path, profile_args, ns.out_root)
+        # Per-rank-shape MoE pass (clean Fix 2 / Fix 4) when --ep requests it.
+        if any(ep != 1 for ep in profile_args.ep_degrees):
+            run_moe_per_rank(arch_path, profile_args, ns.out_root)
     elif ns.cmd == "slice":
         run_slice(
             arch_path,

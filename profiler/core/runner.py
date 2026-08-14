@@ -21,7 +21,12 @@ from profiler.core.categories import (
     Category,
     categories_for,
 )
-from profiler.core.config import Architecture, ProfileArgs, load_architecture
+from profiler.core.config import (
+    Architecture,
+    ProfileArgs,
+    load_architecture,
+    moe_per_rank_overrides,
+)
 from profiler.core.engine import probe_limits, spin_down, spin_up
 from profiler.core.hooks.timings import TimingSample
 from profiler.core.writer import (
@@ -281,3 +286,67 @@ def run_slice(
     persist_meta(args, arch_path, engine_kwargs, variant_root)
 
     log.done(variant_root)
+
+
+# ---------------------------------------------------------------------------
+# Per-rank-shape MoE pass (clean Fix 2 / Fix 4)
+# ---------------------------------------------------------------------------
+
+def run_moe_per_rank(
+    arch_path: Path,
+    args: ProfileArgs,
+    out_root: Path,
+) -> None:
+    """Profile the MoE category at per-(tp, ep) rank shapes on a single GPU, writing
+    ``variant/moe/tp{tp}_ep{ep}/moe.csv``.
+
+    This is the clean Fix 2 / Fix 4: the MoE FIXED overhead and expert width are
+    MEASURED at the real local shape (``num_experts = E/ep``, ``moe_intermediate_size
+    /= max(1, tp//ep)``) rather than synthesized from the tp1 full-model profile. The
+    simulator auto-selects these per-rank tables (see
+    ``serving/core/trace_generator.py::_moe_tbl``); ``(tp, ep) == (1, 1)`` is skipped
+    because that IS the existing ``tp1/moe.csv``.
+
+    UNVERIFIED: authored without GPU access. Validate on a vLLM host per
+    ``MOE_PER_RANK_PROFILING.md`` before trusting the output.
+    """
+    arch = load_architecture(arch_path)
+    variant_root = _variant_root(out_root, args)
+    if args.model_config is None:
+        raise ValueError("run_moe_per_rank requires ProfileArgs.model_config")
+
+    moe_cats = [c for c in categories_for(arch, 1) if c.name == "moe"]
+    if not moe_cats:
+        log.warning("architecture has no MoE category; skipping per-rank MoE pass")
+        return
+    moe_cat = moe_cats[0]
+
+    combos = sorted({
+        (int(tp), int(ep))
+        for tp in args.tp_degrees for ep in args.ep_degrees
+        if (int(tp), int(ep)) != (1, 1)
+    })
+    if not combos:
+        return
+
+    log.banner(args, variant_root)
+    log.info("Per-rank MoE pass: (tp, ep) combos = %s", combos)
+
+    for tp, ep in combos:
+        overrides = moe_per_rank_overrides(args.model_config, tp, ep)
+        if not overrides:
+            log.info("(tp=%d, ep=%d): no per-rank MoE reshape; skipping", tp, ep)
+            continue
+        out_dir = variant_root / "moe" / f"tp{tp}_ep{ep}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Single-GPU engine (full hidden/heads); the per-rank MoE shape is set
+        # entirely by ``overrides`` (num_experts/ep, moe_intermediate/moe_tp).
+        with log.stage(f"per-rank MoE  tp={tp} ep={ep}  booting vLLM engine"):
+            llm, _engine_kwargs, tmpdir = spin_up(args, 1, extra_hf_overrides=overrides)
+            limits = probe_limits(llm)
+        try:
+            _fire_one_category(llm, moe_cat, arch, args, limits, 1, out_dir)
+        finally:
+            spin_down(llm, tmpdir)
+
+    log.done(variant_root / "moe")

@@ -105,7 +105,8 @@ def _profile_engine_overrides(args: ProfileArgs) -> dict[str, Any]:
     return out
 
 
-def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
+def fuse_engine_kwargs(args: ProfileArgs, tp: int,
+                       extra_hf_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     """Produce the final ``**kwargs`` to pass to ``vllm.LLM()``.
 
     Design: profile every TP degree on a **single GPU** by keeping
@@ -192,8 +193,13 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
             )
         sharded_overrides[field_name] = val // tp
 
-    # 5. Sharding wins.
-    kwargs["hf_overrides"] = _deep_merge(hf_overrides, sharded_overrides)
+    # 5. Sharding wins over defaults/CLI; per-rank MoE overrides
+    #    (num_experts/ep, moe_intermediate_size/moe_tp for a per-rank MoE
+    #    profiling pass) win over everything — they redefine the MoE shape.
+    merged = _deep_merge(hf_overrides, sharded_overrides)
+    if extra_hf_overrides:
+        merged = _deep_merge(merged, extra_hf_overrides)
+    kwargs["hf_overrides"] = merged
 
     # 6. Wire the worker extension.
     kwargs["worker_extension_cls"] = "profiler.core.hooks.extension.Extension"
@@ -206,7 +212,8 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def spin_up(
-    args: ProfileArgs, tp: int
+    args: ProfileArgs, tp: int,
+    extra_hf_overrides: dict[str, Any] | None = None,
 ) -> tuple[LLM, dict[str, Any], Path]:
     """Construct a vLLM engine ready for profiling.
 
@@ -226,7 +233,7 @@ def spin_up(
               caller MUST pass this to ``spin_down`` so it gets
               cleaned up.
     """
-    kwargs = fuse_engine_kwargs(args, tp)
+    kwargs = fuse_engine_kwargs(args, tp, extra_hf_overrides)
 
     # Materialize the model's config.json in a temp directory so vLLM
     # can load it directly from disk.
