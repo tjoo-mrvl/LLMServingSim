@@ -397,6 +397,23 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
         tables_per_tp[tp] = tables
         available_tps.append(tp)
 
+    # Per-rank-shape MoE profiles keyed by (tp, ep): ``{root}/moe/tp{T}_ep{E}.csv``,
+    # written by the per-rank profiler pass (num_experts=E/ep, moe_intermediate/=moe_tp;
+    # see MOE_PER_RANK_PROFILING.md). Present only when that pass has been run; when
+    # absent the simulator falls back to the tp1 (full-model) ``moe.csv`` — byte-identical
+    # to prior behavior. This is the clean Fix 2 (EP-on FIXED-over-local) / Fix 4 (EP-off
+    # TP-shard) path: with a per-rank table the cost is measured at the real local shape.
+    moe_by_tpep = {}
+    moe_dir = os.path.join(root, "moe")
+    if os.path.isdir(moe_dir):
+        for entry in sorted(os.listdir(moe_dir)):
+            m = re.match(r"tp(\d+)_ep(\d+)$", entry)
+            if m is None:
+                continue
+            df = _read_category_csv(os.path.join(moe_dir, entry, "moe.csv"), None)
+            if df is not None:
+                moe_by_tpep[(int(m.group(1)), int(m.group(2)))] = _build_moe_table(df)
+
     perf_db = {
         "meta": meta,
         "architecture": arch,
@@ -405,6 +422,7 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
         "model": model,
         "available_tps": sorted(available_tps),
         "tables": tables_per_tp,
+        "moe_by_tpep": moe_by_tpep,
     }
     _perf_db_cache[cache_key] = perf_db
     _check_tp_coverage(perf_db, tp_needed, hardware, model, variant)
@@ -826,21 +844,47 @@ def _lookup_attention(perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decod
     return max(1, int(out))
 
 
-def _lookup_moe(perf_db, tokens, activated_experts):
-    """MoE is profiled once at tp=1 (single-rank view); the simulator
-    looks up per EP-rank token counts.
+def _moe_tbl(perf_db, tp, ep):
+    """Resolve the MoE table for a runtime (tp, ep). Prefer a per-rank-shape
+    profile ``moe_by_tpep[(tp, ep)]`` (correct FIXED / expert width for the real
+    local shape → the clean Fix 2 / Fix 4); else fall back to the tp1 (full-model)
+    profile — byte-identical to the pre-per-rank behavior. Returns ``(table, is_per_rank)``.
     """
+    per = perf_db.get("moe_by_tpep") or {}
+    key = (int(tp), int(ep))
+    if key in per:
+        return per[key], True
     tp_eff = 1 if 1 in perf_db["available_tps"] else perf_db["available_tps"][0]
-    tbl = _tp_tables(perf_db, tp_eff).get("moe")
+    return _tp_tables(perf_db, tp_eff).get("moe"), False
+
+
+def _lookup_moe(perf_db, tokens, activated_experts, tp=1, ep=1):
+    """MoE latency lookup. Uses a per-rank-shape profile for (tp, ep) when present,
+    else the tp1 profile (see ``_moe_tbl``).
+    """
+    tbl, _is_per_rank = _moe_tbl(perf_db, tp, ep)
     if tbl is None:
         raise KeyError(
             f"Missing moe profile. Check that moe.csv exists under "
-            f"perf/{perf_db['hardware']}/{perf_db['model']}/{perf_db['variant']}/tp{tp_eff}/."
+            f"perf/{perf_db['hardware']}/{perf_db['model']}/{perf_db['variant']}/tp1/ "
+            f"(or a per-rank moe/tp{int(tp)}_ep{int(ep)}.csv)."
         )
     ae_vals = tbl["activated_experts_vals"]
     rows = tbl["rows"]
     aeq = max(int(activated_experts), 1)
     tokq = max(int(tokens), 1)
+    ae_min = ae_vals[0]
+    if aeq < ae_min:
+        # Fix B (sub-top_k floor): the profiler cannot represent activated < top_k
+        # (every profiled token fires top_k experts, so the smallest activated row
+        # is top_k). The old code let ``_lookup_bounds`` clamp aeq up to that row,
+        # charging the weight-load of ``ae_min`` experts to a rank that actually
+        # touches only ``aeq`` (e.g. an ep8 rank at batch=1 fires ~1 expert but was
+        # billed moe(tok, 8)). Instead subtract the excess experts' weight-load, the
+        # activated-axis slope: moe(tok, aeq) = moe(tok, ae_min) - (ae_min-aeq)*per_expert.
+        base = _lookup_1d(rows[0]["keys"], rows[0]["values"], tokq)
+        per_expert = _moe_per_expert_ns(perf_db, tp, ep)
+        return max(1, int(base - (ae_min - aeq) * per_expert))
     lo, hi = _lookup_bounds(ae_vals, aeq)
     val_lo = _lookup_1d(rows[lo]["keys"], rows[lo]["values"], tokq)
     if lo == hi:
@@ -848,6 +892,83 @@ def _lookup_moe(perf_db, tokens, activated_experts):
     val_hi = _lookup_1d(rows[hi]["keys"], rows[hi]["values"], tokq)
     out = _linear_interpolate(ae_vals[lo], val_lo, ae_vals[hi], val_hi, aeq)
     return max(1, int(out))
+
+
+def _moe_per_expert_ns(perf_db, tp=1, ep=1):
+    """MoE activated-axis slope (weight-load per expert), in ns. Cached per (tp, ep).
+
+    Evaluated at the smallest token count shared by the two smallest activated
+    rows, so it isolates the per-expert weight-load from the token-axis GEMM.
+    Shared by the sub-top_k floor (``_lookup_moe`` Fix B) and the fixed-overhead
+    fit (``_moe_fixed_ns``) so both use one consistent slope, read from the same
+    (per-rank or tp1) table the lookup uses.
+    """
+    cache = perf_db.setdefault("_moe_per_expert_cache", {})
+    key = (int(tp), int(ep))
+    if key in cache:
+        return cache[key]
+    tbl, _ = _moe_tbl(perf_db, tp, ep)
+    if tbl is None or len(tbl["activated_experts_vals"]) < 2:
+        cache[key] = 0.0
+        return 0.0
+    ae = tbl["activated_experts_vals"]
+    rows = tbl["rows"]
+    t0 = max(rows[0]["keys"][0], rows[1]["keys"][0])
+    v0 = _lookup_1d(rows[0]["keys"], rows[0]["values"], t0)
+    v1 = _lookup_1d(rows[1]["keys"], rows[1]["values"], t0)
+    per = (v1 - v0) / (ae[1] - ae[0]) if ae[1] != ae[0] else 0.0
+    cache[key] = max(0.0, per)
+    return cache[key]
+
+
+def _moe_fixed_ns(perf_db, tp=1, ep=1):
+    """Token/expert-independent MoE floor (gate over all experts + permute +
+    kernel launch), in ns. Cached on ``perf_db``.
+
+    The tp1 ``moe.csv`` measures a whole MoE layer on one GPU as a SUM of a
+    shardable mass (expert weight-load + grouped-GEMM) and this fixed overhead,
+    which is replicated on every rank and does NOT shard by TP. Splitting it off
+    is what makes a TP-sharded MoE cost derivable from the (EP-only) profile.
+    Fit from the grid: ``fixed = moe(min_tok, top_k) - top_k * per_expert``,
+    where ``per_expert`` is the activated-axis slope (weight-load per expert).
+    """
+    cache = perf_db.setdefault("_moe_fixed_cache", {})
+    key = (int(tp), int(ep))
+    if key in cache:
+        return cache[key]
+    tbl, _ = _moe_tbl(perf_db, tp, ep)
+    if tbl is None or len(tbl["activated_experts_vals"]) < 2:
+        cache[key] = 0.0
+        return 0.0
+    ae = tbl["activated_experts_vals"]
+    rows = tbl["rows"]
+    per_expert = _moe_per_expert_ns(perf_db, tp, ep)
+    fixed = max(0.0, rows[0]["values"][0] - ae[0] * per_expert)
+    cache[key] = fixed
+    return fixed
+
+
+def _lookup_moe_tp_sharded(perf_db, tokens, activated_experts, moe_tp, tp=1, ep=1):
+    """Per-rank MoE latency when experts are TP-sharded along the intermediate
+    dim by ``moe_tp`` (EP-off / partial-EP).
+
+    If a per-rank-shape profile exists for (tp, ep) it already measures the sharded
+    cost directly → use it (the clean Fix 4, no analytical shard). Otherwise
+    synthesize from the tp1 profile: the expert weight-load + grouped-GEMM shard by
+    ``moe_tp`` while the fixed gate/permute/launch overhead (``_moe_fixed_ns``) is
+    replicated per rank:
+        latency = FIXED + (moe(T, A) - FIXED) / moe_tp
+    ``moe_tp == 1`` returns the raw single-GPU lookup unchanged.
+    """
+    _tbl, is_per_rank = _moe_tbl(perf_db, tp, ep)
+    if is_per_rank:
+        return _lookup_moe(perf_db, tokens, activated_experts, tp=tp, ep=ep)
+    full = _lookup_moe(perf_db, tokens, activated_experts, tp=tp, ep=ep)
+    m = max(1, int(moe_tp))
+    if m == 1:
+        return full
+    fixed = _moe_fixed_ns(perf_db, tp=tp, ep=ep)
+    return max(1, int(fixed + (full - fixed) / m))
 
 
 def _catalog_has(perf_db, category, name):
@@ -1081,6 +1202,33 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     effective_total_len_compute = bctx.total_len
     routing = ctx.gate.route_ep(layer_num, batch_id_str, effective_total_len_compute, ep_total)
 
+    # EP-OFF / partial-EP: experts are TP-sharded along their intermediate dim
+    # (moe_tp = tp//ep) rather than distributed whole. Every rank holds all
+    # tokens, so there is no dispatch all-gather; the block runs once and
+    # combines with an ALLREDUCE over the TP dim (the down_proj pattern). Only
+    # the pure TP-shard case (ep_total == 1, tp_size > 1) is emitted here; a
+    # hybrid EP+TP-shard trace is out of scope.
+    if ep_total == 1 and ctx.tp_size > 1:
+        moe_tp = ctx.tp_size
+        local_tokens = routing.local_tokens[0]              # == total_len (all tokens on the rank)
+        activated = max(routing.activated_experts[0], 1)    # cluster-activated experts
+        wt_loc = get_device(ctx.placement, layer_num, "moe", "weights")
+        lat = _lookup_moe_tp_sharded(ctx.perf_db, local_tokens, activated, moe_tp,
+                                     tp=ctx.tp_size, ep=ep_total)
+        inp, wt, out = calculate_sizes(
+            ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp,
+            weight_fp=ctx.weight_fp, moe_weight_fp=ctx.moe_weight_fp, moe_tp=moe_tp)
+        lines.append(formatter("moe", str(lat), 'LOCAL', str(inp), wt_loc, str(wt),
+                               'LOCAL', str(out), _with_dim('ALLREDUCE', ctx.tp_dim),
+                               str(out), batch_tag))
+        if power_acc is not None:
+            if lat > 0:
+                power_acc.npu_latencies_ns.append(lat)
+            if wt_loc != 'LOCAL':
+                power_acc.dram_weight_bytes += wt
+            power_acc.link_data_bytes += total_ring_data(out, ctx.tp_size, collective="allreduce")
+        return
+
     # AG/RS comm sizes are anchored to ``dp_sum_total_len``, which
     # ``serving/__main__.py`` sets to ``max_total_len`` (NOT ``max × dp_group_size``)
     # for DP groups; this calibrates the AG/RS bandwidth model against the same
@@ -1136,7 +1284,8 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
         activated_experts = routing.activated_experts[i]
 
         if local_tokens > 0:
-            rank_latency_ns = _lookup_moe(ctx.perf_db, local_tokens, max(activated_experts, 1))
+            rank_latency_ns = _lookup_moe(ctx.perf_db, local_tokens, max(activated_experts, 1),
+                                          tp=ctx.tp_size, ep=ep_total)
             rank_inp, rank_wt, rank_out = calculate_sizes(
                 ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp,
                 weight_fp=ctx.weight_fp, moe_weight_fp=ctx.moe_weight_fp)

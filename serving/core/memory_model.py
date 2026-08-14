@@ -292,8 +292,12 @@ class MemoryModel():
             block_weight += o_w
         block_weight += ln_w  # post layernorm (same weight size)
         if mlp_type == 'moe':
+            # EP distributes whole experts (parallel=ep); when tp>ep (EP-off /
+            # partial-EP) each expert is ALSO TP-sharded along its intermediate
+            # dim by moe_tp = tp//ep. ep==tp -> moe_tp=1 (bit-identical).
             _, moe_w, _ = calculate_sizes(self.model, 'moe', 1, parallel=ep, fp=fp,
-                                          weight_fp=wfp, moe_weight_fp=mwfp)
+                                          weight_fp=wfp, moe_weight_fp=mwfp,
+                                          moe_tp=max(1, tp // ep))
             block_weight += moe_w
         else:
             _, ffn1_w, _ = calculate_sizes(self.model, 'gate_up_proj', 1, parallel=tp, fp=fp, weight_fp=wfp)
@@ -856,7 +860,7 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
 
 # calculate the per-rank input, weight, output size of each layer
 def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2,
-                    weight_fp=None, moe_weight_fp=None):
+                    weight_fp=None, moe_weight_fp=None, moe_tp=1):
     """Calculate input, weight, and output tensor sizes for a given layer.
 
     Args:
@@ -877,6 +881,12 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
             than the dense path (fp8 dense + fp4 experts). Only consumed
             by the ``moe`` layer branch. When ``None`` (default), falls
             back to ``weight_fp``.
+        moe_tp: intra-expert tensor-parallel degree for the ``moe`` branch.
+            EP (``parallel``) distributes WHOLE experts across ranks; when
+            ``tp > ep`` (EP-off or partial-EP) each expert is ADDITIONALLY
+            TP-sharded along its intermediate dim by ``moe_tp = tp // ep``.
+            Default ``1`` (ep == tp) leaves the expert weights unsharded —
+            bit-identical to the pre-existing expert-parallel model.
     """
     if weight_fp is None:
         weight_fp = fp
@@ -1182,11 +1192,13 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # fp8 dense + fp4 experts). For every existing model
         # (Mixtral / Qwen3-MoE / DeepSeek-R1 / phi-mini-MoE), the resolver
         # collapses ``moe_weight_fp == weight_fp`` so behaviour is unchanged.
-        # Shared experts share dims with routed experts but are NOT divided
-        # by EP.
+        # Shared experts are not distributed by EP (every EP rank keeps the
+        # shared expert), but they ARE TP-sharded along the intermediate dim
+        # like the routed experts when moe_tp>1 (EP-off / partial-EP).
         gate_w = n_embd * num_local_experts * fp
-        routed_w = experts_per_rank * 3 * n_embd * moe_ffn_dim * moe_weight_fp
-        shared_w = n_shared_experts * 3 * n_embd * moe_ffn_dim * moe_weight_fp
+        moe_ffn_shard = moe_ffn_dim // max(1, int(moe_tp))  # intra-expert TP shard (tp//ep; 1 when ep==tp)
+        routed_w = experts_per_rank * 3 * n_embd * moe_ffn_shard * moe_weight_fp
+        shared_w = n_shared_experts * 3 * n_embd * moe_ffn_shard * moe_weight_fp
         weight_size = gate_w + routed_w + shared_w
         output_size = length * n_embd * fp
 
