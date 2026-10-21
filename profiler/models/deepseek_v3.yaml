@@ -1,96 +1,86 @@
 # DeepSeek-V3 family — class catalog (Multi-head Latent Attention + DeepSeekMoE).
 #
-# Covers ``DeepseekV3ForCausalLM`` (and its V2 superclass when q_lora_rank
-# is set, which is the V3 / R1 case). The flagship checkpoints are
-# DeepSeek-V3 / DeepSeek-V3-0324 / DeepSeek-R1 / DeepSeek-R1-0528 — all
-# 671B with 256 routed experts + 1 shared expert and the first
-# ``first_k_dense_replace`` layers running a plain DeepseekV2MLP instead
-# of the MoE block.
+# Covers ``DeepseekV3ForCausalLM``: DeepSeek-V3 / V3-0324 / R1 / R1-0528, all
+# 671B with 256 routed experts + 1 shared expert, the first
+# ``first_k_dense_replace`` (3) layers running a dense MLP and the rest
+# DeepseekV2MoE. vLLM serves it from ``deepseek_v2.py``, the same module as
+# DeepSeek-V3.2 (``deepseek_v32.yaml``), so the class names are shared.
 #
-# Two structural departures from llama / qwen3_moe:
+# It is a separate file rather than a ``model_types`` alias of
+# ``deepseek_v32.yaml`` because V3/R1 has no sparse indexer: that catalog's
+# ``pre_attn`` and component layouts expect ``Indexer`` / ``SparseAttnIndexer``
+# nodes, which never fire here.
 #
-#   1. **MLA**: the QKV path is split into a small fused ``A``-projection
-#      (``fused_qkv_a_proj`` → q_lora_rank + kv_lora_rank + qk_rope_head_dim)
-#      followed by separate Q / KV layernorms and ``B``-projections. The
-#      KV cache stores the *latent* (kv_lora_rank + qk_rope_head_dim) per
-#      token — about 30× smaller than naive MHA — so memory_model.py has
-#      an MLA branch in ``get_kv``. The actual attention kernel is
-#      ``MLAAttention`` (not the standard ``Attention``).
+# Two bindings carry what a live profile tree taught the V3.2 catalog:
 #
-#   2. **Hybrid FFN**: the simulator's trace_generator dispatches between
-#      ``mlp_dense`` and ``mlp_moe`` per layer index against
-#      ``first_k_dense_replace`` from the HF config. Both sequences are
-#      declared below; the YAML alone can't express which runs where.
+#  * The **shared expert is a ``DeepseekV2MLP``**, the same class as a dense
+#    layer's own ``mlp``. ``not_within: DeepseekV2MoE`` keeps the shared
+#    expert (2048 wide) out of the dense MLP entries (18432 wide); its cost is
+#    already inside ``moe``, which binds the whole block. Without it the two
+#    widths are averaged into one row that describes neither.
+#  * ``q_a_layernorm`` / ``kv_a_layernorm`` and ``q_b_proj`` / ``kv_b_proj``
+#    each share (class, parent), so each pair is one canonical entry whose
+#    value is the pair's **sum** (``mla_a_layernorm``, ``mla_b_proj``). The sum
+#    is also what makes ``kv_b_proj`` correct per regime: FlashAttention-MLA
+#    sends requests of up to 512 new tokens down the weight-absorbed decode
+#    path (``reorder_batch_threshold``), where ``kv_b_proj`` never runs.
 #
-# DeepseekV2MoE wraps gate + 256 routed experts (FusedMoE) + 1 shared
-# expert (DeepseekV2MLP) into one timed unit, so per-rank MoE latency
-# already includes the shared expert's contribution. Only the *weight*
-# size needs to add the shared expert (replicated across EP) — see
-# memory_model.calculate_sizes.
-#
-# Canonical layer names mirror vLLM v0.19.0 attribute names (see
-# ../vllm/vllm/model_executor/models/deepseek_v2.py and
-# ../vllm/vllm/model_executor/layers/mla.py).
+# Canonical layer names mirror vLLM's attribute names (see
+# ../vllm/vllm/model_executor/models/deepseek_v2.py). Re-derive the bindings
+# with ``python -m profiler coverage`` on the vLLM version being profiled.
 
-
-sequence:
+blocks:
+  attn:
+    full_attention:
+      pre_attn:  [layernorm, mla_qkv_a_proj, mla_a_layernorm, mla_b_proj,
+                  rotary_emb, attention]
+      post_attn: [o_proj, layernorm]
+  mlp:
+    dense: [gate_up_proj, act_fn, down_proj]
+    moe:   [moe]
+shared:
   prologue:  [embedding]
-  pre_attn:  [layernorm, fused_qkv_a_proj, q_a_layernorm, q_b_proj,
-              kv_a_layernorm, rotary_emb, kv_b_proj, attention]
-  post_attn: [o_proj, layernorm]
-  mlp_dense: [gate_up_proj, act_fn, down_proj]
-  mlp_moe:   [moe]
   head:      [final_layernorm, lm_head, sampler]
-
-
 catalog:
   dense:
     embedding:
       vllm: VocabParallelEmbedding
+      not_within: DeepSeekMultiTokenPredictor
     layernorm:
       vllm: RMSNorm
       within: DeepseekV2DecoderLayer
       tp_stable: true
-    fused_qkv_a_proj:
+    final_layernorm:
+      vllm: RMSNorm
+      within: [DeepseekV3ForCausalLM, DeepseekV2Model]
+      tp_stable: true
+    mla_qkv_a_proj:
       vllm: DeepSeekV2FusedQkvAProjLinear
-      within: DeepseekV2MLAAttention
-    q_a_layernorm:
+    mla_a_layernorm:
       vllm: RMSNorm
       within: DeepseekV2MLAAttention
-      repr_match: "1536"   # normalizes q_lora_rank; distinguishes from kv_a_layernorm (512)
       tp_stable: true
-    q_b_proj:
+    mla_b_proj:
       vllm: ColumnParallelLinear
-      within: DeepseekV2MLAAttention
-      repr_match: "1536"   # in_features = q_lora_rank; distinguishes from kv_b_proj (512)
-    kv_a_layernorm:
-      vllm: RMSNorm
-      within: DeepseekV2MLAAttention
-      repr_match: "512"    # normalizes kv_lora_rank; distinguishes from q_a_layernorm (1536)
-      tp_stable: true
-    kv_b_proj:
-      vllm: ColumnParallelLinear
-      within: DeepseekV2MLAAttention
-      repr_match: "512"    # in_features = kv_lora_rank; distinguishes from q_b_proj (1536)
-    rotary_emb:
-      vllm: DeepseekScalingRotaryEmbedding
       within: DeepseekV2MLAAttention
     o_proj:
       vllm: RowParallelLinear
       within: DeepseekV2MLAAttention
+    rotary_emb:
+      vllm: [DeepseekScalingRotaryEmbedding, RotaryEmbedding]
+      within: MultiHeadLatentAttentionWrapper
     gate_up_proj:
       vllm: MergedColumnParallelLinear
       within: DeepseekV2MLP
+      not_within: DeepseekV2MoE
     act_fn:
       vllm: SiluAndMul
       within: DeepseekV2MLP
+      not_within: DeepseekV2MoE
     down_proj:
       vllm: RowParallelLinear
       within: DeepseekV2MLP
-    final_layernorm:
-      vllm: RMSNorm
-      within: DeepseekV2Model
-      tp_stable: true
+      not_within: DeepseekV2MoE
   per_sequence:
     lm_head:
       vllm: LogitsProcessor
