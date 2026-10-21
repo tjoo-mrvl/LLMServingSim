@@ -23,24 +23,135 @@ generates derived ASTRA-Sim input files (`network.yml`,
 ```json
 {
   "num_nodes": 1,
-  "link_bw": 16,
-  "link_latency": 20000,
   "nodes": [...],
   "cxl_mem": {...}
 }
 ```
 
+`link_bw` and `link_latency` may be set here, but the committed examples on
+hardware we own no longer do: they are measured into
+`profiler/perf/<hw>/hardware.yaml` and inherited. Set them explicitly to
+describe an interconnect you do not have.
+
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `num_nodes` | int | ✓ |  | Number of physical nodes in the cluster |
-| `link_bw` | float or float[] | ✓ |  | ASTRA-Sim topology link bandwidth in **GB/s**. Scalars apply to every topology dimension; arrays must match the final `network.yml::npus_count` rank |
-| `link_latency` | float or float[] | ✓ |  | ASTRA-Sim topology link latency in **ns**. Scalars apply to every topology dimension; arrays must match the final `network.yml::npus_count` rank |
+| `link_bw` | float or float[] | — | *inherited* | ASTRA-Sim topology link bandwidth in **GiB/s** (binary). Scalars apply to every topology dimension; arrays must match the final `network.yml::npus_count` rank. Omit it and the measured value from `profiler/perf/<hw>/hardware.yaml` is used — see [Hardware facts are inherited](#hardware-facts-are-inherited) |
+| `link_latency` | float or float[] | — | *inherited* | ASTRA-Sim topology link latency in **ns**. Scalars apply to every topology dimension; arrays must match the final `network.yml::npus_count` rank. Omit it and the measured value is used |
+| `collective_links` | object | — | *optional inheritance* | Per-operation analytical Ring link settings; see [Collective-specific links](#collective-specific-links). `{}` keeps the common link for every operation |
 | `nodes` | array | ✓ |  | Length must equal `num_nodes` |
 | `cxl_mem` | object | optional | absent | CXL memory expansion (see below) |
 
 Example: if `network.yml` will end up with `npus_count: [4, 2]`, you may set
 `link_bw: [900, 100]` and `link_latency: [0, 20000]` to assign different
 bandwidth/latency per topology dimension.
+
+`link_latency` is charged per network hop, not once per whole collective.
+The hardware profiler fits the [single-chunk Ring contract](../profiler/adding-hardware#calibration-contract).
+Unlike network `link_bw`, `npu_mem.mem_bw` is decimal **GB/s** and also drives
+the backend's local reduction cost. Calibration parameters depend on these
+assumptions; they are not universal physical-link constants.
+
+### Collective-specific links
+
+The congestion-unaware analytical backend can use different effective link
+parameters for `all_reduce`, `all_gather` and `reduce_scatter`. For example,
+this hypothetical single-dimension link overrides only AllGather bandwidth:
+
+```json
+{
+  "link_bw": 100,
+  "link_latency": 1000,
+  "collective_links": {
+    "all_gather": {"link_bw": 80}
+  }
+}
+```
+
+Each operation accepts `link_bw` and/or `link_latency`, with the same units
+and scalar-or-array shape as the common fields. Bandwidth must be finite and
+positive; latency must be finite and nonnegative. Unknown names, empty operation
+objects and mismatched dimension counts are errors.
+
+- An unspecified operation uses the common link. A missing field within an
+  operation also uses its common value.
+- An explicit map replaces the hardware operation map; missing entries do not
+  inherit other operation overrides. An empty map, `{}`, disables inheritance.
+- With no explicit map, operation defaults are inherited from
+  `hardware.yaml::defaults.collective_links` only when **both** common link
+  values are omitted and every instance shares one hardware label. Supplying
+  either common value therefore describes a custom link without silently
+  adding the measured hardware's operation curves.
+
+The bundled RTXPRO6000 Qwen3-32B TP2 and Qwen3-30B DP2/EP2 examples use this
+default path: their cluster configs omit `link_bw`, `link_latency` and
+`collective_links`. No enable flag or model-specific bandwidth is needed.
+
+The generated `network.yml` references same-topology sidecar files through
+`collective_networks`. The backend selects a link using the original collective:
+AllReduce retains its own settings through internal scatter/gather phases.
+Physical message sizes, rank groups, local-memory reductions, and point-to-point
+traffic are unchanged. Rebuild ASTRA-Sim when installing this feature.
+
+:::caution[Analytical Ring only]
+
+This option requires the congestion-unaware analytical backend and Ring
+implementations. It is not supported by ns-3, and it does not implement NCCL
+channel selection, grouped launches or arbitrary ragged collectives. The
+hardware profiler's [calibration contract](../profiler/adding-hardware#calibration-contract)
+and retained residuals bound how its effective curves should be interpreted.
+
+:::
+
+## Hardware facts are inherited
+
+A cluster config mixes two kinds of statement:
+
+| | |
+|---|---|
+| `tp_size`, `num_npus`, `mem_util`, `dp_group`, `pd_type` | what you want to simulate |
+| `link_bw`, `link_latency`, `npu_mem.mem_size/mem_bw/mem_latency` | what the hardware actually is |
+
+The second kind is measured by
+[`python -m profiler hardware`](../profiler/running) into
+`profiler/perf/<hw>/hardware.yaml`, and a config that omits those keys inherits
+it. Each inherited value is logged with where it came from:
+
+```
+[HardwareDefaults] INFO  link_bw = 16.37 for RTXPRO6000 (inherited from hardware.yaml, measured)
+[HardwareDefaults] INFO  link_latency = 16100 for RTXPRO6000 (inherited from hardware.yaml, measured)
+[HardwareDefaults] INFO  npu_mem.mem_bw = 1597.6 for RTXPRO6000 (inherited from hardware.yaml, spec)
+[HardwareDefaults] INFO  npu_mem.mem_latency = 0 for RTXPRO6000 (inherited from hardware.yaml, assumed)
+```
+
+`measured` came from a benchmark on that machine, `spec` from a device query,
+`assumed` from an assumption. The log above illustrates provenance, not a
+current calibration recommendation. Check the hardware file's fit assumptions
+and residuals before adopting its effective BW/latency pair for a different
+configuration.
+
+### Three rules
+
+1. **An explicit value always wins**, with no warning. Simulating hardware
+   nobody owns is the point, so `"link_bw": 900` for a hypothetical NVLink
+   domain is never second-guessed.
+2. **A gap is filled from the bundle** and logged with its provenance.
+3. **A gap with nothing to fill it raises.** If the interconnect was never
+   measured for that hardware — one GPU on the machine, or a card that is gone
+   — then no number is defensible and the config has to say what it wants.
+
+`link_bw` / `link_latency` are cluster-level while `hardware` is per-instance,
+so they are inherited only when every instance shares one hardware label. A
+cluster mixing two card types has a link that is neither one's intra-node
+measurement, and it raises rather than copying one.
+
+### The empty case: RTX4090
+
+That card is no longer in the machine, so its `hardware.yaml` is hand-written
+with `measured: null` and carries no link defaults. Its bench example keeps
+`link_bw` and `link_latency` in the config, where a reader can see they are the
+author's choice rather than a measurement. Simulating RTX4090 works exactly as
+before; what changed is that the guess is now visible as one.
 
 ## `cxl_mem` (top-level, optional)
 
@@ -55,10 +166,10 @@ bandwidth/latency per topology dimension.
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `mem_size` | float | ✓ | Capacity per device in **GB** |
+| `mem_size` | float | ✓ | Capacity per device in **GiB** |
 | `mem_bw` | float | ✓ | Bandwidth per device in **GB/s** |
 | `mem_latency` | float | ✓ | Access latency in **ns** |
-| `num_devices` | int | ✓ | Number of CXL devices (`cxl:0` through `cxl:N-1`) |
+| `num_devices` | int | optional (default `1`) | Number of CXL devices (`cxl:0` through `cxl:N-1`) |
 
 When present, instances can reference `cxl:N` in their `placement`
 field.
@@ -68,10 +179,14 @@ field.
 ```json
 {
   "num_instances": 2,
-  "cpu_mem": {"mem_size": 512, "mem_bw": 256, "mem_latency": 0},
+  "cpu_mem": {
+    "mem_size": 512,
+    "mem_bw": 256,
+    "mem_latency": 0,
+    "pim_config": "DDR4_8GB_3200_pim"
+  },
   "instances": [...],
-  "power": {...},
-  "cpu_mem.pim_config": "DDR4_8GB_3200_pim"
+  "power": {...}
 }
 ```
 
@@ -86,10 +201,15 @@ field.
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `mem_size` | float | ✓ | Host CPU memory capacity in **GB** |
+| `mem_size` | float | ✓ | Host CPU memory capacity in **GiB** |
 | `mem_bw` | float | ✓ | CPU memory bandwidth in **GB/s** |
 | `mem_latency` | float | ✓ | CPU memory latency in **ns** |
 | `pim_config` | string | optional | Name of a PIM device config in `configs/pim/`. See **[PIM config](./pim-config)** |
+
+When the CLI or any instance enables attention offloading, cluster construction
+requires `pim_config` on every node and derives its CPU-memory bandwidth and
+latency from that INI. Capacity values use GiB (`1024^3` bytes); memory
+bandwidth remains decimal GB/s.
 
 ### `power` (optional)
 
@@ -122,6 +242,22 @@ schema. Top-level structure:
 | `nic.num_nics`, `nic.idle_power` | ✓ | NIC count and baseline |
 | `storage.num_devices`, `storage.idle_power` | ✓ | Storage devices |
 
+Three rules the table cannot show:
+
+- **Power modeling is all-or-nothing across the cluster.** If *any*
+  node omits `power`, `config_builder.py` disables power modeling for
+  **every** node, silently. There is no per-node opt-in.
+- **`npu` needs one entry per distinct `hardware` on that node.** The
+  key is the instance's `hardware` string, and every instance on the
+  node must find its own key. A heterogeneous node needs one block per
+  hardware label.
+- **`dram.dimm_size` and `dram.idle_power` become optional under
+  `--enable-attn-offloading`.** With PIM on, both are supplied by the
+  PIM config instead (`dimm_size` from the derived per-channel
+  capacity, `idle_power` from the INI's `idle_power`), and only
+  `dram.energy_per_bit` stays required. See
+  **[PIM config](./pim-config)**.
+
 ## Per-instance (`instances[i]`)
 
 ```json
@@ -141,16 +277,21 @@ schema. Top-level structure:
 }
 ```
 
-### Required fields
+### Identity and memory fields
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `model_name` | string | HF id. Must match a config at `configs/model/<model_name>.json` (see **[Model config](./model-config)**) |
 | `hardware` | string | Hardware label. Must match `profiler/perf/<hardware>/` |
-| `npu_mem.mem_size` | float | Per-GPU NPU memory in **GB** |
-| `npu_mem.mem_bw` | float | Per-GPU NPU memory bandwidth in **GB/s** |
-| `npu_mem.mem_latency` | float | Per-GPU NPU memory latency in **ns** |
+| `npu_mem.mem_size` | float | Per-GPU NPU memory in **GiB**; inherited from hardware data when omitted |
+| `npu_mem.mem_bw` | float | Per-GPU NPU memory bandwidth in **GB/s**; inherited when omitted |
+| `npu_mem.mem_latency` | float | Per-GPU NPU memory latency in **ns**; inherited when omitted |
 | `pd_type` | string \| null | `"prefill"`, `"decode"`, or `null` (combined) |
+
+`model_name`, `hardware` and `pd_type` must be supplied. The `npu_mem`
+object and its hardware fields may be omitted when the hardware file supplies
+them; any unresolved required field fails at startup. `mem_util` has its
+separate CLI default and is not inherited from hardware data.
 
 ### Parallelism (at least one of `num_npus` / `tp_size`)
 
@@ -160,19 +301,40 @@ schema. Top-level structure:
 | `tp_size` | int | inferred from `num_npus // pp_size` | Tensor-parallel degree |
 | `pp_size` | int | `1` | Pipeline-parallel degree |
 | `ep_size` | int | `tp_size` (MoE) / `1` (dense) | Expert-parallel degree |
-| `dp_group` | string \| null | `null` | Group ID. Instances with the same string share experts via cross-instance ALLTOALL |
+| `dp_group` | string \| null | `null` | Group ID. Instances with the same string form one data-parallel group, wave-synchronized per iteration; for MoE they also share experts across the group |
 
 **Constraints:**
 
 - `num_npus == tp_size * pp_size` (always)
+- `pp_size <= num_hidden_layers`: pipeline stages are cut on
+  transformer-block boundaries, so a stage cannot be empty
 - Without `dp_group`: `ep_size <= tp_size`
 - For MoE: `ep_size` must divide `num_local_experts`
+- All members of a `dp_group` must agree on `tp_size`, `pp_size` and `ep_size`
+- For a **MoE** model in a `dp_group`, `ep_size` is the total EP degree across
+  the group: it must be divisible by `dp_group_size`, and
+  `ep_size / dp_group_size <= tp_size`. For a **dense** model `ep_size` is not a
+  degree to spread over the group, so neither check applies — plain data
+  parallelism over a dense model is supported (`single_node_dp_instance.json`)
 
 ### Runtime overrides (optional)
 
-These fields override the matching `python -m serving` CLI flag for this
-instance only. Omitted fields keep the CLI value; for `dtype`, an omitted CLI
-value still falls back to the model config's `torch_dtype`.
+Runtime flags can be re-specified per
+instance, letting one cluster run heterogeneous instances — a prefill
+instance with a tight `max_num_seqs` next to a decode instance with a
+wide one, or two instances at different `mem_util`. Every one of them
+is resolved in `_build_instance_runtime_configs()` in
+`serving/__main__.py`.
+
+**Precedence** is one level deep, no merging:
+
+```
+instances[i].<field>   >   --<field> on the CLI   >   built-in default
+```
+
+The lookup is literally `instance.get("<field>", args.<field>)`, so a
+field present in the cluster config wins for that instance and every
+other instance keeps the CLI value.
 
 | Field | Type | CLI fallback | Description |
 | --- | --- | --- | --- |
@@ -180,15 +342,181 @@ value still falls back to the model config's `torch_dtype`.
 | `max_num_batched_tokens` | int | `--max-num-batched-tokens` | Per-iteration token budget for this instance. `0` means unlimited |
 | `long_prefill_token_threshold` | int | `--long-prefill-token-threshold` | Per-request chunk cap for chunked prefill |
 | `block_size` | int | `--block-size` | KV-cache block size in tokens |
-| `dtype` | string | `--dtype` | Weight/profile dtype for this instance |
-| `kv_cache_dtype` | string | `--kv-cache-dtype` | KV-cache dtype for memory accounting and profile variant selection |
 | `enable_chunked_prefill` | bool | `--enable-chunked-prefill` | Enable chunked prefill in this instance's scheduler |
 | `enable_prefix_caching` | bool | `--enable-prefix-caching` | Enable this instance's local prefix cache |
-| `prioritize_prefill` | bool | `--prioritize-prefill` | Prefer prefill requests when forming batches |
+| `npu_mem.mem_util` | float | `--npu-memory-utilization` | Fraction of `npu_mem.mem_size` usable for weights plus KV cache. KV capacity is `mem_size * mem_util - model weight`, divided into `block_size` blocks |
+| `reserve_full_isl` | bool | `--reserve-full-isl` | Admit only if the request's whole sequence fits, not just its first chunk |
+| `async_scheduling` | bool | `--async-scheduling` | Compose the next batch while the current one executes |
+| `num_speculative_tokens` | int | `--num-speculative-tokens` | Draft count, with matching query-length and drafter profile coverage |
+| `spec_acceptance_rate` | float/null | `--spec-acceptance-rate` | Explicit rate or the model's entry in `configs/spec_decode.json`; no generic rate is invented |
+| `spec_acceptance_policy` | choice | `--spec-acceptance-policy` | `FIXED`, `DECAY` or `CUSTOM` acceptance policy |
 | `enable_local_offloading` | bool | `--enable-local-offloading` | Emit graph conversion with local offloading for this instance |
 | `enable_attn_offloading` | bool | `--enable-attn-offloading` | Emit PIM attention offload for this instance |
 | `enable_sub_batch_interleaving` | bool | `--enable-sub-batch-interleaving` | Enable sub-batch interleaving for this instance |
-| `enable_block_copy` | bool | `--enable-block-copy` | Reuse one block trace across repeated transformer blocks |
+| `enable_block_copy` | bool | `--enable-block-copy` | Build a block's trace rows once per distinct block shape and reuse them for every layer sharing it. A trace-*generation* optimization — the emitted trace has every layer either way. Off means every layer is built from its own router draw |
+
+#### CUDA graph contract
+
+`cudagraph` is an optional, config-only object on each instance. It describes
+the **target deployment**, not the eager engine used to measure profile tables.
+Local forward padding applies even at DP=1 and TP=1. Members of a DP group
+must resolve to the same graph contract. Capture overrides must remain
+compatible with each member's scheduler limits.
+
+```json
+{
+  "cudagraph": {
+    "mode": "FULL_AND_PIECEWISE",
+    "capture_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256],
+    "enable_sp": false
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `runner` | `v1` (historical default) or `v2`; selects the model runner's dispatch and DP synchronization rules |
+| `mode` | Effective graph mode: `NONE`, `PIECEWISE`, `FULL`, `FULL_DECODE_ONLY`, or `FULL_AND_PIECEWISE` (default assumption) |
+| `capture_sizes` | Optional positive token counts; deduplicated, sorted and filtered by the token budget and compiler-SP divisibility |
+| `max_capture_size` | Optional positive cap for automatic grid generation. If supplied with `capture_sizes`, it must equal the largest retained size before speculative rounding |
+| `enable_sp` | Compiler sequence parallelism, default `false`. This is **not** the MoE model's sequence-parallel dispatch wrapper |
+
+An explicit `cudagraph` object takes precedence. Otherwise, serving uses a
+matching worker observation imported into the profile bundle's
+`meta.yaml.serving_execution`, or derives defaults. Observations must match
+the model configuration, device, precision, parallelism, scheduler and cache
+scope. A saved but incompatible observation produces a warning, not silent reuse.
+See [importing serving observations](/docs/profiler/output-bundle#serving_execution).
+
+Without an explicit grid, the simulator follows vLLM's ordinary
+non-interactivity grid: 1/2/4, then increments of 8 below 256 and of 16 above.
+The cap depends on the instance's sequence limit, speculative query length,
+token budget and target compute capability. `hardware.yaml` identifies SM10x
+(platform cap 1024); other capabilities use 512. Unknown capability emits a
+warning and assumes 512; specify a cap or grid for a different target.
+Unlimited simulator scheduler limits do not constrain this finite graph cap.
+The sequence-limit endpoint is included when it fits. FULL decode grids are
+rounded to supported speculative query multiples. MRV2 retains separate
+FULL decode and PIECEWISE token grids; MRV1 retains its shared-grid behavior.
+
+Use the **effective worker mode** after attention-backend resolution, not just
+the requested engine mode. Explicit sizes can also describe an interactivity
+grid. Set `mode: "NONE"` for eager execution. The resolver does not automatically
+infer LoRA-specialized keys, cascade/encoder restrictions, DBO, dynamic/variable
+speculative decoding or drafter
+graph dispatch. Attention offloading uses NONE; graph replay for that simulator
+extension is not modeled. No graph-specific latency multiplier or subtraction
+is applied. See [parallelism mechanics](/docs/simulator/parallelism-mechanics)
+for the local-padding and DP synchronization order.
+
+#### Nested memory utilization override
+
+The scheduler overrides are plain keys on the instance object. `mem_util` sits
+**inside** the `npu_mem` block, because its only job is to scale
+`mem_size` and it follows that block's `mem_*` naming:
+
+```json
+{
+  "model_name": "meta-llama/Llama-3.1-8B",
+  "hardware": "RTXPRO6000",
+  "npu_mem": {"mem_size": 96, "mem_bw": 1597, "mem_latency": 0, "mem_util": 0.8},
+  "tp_size": 1,
+  "pd_type": null,
+  "max_num_seqs": 64
+}
+```
+
+It must be a number in `(0, 1]` — it is a *fraction*, so `0.9`, never
+`90`. Anything else raises at startup rather than being clamped.
+
+:::caution[Match it to a measured run when the KV cache saturates]
+`mem_util` sizes the KV cache, and that only shows up in the results once a run
+actually fills it — below the ceiling nothing is preempted and the capacity is
+invisible. On a card with headroom, leave it at the default.
+
+When a run does saturate, the default is the wrong number: the simulator does
+not model vLLM's activation peak or CUDA context, so `0.9` here gives **more**
+KV cache than vLLM gets at the same fraction. Read
+each rank's complete `kv_cache.capacity.per_engine` observation from the new
+bench run's `meta.json` and match that instance's **KV Cache Initialization**
+block count through `mem_util`. Do not treat a DP client aggregate as one pool;
+see the [capacity metadata contract](bench-cli.md#kv-capacity-metadata).
+Historical single-engine references retain `kv_cache.num_gpu_blocks`.
+On the bundled RTX 4090 example — 24 GB, pinned at its ceiling — the value is
+`0.833919`, matching its recorded 2,588 blocks. The Qwen3-30B example matches
+its complete per-engine observations separately for each DP rank.
+See [Validation](../validation) and
+[KV cache and memory](../simulator/scheduling/kv-cache-and-memory).
+:::
+#### `0` means unlimited, with one caveat
+
+`max_num_seqs` and `max_num_batched_tokens` route through a
+`_runtime_limit()` helper that maps `0` to infinity:
+
+- `max_num_seqs: 0` — genuinely unbounded concurrency.
+- `max_num_batched_tokens: 0` — **not** unbounded in practice. The
+  scheduler then computes
+  `min(max_num_batched_tokens, max_position_embeddings)`, so the
+  effective budget becomes the model's context length from
+  **[Model config](./model-config)**. On
+  `microsoft/Phi-mini-MoE-instruct` that is 4096, not infinity.
+
+No other numeric override treats `0` specially:
+`long_prefill_token_threshold: 0` means *disabled* (no per-request
+cap), matching the CLI flag, and `block_size: 0` is simply invalid.
+
+#### Dtypes are not overridable at all
+
+There is no `dtype` or `kv_cache_dtype` instance field, and no CLI flag
+below it. Both are read from the model config, because a modern
+checkpoint carries five cache dtypes decided in four different places
+and the checkpoint is the only thing that knows which. See
+**[Reference → CLI flags → Precision](./cli-flags)** for the table.
+
+The weight dtype still selects the profile **variant folder**, so the
+matching `profiler/perf/<hardware>/<model>/<variant>/tp<N>/` bundle has
+to exist — but the folder name now follows from the config alone
+(`resolve_variant(model_config)`), so a missing bundle means *profile
+this model*, not *pass a different flag*.
+
+Serving two precisions of one model in a heterogeneous cluster is
+therefore two **model configs**, one per checkpoint, not one config with
+two `dtype` overrides.
+
+#### Validation gates
+
+Two combinations are rejected at config-load time, per instance:
+
+| Rejected | Error | Why |
+| --- | --- | --- |
+| `enable_sub_batch_interleaving: true` without `enable_attn_offloading: true` | `RuntimeError` | There is nothing to overlap the NPU sub-batch against |
+| `enable_sub_batch_interleaving: true` with `pp_size > 1` | `RuntimeError` | An interleaved trace leaves both sub-batches mid-block at every stage edge, so a pipeline stage has no single hidden state to pass on |
+
+Both gates read the *effective* values, so inheriting
+`--enable-sub-batch-interleaving` from the CLI onto an instance that
+locally disables `enable_attn_offloading` fails just the same.
+
+#### Flags that are **not** per-instance
+
+The remaining 15 CLI flags are cluster-wide. Setting them inside an
+instance object is silently ignored — nothing reads the key:
+
+| Scope | Flags |
+| --- | --- |
+| Cluster / backend | `--cluster-config`, `--network-backend` |
+| Router (cross-instance by definition) | `--request-routing-policy`, `--expert-routing-policy` |
+| Shared lower KV tier | `--enable-prefix-sharing`, `--prefix-storage` |
+| Workload (one per run) | `--dataset`, `--num-reqs`, `--skip-prefill` |
+| Run plumbing | `--output`, `--run-id`, `--inputs-root`, `--save-trace-text`, `--keep-inputs`, `--log-interval`, `--log-level` |
+
+#### Worked example
+
+`configs/cluster/single_node_pd_per_instance_config.json` splits
+prefill and decode with different scheduler limits, and
+`configs/cluster/single_node_heterogeneous.json` pairs them with
+different chunked-prefill settings. See
+**[Examples → Cluster config explained](/docs/examples/cluster-config-explained#per-instance-runtime-overrides)**
+for the annotated walkthrough.
 
 ### `placement` (optional)
 
@@ -228,13 +556,37 @@ canonical layer names from the architecture YAML.
 
 ## Validation rules
 
+Structural, in `config_builder.py`:
+
 - `num_nodes == len(nodes)` and per-node `num_instances == len(instances)`.
-- Per-instance `weight_per_gpu * num_npus <= npu_mem.mem_size *
-  num_npus` (otherwise startup OOM).
-- Hardware folder must exist at `profiler/perf/<hardware>/<model_name>/<variant>/tp<tp_size>/`.
-- `dp_group` must be a valid string or `null`.
-- All instances within the same `dp_group` must share the same
-  `ep_size` and `tp_size`.
+- `link_bw` and `link_latency` must both resolve at top level after hardware
+  defaults are applied; they need not be written explicitly in the input config.
+- Every instance needs `model_name`, `hardware`, `npu_mem`, and
+  `pd_type` after hardware defaults are applied; `npu_mem` then needs
+  `mem_size`, `mem_bw`, `mem_latency`. The same three keys are required in
+  ordinary `cpu_mem` and, if present, `cxl_mem`; the PIM path instead derives
+  CPU-memory bandwidth and latency from `pim_config`.
+- `num_npus == tp_size * pp_size`, and `pp_size <= num_hidden_layers`.
+- `dp_group` must be a string or `null`, and all instances sharing one
+  `dp_group` must agree on `tp_size`, `pp_size` **and** `ep_size`.
+- Hardware folder must exist at
+  `profiler/perf/<hardware>/<model_name>/<variant>/tp<tp_size>/`.
+
+Memory, in `memory_model.py`, evaluated **per GPU** (weights are
+already sharded by `tp_size` / `ep_size`):
+
+- `weight_per_gpu <= npu_mem.mem_size`, ignoring `mem_util`. Failing
+  this raises `Model size ...GB exceeds total NPU memory ...GB`.
+- `npu_mem.mem_size * mem_util - weight_per_gpu` must leave room for at
+  least **one** KV block of `block_size` tokens. This is the tighter of
+  the two and the one `mem_util` actually gates: dropping `mem_util`
+  far enough fails here, with a message naming the requested bytes,
+  the weight bytes, and the shortfall.
+
+Runtime, per instance, in `serving/__main__.py`:
+
+- `npu_mem.mem_util` must be a number in `(0, 1]`.
+- The two sub-batch-interleaving gates above.
 
 ## What's next
 

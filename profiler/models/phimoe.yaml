@@ -19,12 +19,16 @@
 # cluster config and need not be listed here.
 
 
-sequence:
+blocks:
+  attn:
+    full_attention:
+      pre_attn:  [layernorm, qkv_proj, rotary_emb, attention]
+      post_attn: [o_proj, layernorm, block_glue]
+  mlp:
+    moe:   [moe]
+
+shared:
   prologue:  [embedding]
-  pre_attn:  [layernorm, qkv_proj, rotary_emb, attention]
-  post_attn: [o_proj, layernorm]
-  mlp_dense: []
-  mlp_moe:   [moe]
   head:      [final_layernorm, lm_head, sampler]
 
 
@@ -47,6 +51,14 @@ catalog:
       vllm: LayerNorm
       within: PhiMoEForCausalLM
       tp_stable: true
+    block_glue:
+      # The decoder's two direct residual adds are outside its child modules.
+      # Exclude the whole child subtrees: sparse routing, normalization and
+      # attention may launch the same raw kernel families but are already
+      # owned by their module bindings, even during a dense-only acquisition.
+      vllm: ["void at::native::*", "Memcpy*", "Memset*"]
+      within: PhiMoEDecoderLayer
+      not_within: [PhiMoE, LayerNorm, PhiMoEAttention]
   per_sequence:
     lm_head:
       vllm: LogitsProcessor
@@ -59,3 +71,4 @@ catalog:
   moe:
     moe:
       vllm: PhiMoE
+      sequence_parallel: false

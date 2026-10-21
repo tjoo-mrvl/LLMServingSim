@@ -7,14 +7,15 @@ title: Adding new hardware
 
 This page is the workflow for bringing up a brand-new hardware target
 that doesn't have a profile bundle in `profiler/perf/<HARDWARE>/`
-yet. There are two distinct paths depending on whether vLLM supports
-the hardware:
+yet. The bundled acquisition path targets NVIDIA CUDA and vLLM 0.31 internals.
+vLLM support alone does not establish that the profiler's CUDA attribution,
+cache preparation and hardware probes support another accelerator:
 
 ```mermaid
 flowchart TD
-    START([New hardware target]) --> Q{vLLM supports it?}
-    Q -->|Yes, NVIDIA / AMD GPU| GPU[Use profile.sh as-is<br/>set HARDWARE label,<br/>run.]
-    Q -->|No, TPU / custom NPU| SYNTH[Synthesize CSV bundle<br/>from your own measurement source]
+    START([New hardware target]) --> Q{Supported CUDA acquisition path?}
+    Q -->|Yes| GPU[Check backend and coverage<br/>set HARDWARE label,<br/>profile.]
+    Q -->|No| SYNTH[Port acquisition or synthesize a bundle<br/>from your own measurement source]
     GPU --> CONSUME[Simulator reads CSVs]
     SYNTH --> CONSUME
 ```
@@ -25,28 +26,141 @@ way regardless of how the data was collected.
 
 ## Adding a new GPU
 
-This is the easy case. The profiler's vLLM-based workflow already
-handles it. Three steps:
+For a compatible NVIDIA target, start with the workflow below. Check live
+kernel coverage and backend support before committing to a full sweep.
 
-### 1. Confirm vLLM support
+### 0. Measure the machine
 
-The profiler runs vLLM `0.19.0` by default
-(`scripts/docker-vllm.sh` pulls `vllm/vllm-openai:v0.19.0`). Check
-that vLLM's release notes mention your GPU.
+```bash
+python -m profiler hardware --hardware <LABEL> --npus 2
+```
 
-| GPU family | vLLM 0.19.0 support |
+The command defaults to INFO logging; no verbosity flag is required.
+Use `--log-level DEBUG`, `INFO`, `WARNING` or `ERROR` to override it.
+Invalid levels are rejected before probing the GPU.
+
+Writes `profiler/perf/<LABEL>/hardware.yaml`: the card's spec, queried from the
+device, and NCCL AllReduce, AllGather and ReduceScatter sweeps used to fit
+shared `link_bw` / `link_latency` parameters for the analytical backend,
+plus per-operation bandwidths at the shared fitted latency.
+Cluster configs on this hardware then inherit those instead of carrying a
+guess, and every inherited value is logged with its provenance
+(`measured` / `spec` / `assumed`).
+
+Do this first — it characterises the machine, not a model, and the same file
+serves every model bundle in the folder. Re-measure after interconnect or
+communication-software changes.
+
+**It needs two of the cards.** With one, the spec section is still written,
+`interconnect` is `null` with the reason, and the command exits non-zero; a
+cluster config then has to set `link_bw` and `link_latency` explicitly. That is
+the honest outcome: a link has two ends, and the simulator will not substitute
+a number nobody measured.
+
+#### Calibration contract
+
+The fit models a **single-chunk Ring in one local dimension on a one-hop
+FullyConnected topology**. It uses the actual measured rank count `N`.
+The raw `samples[].bytes` field, denoted `S` below, has these meanings:
+
+| Collective | `S` means | Ring message bytes `C` | Network phases `P` | Reduction steps `R` |
+| --- | --- | --- | --- | --- |
+| AllReduce | Full input per rank | `floor(S/N)` | `2(N-1)` | `N-1` |
+| AllGather | Local input per rank | `S` | `N-1` | `0` |
+| ReduceScatter | Local output per rank; input is `N*S` | `S` | `N-1` | `N-1` |
+
+The prediction, in nanoseconds, follows `Ring.cc`, `PacketBundle.cc`,
+`MemBus.cc` and the analytical network backend:
+
+```text
+time_ns = P * floor(L + C * 1e9 / (B * 2^30))
+        + 3 * R * floor(C / M)
+        + (P + 1) * E
+```
+
+`B` is network bandwidth in **GiB/s**; `L` is link latency in ns.
+`M` is local-memory bandwidth in decimal **GB/s**, using the integer spec
+value that `config_builder.py` supplies to ASTRA. `E` is the local endpoint
+event cost defined by the backend's `MemBus::Transmition::Fast` path.
+The local reduction and endpoint terms are accounted for separately, not
+mistaken for network transmission. At two ranks, AllReduce pays two network
+phases but AllGather and ReduceScatter pay only one.
+
+The fitter minimises relative squared error over the primitive sweep, with
+nonnegative latency and inverse bandwidth. It uses the continuous network
+term to solve the two-variable fit; saved residuals use the serialized
+parameters and the backend's integer-nanosecond truncation. No model benchmark
+or model-specific correction coefficient participates.
+
+The hardware file retains raw graphed and isolated timings, the timing source,
+fit version and assumptions, and per-size/per-collective residuals. The legacy
+key `bandwidth_gbps` is retained, but `bandwidth_unit: GiB/s` makes its actual
+unit explicit. Inherited defaults also record their units.
+The bundled hardware file preserves the measured output unchanged, including
+its raw samples and residual arrays.
+
+A retained-data bandwidth refresh can instead hold an independently calibrated
+latency fixed. The bundled post-configuration-change RTXPRO6000 calibration uses
+that contract: the existing 6,600 ns common latency is retained, and common and
+per-operation bandwidths are recomputed from NCCL primitives. Its file records
+`fixed_latency_ns`, the source of that constraint, repetitions and residuals.
+This is not the same optimization as a fresh `profiler hardware` run, which
+estimates both common parameters. Do not silently relabel one as the other.
+
+Historical examples can pin their original transport values with explicit
+`link_bw`, `link_latency` and `collective_links: {}`. Their compute profiles and
+benchmark truths then remain comparable when shared hardware defaults change.
+
+The same primitive samples also feed `collective_fits`: one bandwidth fit
+per operation, with latency fixed to the saved shared fit. This solves the
+remaining one-variable problem in inverse bandwidth using the same relative
+objective and local costs. Per-operation residuals remain visible; a fit that
+cannot identify positive finite bandwidth records `unavailable` rather than
+publishing a value. The shared fit is retained as the fallback.
+
+Usable operation fits populate `defaults.collective_links.<operation>.link_bw`.
+The bundled RTXPRO6000 Qwen3-32B TP2 and Qwen3-30B DP2/EP2 examples consume
+these values directly, with recorded NCCL references for that interconnect.
+They are inherited when the entire link is inherited, not when a user specifies
+a hypothetical common link. An explicit `collective_links` map can override
+bandwidth and latency or disable the operation defaults. See the
+[configuration precedence](../reference/cluster-config#collective-specific-links).
+Updating code alone does not add these values to existing hardware files.
+
+:::caution[Calibration is not an exact NCCL model]
+
+A shared BW/latency pair need not match all three NCCL curves. Inspect the
+residuals rather than assuming a successful fit proves accuracy. Different
+rank counts, topologies, dataset splitting or local-memory overrides change
+the model contract. Grouped multi-tensor MoE dispatch, uneven rank sizes and
+their broadcast/reduce implementations are **not measured by this primitive
+sweep**; summing bytes does not reproduce their execution costs.
+
+Updating profiler code does not migrate existing `hardware.yaml` values.
+Old fit residuals do not certify the corrected backend contract. Refit retained
+raw samples with their original rank count and hardware spec, or re-measure,
+then validate before adopting new defaults.
+
+:::
+
+### 1. Confirm the acquisition backend
+
+The profiler targets vLLM `0.31.0` by default
+(`scripts/docker-vllm.sh` pulls `vllm/vllm-openai:v0.31.0`). Its launcher,
+hardware probes, cache initialization and timing attribution target NVIDIA
+CUDA. A device being supported by vLLM alone does not validate this profiler.
+
+| Target | Bundled acquisition path |
 | --- | --- |
-| NVIDIA A100, H100, H200 | Yes |
-| NVIDIA RTX PRO 6000, RTX 6000 Ada, L40S | Yes |
-| NVIDIA Blackwell (B100, B200) | Yes (with CUDA 13.x image: `v0.19.0-cu130`) |
-| NVIDIA Hopper SXM | Yes |
-| AMD MI300X | Yes (ROCm path; needs `vllm/vllm-rocm`) |
-| AMD MI200 / older | Limited; check vLLM matrix |
-| Intel Gaudi 3 | Limited (HPU plugin); not supported by this profile path |
+| NVIDIA CUDA | Intended target; verify the selected model/backend, live coverage and measurement contract on the device |
+| AMD ROCm | Requires an acquisition port; changing the Docker image is insufficient |
+| Intel HPU and other accelerators | Requires an acquisition adapter or an independently produced compatible bundle |
 
-If vLLM doesn't support it yet, you have two options: wait for vLLM
-to add support, or contribute the backend to vLLM upstream. Neither
-is fast.
+Choose the CUDA image for the host driver and installed dependencies, not
+the GPU family name alone. The launcher defaults to the CUDA 13 image;
+another image requires its own model/backend compatibility and acquisition
+checks. This upgrade does not remeasure existing bundles. See
+[vLLM installation](../getting-started/installation/vllm) for environment setup.
 
 ### 2. Edit `profile.sh`
 
@@ -82,21 +196,20 @@ Once it's done, the simulator is ready to use, no further changes.
 Update your `cluster_config.json` to set `"hardware": "<HARDWARE>"`
 and run.
 
-### AMD ROCm notes
+### Other accelerator backends
 
-The official `vllm/vllm-rocm` Docker image is the AMD equivalent.
-Edit `scripts/docker-vllm.sh` to pull that image instead of
-`vllm/vllm-openai`. Beyond the image swap, the profile workflow is
-identical.
-
-`HARDWARE="MI300X"` (for example): pick whatever makes sense.
+ROCm and HPU are not drop-in replacements for this CUDA acquisition path.
+Audit and port device discovery, cache layouts, kernel attribution and
+communication measurement before publishing a bundle from another backend.
+The free-form `HARDWARE` label selects an output folder; it does not select
+or implement an accelerator adapter.
 
 ## Adding non-GPU hardware
 
-This is the more involved case. The vLLM-based profiler doesn't
-work for hardware vLLM doesn't run on (TPU, Intel Gaudi without HPU
-support, custom NPUs / accelerators). But the simulator only cares
-about the **CSV bundle format**, not how the data was produced.
+For a target outside the bundled acquisition path, use an appropriate
+measurement adapter or analytical model. The simulator consumes the
+**profile bundle contract**, independently of the acquisition environment;
+skew calibration and native MoE data also require their matching metadata.
 
 The strategy: synthesize CSVs in the
 [Output bundle](./output-bundle) format from your own measurement
@@ -113,8 +226,10 @@ hardware. If you have access:
   layer types the simulator's architecture YAML declares
   (`qkv_proj`, `attention`, `down_proj`, etc.).
 - Sweep the same axes the GPU profiler does
-  (`tokens`, `(prefill_chunk, kv_prefill, n_decode, kv_decode)`,
-  `(tokens, activated_experts)`).
+  (`tokens`, `sequences`, and attention's
+  `(prefill_chunk, prefill_key, n_decode, kv_decode)` for each kernel and
+  `decode_q_len`). Use the category-specific schema for linear attention,
+  MTP and MoE; native MoE component tables require their matching contracts.
 - Write CSVs in the schema documented on
   **[Output bundle](./output-bundle)**.
 
@@ -134,9 +249,11 @@ declare which kernels you need to time. For each entry in the
 
 - For `dense` category: latency as a function of `tokens`.
 - For `per_sequence`: latency as a function of `sequences`.
-- For `attention`: 4D table over `(prefill_chunk, kv_prefill,
-  n_decode, kv_decode)`.
-- For `moe`: 2D table over `(local_tokens, activated_experts)`.
+- For `attention`: a table per kernel and `decode_q_len`, interpolated over
+  `(prefill_chunk, prefill_key, n_decode, kv_decode)`.
+- For `linear_attention`, MTP and MoE: follow the matching
+  [output schema](./output-bundle). Include the linear-attention regimes,
+  drafter entries or MoE contracts required by the model and deployment.
 
 #### 3. Hand-authored from datasheets / public benchmarks
 
@@ -158,50 +275,77 @@ Even when synthesizing, write a `meta.yaml` so the simulator's
 runtime warnings work properly:
 
 ```yaml
-profiler_version: "synthetic-v1"
+profiler_version: "synthetic"
 vllm_version: "n/a"
-gpu: "<HARDWARE>"
+gpu: "<driver device name, or n/a>"
+hardware: "<HARDWARE>"          # must equal the folder name
+variant: "<VARIANT>"
+model: "<org>/<name>"
+tp_degrees: [1]
 profiled_at: "<date>"
 
 engine_effective:
   max_num_batched_tokens: <whatever your CSVs cover>
   max_num_seqs: <ditto>
-  dtype: bfloat16
-  kv_cache_dtype: auto
-
-attention_grid:
-  max_kv: <upper bound your attention.csv covers>
-  chunks: "<comma-separated chunk values>"
-  n_decode: "<comma-separated values>"
-  kv: "<comma-separated values>"
 
 skew_fit:
-  per_tp:
-    1:
-      method: "synthetic-constant"
-      alpha_default: 0.3   # the pooled constant fallback
+  enabled: false                # no measured heterogeneous correction
 ```
 
-If you don't have skew measurements (most non-GPU paths won't),
-**omit** `skew.csv` and `skew_fit.csv` entirely. The simulator
-detects their absence and uses `alpha_default` from `meta.yaml` as a
-constant skew correction.
+Do not supply guessed inline alpha coefficients or invent `runtime-skew-calibration` entries or their hashes:
+generate them from measured skew data and matching attention references with
+`profiler refit-skew`. See [Skew & alpha fit](./skew-alpha-fit).
+
+`hardware` is the folder name a cluster config's `hardware` field must
+match; `gpu` is free-form provenance. They are separate fields — don't
+put the label in both.
+
+`engine_effective` takes only the two batching bounds; there is no
+`dtype` / `kv_cache_dtype` key there, since the dtypes are encoded in
+`variant`. Only those two are read, and only to emit the
+sweep-bound warning.
+
+`attention_grid` and `skew_profile` are provenance for humans and are
+**not read at run time**, so you can omit them from a synthetic bundle
+or fill them in however you like.
+
+:::warning[Enable only measured, compiled calibration]
+An absent or disabled `skew_fit` applies zero correction. Enabled entries
+must use a recognized calibration format from the compiler; the old constant-alpha and bucket
+formats are rejected. `profiler refit-skew` compiles your own raw measurements
+against matching attention references. A missing TP or query slice does not
+borrow another slice's correction.
+:::
+
+Omit `skew.csv` and `skew_fit.csv` when you have no
+heterogeneous-decode measurements.
 
 ### What you can skip
 
 - `skew.csv` and `skew_fit.csv` if you don't have heterogeneous-decode
-  data. Provide `alpha_default` in `meta.yaml::skew_fit.per_tp.<TP>`.
+  data — see the warning above about what that costs you.
 - `moe.csv` if you're not modeling MoE on this hardware (only needed
   when running MoE models).
-- TP=N folders for TP degrees you don't need to simulate. The
-  simulator only loads the TPs your cluster config asks for.
+- `tp<N>/` folders for TP degrees you don't need to simulate. Note the
+  mechanism: `_load_perf_db` discovers available `tp*/` folders and checks
+  that the degrees your cluster config needs are present. Category tables
+  are loaded lazily on lookup; TP1 can still be needed for stable entries
+  and MoE even when the deployment uses another TP degree.
+  A missing one is a hard error, not a fallback:
 
-### What you cannot skip
+  ```text
+  FileNotFoundError: No profile data for tp=[4] under
+  perf/<hw>/<model>/<variant>/. Re-run the profiler with TP_DEGREES
+  including 4.
+  ```
 
-- `dense.csv`: every model uses dense linears.
-- `per_sequence.csv`: `lm_head` and `sampler` always run.
-- `attention.csv`: every model has attention.
-- `meta.yaml`: without it the simulator can't resolve the variant.
+### Required inputs
+
+- The category tables and canonical entries required by the model's resolved
+  catalog and deployment, including linear-attention or MTP tables when used.
+  See the [output schema](./output-bundle) for category coordinates and metadata.
+- `meta.yaml`, which the simulator requires to load the bundle's metadata.
+  The variant folder name itself is derived from the model configuration.
 
 ### Validation
 
@@ -234,9 +378,12 @@ it up automatically when the cluster config names matching values:
 }
 ```
 
-The `--dtype` and `--kv-cache-dtype` CLI flags resolve to the right
-`<variant>` folder via `resolve_variant()` (see
-**[Simulator → Trace generation](/docs/simulator/trace-generation#variant-resolution)**).
+The simulator's `resolve_variant()` derives the folder from the checkpoint;
+it has no runtime dtype-selection flags. Profiler `--dtype`,
+`--kv-cache-dtype` and `--variant` can create alternative measurements that
+are not automatically selected. See
+**[Simulator → Trace generation](/docs/simulator/trace-generation#variant-resolution)**
+and [profiler naming](/docs/profiler/running#precision-and-variant-names).
 
 ## What's next
 

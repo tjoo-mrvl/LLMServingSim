@@ -10,15 +10,17 @@ is a directory map, not a behavior reference. For *what* each piece
 does, see the **[Simulator](/docs/simulator/architecture)** and
 **[Profiler](/docs/profiler/overview)** sections.
 
-## The five domains
+## Repository layout
 
-```
+Selected directories and entry points:
+
+```text
 LLMServingSim/
 ├── serving/      Simulator       Python, the core loop
 ├── profiler/     Profiler        Python, vLLM-based latency capture
 ├── bench/        Bench           Python, real vLLM run + sim validation
 ├── workloads/    Workloads       JSONL traces + generators
-├── configs/      Configs         JSON: cluster / model / PIM
+├── configs/      Configs         Cluster/model JSON and PIM INI
 ├── scripts/      Env scripts     Docker launchers + builders
 └── astra-sim/    Backend         C++ analytical network simulator
 ```
@@ -31,22 +33,30 @@ domains for a single change, stop and reconsider the scope.
 
 Where most contributor work happens.
 
-```
+```text
 serving/
 ├── __main__.py              CLI + main loop
 └── core/
     ├── scheduler.py         vLLM-style continuous batching
-    ├── trace_generator.py   Profile lookup -> text trace
+    ├── trace_generator.py   Profile lookup -> trace rows
     ├── memory_model.py      KV / weight / CXL byte accounting
-    ├── graph_generator.py   Text trace -> Chakra protobuf
+    ├── component_sizes.py   Contextual component loading and byte accounting
+    ├── graph_generator.py   Trace rows -> Chakra protobuf
     ├── controller.py        ASTRA-Sim subprocess IPC
     ├── router.py            Request routing across instances
-    ├── gate_function.py     MoE expert routing
+    ├── gate_function.py     MoE expert routing (incl. group-limited)
+    ├── spec_decode.py       Speculative-decoding acceptance model
+    ├── cudagraph.py         Target graph padding and DP shape synchronization
     ├── config_builder.py    Cluster config -> ASTRA-Sim inputs
+    ├── hardware_defaults.py Measured hardware defaults and override precedence
+    ├── communication.py     Collective tensor sizes and vocabulary shards
+    ├── moe_components.py    Native DP+EP component table lookup
+    ├── moe_execution.py     Native MoE compute/collective ordering
     ├── power_model.py       Power / energy estimation
     ├── pim_model.py         PIM device model
     ├── request.py           Request / Batch dataclasses
-    ├── radix_tree.py        Prefix cache (RadixCache, from SGLang)
+    ├── block_pool.py        Per-tier KV block pool + prefix-cache index
+    ├── kv_cache_manager.py  Tiered KV cache manager (block hashing, allocation)
     ├── logger.py            Rich-based logging + stdio capture
     └── utils.py             Model config loading, formatters
 ```
@@ -61,37 +71,53 @@ serving/
 | Change inter-instance routing | `router.py` |
 | Add a new CLI flag | `__main__.py` (argparse), then thread through |
 | Change MoE expert distribution | `gate_function.py` |
+| Change speculative acceptance | `spec_decode.py`, and `configs/spec_decode.json` for the published defaults |
 | Change ASTRA-Sim input generation | `config_builder.py` |
 | Add a new power component | `power_model.py` |
 
 ## Profiler (`profiler/`)
 
-```
+```text
 profiler/
-├── __main__.py              CLI dispatch (profile / slice)
-├── core/                    internals (runner, engine, categories, fit_alpha)
-├── models/<model_type>.yaml Architecture catalogs (one per HF model_type)
+├── __main__.py              Model, coverage, skew and hardware CLI dispatch
+├── core/                    internals (runner, engine, categories, skew_calibration)
+│   ├── catalog_path.py      model_type -> yaml resolution   (shared with serving/)
+│   ├── component_layouts.py Runtime-selected canonical component layouts
+│   ├── context_tables.py    Contextual category publication and metadata
+│   ├── context_lookup.py    Strict contextual category loading and lookup
+│   ├── callable_profile.py Declared callable acquisition and lookup
+│   └── stack.py             per-layer block resolution      (shared with serving/)
+├── models/<model_type>.yaml Architecture catalogs with declared aliases
 ├── perf/<hw>/<model>/...    Output bundles (CSV per category)
 └── profile.sh               Editable user template
 ```
+
+Several `core/` modules are **shared with the simulator**, including catalog
+resolution, stack composition, attention geometry, skew calibration and MoE
+deployment contracts. Keep these importable in the CPU simulator environment
+without vLLM or GPU acquisition dependencies. Changes can alter simulation
+results; audit imports and run regression validation.
 
 **Where to touch by intent:**
 
 | Intent | Edit |
 | --- | --- |
-| Add a new hardware target | Run the profiler with `HARDWARE=` set; output lands in `perf/<hw>/`. See **[Profiler / Adding hardware](/docs/profiler/adding-hardware)** |
-| Add a new model architecture | Drop a YAML in `profiler/models/<model_type>.yaml`. See **[Profiler / Adding model architecture](/docs/profiler/adding-model-architecture)** |
-| Change the skew alpha fit | `core/fit_alpha.py` |
-| Change what categories get profiled | `core/categories.py` + `core/runner.py` |
+| Add a new hardware target | Run `python -m profiler profile <model> --hardware <hw>`, or edit `MODEL` and `HARDWARE` inside `profiler/profile.sh`; output lands in `profiler/perf/<hw>/`. See **[Profiler / Adding hardware](/docs/profiler/adding-hardware)** |
+| Add a new model architecture | Drop a YAML in `profiler/models/<model_type>.yaml`, then `python -m profiler coverage <model> --hardware <hw>` until it binds every kernel. See **[Profiler / Adding model architecture](/docs/profiler/adding-model-architecture)** |
+| Teach the layer resolver a new per-layer rule | `profiler/core/stack.py` — read the rule out of vLLM's source, never guess; the vendors' conventions genuinely disagree |
+| Change the default skew calibration | `profiler/core/skew_calibration.py` |
+| Change what categories get profiled | `profiler/core/categories.py` + `profiler/core/runner.py` |
+| Change runtime-selected component boundaries | `core/component_layouts.py`, `core/callable_profile.py`, `core/hooks/runtime_admission.py` |
+| Change contextual category publication or lookup | `core/context_tables.py`, `core/context_lookup.py`, `serving/core/component_sizes.py` |
 | Change output CSV columns | `core/writer.py` (and `_load_perf_db()` in `serving/core/trace_generator.py` to consume them) |
 
 ## Bench (`bench/`)
 
-```
+```text
 bench/
 ├── __main__.py              CLI (run / validate)
 ├── core/                    AsyncLLM driver, recorder, validator
-├── examples/<model>/        Committed end-to-end runs
+├── examples/<hw>/<model>/   Committed end-to-end runs
 └── results/<run_id>/        Output for ad-hoc runs
 ```
 
@@ -102,10 +128,10 @@ are emitted). For day-to-day "did my change regress?" use, see
 
 ## Configs (`configs/`)
 
-```
+```text
 configs/
 ├── cluster/<name>.json      Cluster topology (the main thing)
-├── model/<org>/<name>.json  Model architecture (subset of HF config.json)
+├── model/<org>/<name>.json  Model configs consumed by profiling and simulation
 └── pim/<name>.ini           PIM device specs (DRAMSim3 format)
 ```
 
@@ -117,16 +143,16 @@ all. Field-by-field schema lives in
 
 ## Workloads (`workloads/`)
 
-```
+```text
 workloads/
 ├── *.jsonl                  Datasets (one request or session per line)
-├── generators/              ShareGPT / SWE-bench JSONL builders
+├── generators/              JSONL builders. One subcommand today: `sharegpt`
 └── README.md                JSONL format reference
 ```
 
 Adding a new workload generator is a contained change: a new module
-under `generators/`, runnable as
-`python -m workloads.generators.<your_module>`. See
+under `generators/`, registered in `generators/__main__.py` and runnable as
+`python -m workloads.generators <name>`. See
 **[Workloads / ShareGPT generators](/docs/workloads/sharegpt-generators)**
 for the existing pattern.
 
@@ -140,22 +166,26 @@ The handful of files you might edit:
 
 | File | Why |
 | --- | --- |
-| `astra-sim/extern/graph_frontend/chakra/src/converter/llm_converter.py` | New trace `comm_type` syntax, new memory location enum |
-| `astra-sim/astra-sim/system/Workload.cc` | Custom collective issuance, `involved_dim` handling |
+| `astra-sim/extern/graph_frontend/chakra/src/converter/llm_converter.py` | New trace `comm_type` syntax, new trace header field, new memory location enum |
+| `astra-sim/astra-sim/workload/Workload.cc` | Custom collective issuance, `involved_dim` handling |
 | `astra-sim/astra-sim/system/AstraMemoryAPI.hh` | New memory tier enum (paired with `llm_converter.py`) |
 | `astra-sim/inputs/...` | Don't edit. Generated by `config_builder.py` on every run |
 
 If you do edit ASTRA-Sim, rerun `./scripts/compile.sh` before
-testing.
+testing. Chakra is *installed* into the container's site-packages, so
+editing `llm_converter.py` alone has no effect until you reinstall it
+(`cd astra-sim/extern/graph_frontend/chakra && pip3 install .`, which
+`compile.sh` does for you).
 
 ## Scripts (`scripts/`)
 
-```
+```text
 scripts/
 ├── docker-sim.sh            Sim container launcher
 ├── docker-vllm.sh           vLLM container launcher (profiler / bench)
 ├── install-vllm.sh          Bare-metal vLLM install (uv venv)
-└── compile.sh               ASTRA-Sim + Chakra build
+├── compile.sh               ASTRA-Sim + Chakra build
+└── monitor_run.py           Bounded process execution and resource telemetry
 ```
 
 You'll touch these rarely. If you add a new entry point, prefer
@@ -164,18 +194,24 @@ adding more shell scripts.
 
 ## Tests and fixtures
 
-There is **no unit-test suite**. Validation is done by:
+There is **no unit-test suite**. The simulator is deterministic
+instead, so validation is exact equality against recorded results:
 
-1. Running a smoke `python -m serving …` and inspecting the output
-   CSV.
-2. Running `python -m bench validate` against a known-good vLLM
-   replay (see **[Validating your changes](./validating-changes)**).
+```bash
+./serving/validate.sh
+```
+
+Every scenario compared against its recorded `Total clocks (ns)`, then each
+`bench/examples` entry's `sim.csv` and `validation/summary.txt` checked
+by md5. See **[Validating your changes](./validating-changes)** for
+what to do when something differs, and for the case where no scenario
+covers what you changed.
 
 When adding a feature that has clean inputs and outputs (a new
-`_lookup_*` function, a new memory accounting helper), feel free to
-add a script under `scripts/` or a notebook checked into your
-branch. The project has not adopted a formal test framework yet;
-that itself is an open contribution opportunity.
+`_lookup_*` function, a new memory accounting helper), a scenario in
+`serving/validate.sh` is usually the cheapest way to pin it down. A
+formal unit-test framework is still an open contribution
+opportunity.
 
 ## Where docs live
 

@@ -159,10 +159,9 @@ def register_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--vllm-repetition-penalty", type=float, default=1.1,
                    dest="vllm_repetition_penalty",
                    help="(--use-vllm) Repetition penalty. 1.0 disables it; "
-                        "values >1.0 down-weight previously-emitted tokens, "
-                        "which keeps free-generation from rambling and lets "
-                        "natural EOS fire at typical ShareGPT lengths "
-                        "(~500-1000 tokens). Default 1.1.")
+                        "values >1.0 discourage repeated tokens. "
+                        "Does not guarantee EOS or a particular output length. "
+                        "Default 1.1.")
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +215,13 @@ def run(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _load_tokenizer(model: str):
-    from transformers import AutoTokenizer
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as e:
+        raise ImportError(
+            "huggingface 'transformers' is required to tokenize the source "
+            "dataset. Run inside the vLLM container or `pip install transformers`."
+        ) from e
     return AutoTokenizer.from_pretrained(model, use_fast=True, trust_remote_code=True)
 
 
@@ -380,6 +385,7 @@ def _override_outputs_with_vllm(
     sp = SamplingParams(
         max_tokens=int(args.max_output_toks),
         temperature=float(args.vllm_temperature),
+        repetition_penalty=float(args.vllm_repetition_penalty),
         seed=args.seed,
     )
     prompts = [TokensPrompt(prompt_token_ids=in_ids) for in_ids, _ in pairs]

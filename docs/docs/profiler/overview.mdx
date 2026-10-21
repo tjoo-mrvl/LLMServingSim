@@ -13,11 +13,24 @@ vLLM engine with synthetic batches and records per-layer CUDA kernel
 latencies into per-category CSV files. Those CSVs are exactly what
 the simulator's `trace_generator` reads at run time, the profiler's
 output IS the simulator's input.
+The bundle's execution contract still limits its consumers: native
+[DeepSeek-V3.2 tables](./output-bundle#native-dsa-acquisition) currently support
+explicit duration trace replay, not ordinary serving or memory-capacity admission.
+
+Ordinary and skew shots use lightweight PyTorch/Kineto capture with explicit
+module scopes and catalog-declared operator or callable boundaries. These identify
+GPU-work ownership, not CPU latency. Kernels, copies and memsets are retained;
+Python stack, tensor-shape and memory-snapshot recording are disabled. This changes
+collection overhead,
+not the simulator's time units or lookup rules. See the
+[acquisition contract](./output-bundle#cuda-activity-and-acquisition-identity).
 
 ## When you need to run it
 
 You **don't** need to run the profiler if your hardware × model
-combination is already in the bundled profile data. Otherwise:
+combination and required execution geometry are already covered by the bundled
+profile data. For native MoE, that includes target TP/DP/EP, backend and rank
+ownership, not just a matching model name. Otherwise:
 
 | Scenario | Profile? |
 | --- | --- |
@@ -34,12 +47,14 @@ folder under `profiler/perf/<hardware>/<model>/<variant>/` with one
 
 ```
 perf/<hardware>/<model>/<variant>/
-├── meta.yaml                       # engine flags, sweep specs, skew_fit summary
+├── meta.yaml                       # all profile metadata, including per-TP records
 └── tp<N>/
     ├── dense.csv                   # token-count → latency
     ├── per_sequence.csv            # seq-count → latency
-    ├── attention.csv               # 4D: (pc, kv_pre, n_dec, kv_dec) → latency
-    ├── moe.csv                     # MoE only: (tokens, experts) → latency
+    ├── attention.csv               # per-layer, per-q: (pc, kv_pre, n_dec, kv_dec)
+    ├── linear_attention.csv        # hybrid only: per-layer (prefill_tokens, n_dec)
+    ├── moe.csv                     # retained historical whole-block fallback
+    ├── moe_components/             # native component CSVs per deployment
     ├── skew.csv                    # raw heterogeneous-decode shots
     └── skew_fit.csv                # fitted per-bucket alpha table
 ```
@@ -48,6 +63,23 @@ Times are stored in **microseconds** (`time_us` column); the
 simulator multiplies by 1000 and rounds to ns at load time.
 
 Schema details on **[Output bundle](./output-bundle)**.
+
+[Native MoE profiling](./native-moe-components) is the default for MoE models,
+at DP1 unless `--dp` selects other target degrees; optional `--ep` filters
+the resulting TP*DP targets. It adds deployment records
+to the root metadata and component CSVs, preserving global top-k and separating
+local routing, gathered expert work and applicable finalization. New measurements
+are eager only, without isolated graph capture. Expert points cover tokens,
+active local experts and local assignments; `--moe-grid-factor` defaults to
+`2` and retains feasible geometry corners. Target serving capture sizes also
+anchor token rows after DP/SP transformation; active experts and assignments
+retain their own axes. [Sampling policy](./running#sampling-policy) distinguishes
+observed captures from derived candidates, while acquisition stays eager.
+A capability-admitted live TP1/DP1/EP1 path preserves native quantized weights
+and adds surrounding shared/wrapper work. Its summed CUDA durations do not
+reproduce concurrent branch overlap. Unsupported APIs and layouts still fail.
+Historical `moe.csv` reads remain available; the
+whole-block acquisition path has been removed.
 
 ## How it fits the bigger picture
 
@@ -65,12 +97,41 @@ container** (`astrasim/tutorial-micro2024`). They share the
 
 ## Bundled profile data
 
-| Hardware | Models profiled | Variants |
-| --- | --- | --- |
-| `RTXPRO6000` | `meta-llama/Llama-3.1-8B`, `Qwen/Qwen3-32B`, `Qwen/Qwen3-30B-A3B-Instruct-2507` | `bf16`, `bf16-kvfp8` |
+The following bundles drive the headline Llama and Qwen validation examples:
 
-If your `(hardware, model, variant)` combo is in this table, you can
-skip the profiler entirely.
+| Hardware | Model | Variant | TP degrees |
+| --- | --- | --- | --- |
+| `RTXPRO6000` | `meta-llama/Llama-3.1-8B` | `bf16` | 1, 2 |
+| `RTXPRO6000` | `Qwen/Qwen3-32B` | `bf16` | 1, 2 |
+| `RTXPRO6000` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | `bf16` | 1, 2 |
+| `RTX4090` | `meta-llama/Llama-3.1-8B` | `bf16` | 1 |
+
+Additional sparse-attention and hybrid-model bundles live under `profiler/perf/`.
+The tracked folders and metadata are the authoritative model/variant/TP inventory;
+the table above is not exhaustive. Existing data avoids a new acquisition only
+when its shapes, backend and coverage match the target. Native MoE also requires
+a matching deployment contract, not merely an existing TP folder.
+
+Updating profiler code does not rewrite these measurements. Their metadata and
+row identities determine acquisition provenance; reproducing a stored example
+does not validate a complete fresh-only bundle from the current protocol.
+
+The RTX 4090 bundle was contributed in
+[#59](https://github.com/casys-kaist/LLMServingSim/pull/59); it retains vLLM 0.19
+measurements. See **[Validation](/docs/validation)** for current per-statistic
+results and the distinction between profile availability and measured accuracy.
+
+Two consequences that catch people out:
+
+- **KV precision must match the bundle.** The simulator derives it from the
+  model config, not a `--kv-cache-dtype` flag, and rejects a missing variant.
+  The profiler's `KV_CACHE_DTYPE=fp8` option can acquire that variant; it does
+  not change the simulator's model config. See
+  **[Examples → FP8 KV cache](/docs/examples/memory-tiers/fp8-kv-cache)**.
+- **TP=4 and above need a profile run**, even on RTXPRO6000 with a
+  bundled model, and so does **TP=2 on RTX4090** — that bundle is TP=1
+  only. `_load_perf_db` hard-errors on a missing `tp<N>/` folder rather
+  than extrapolating.
 
 ## Prerequisites
 
@@ -78,9 +139,12 @@ skip the profiler entirely.
   root). See **[Installation → vLLM setup](/docs/getting-started/installation/vllm)**.
 - **NVIDIA GPU** (only for the profiler, the simulator runs on CPU).
 - **`HF_TOKEN`** environment variable for gated model configs (Llama
-  3.x, etc.). Set this in `scripts/docker-vllm.sh` before launching.
-- **A few GB of GPU memory** for the model variant you're profiling
-  (TP=1 needs the full model; TP=N needs `model_size / N`).
+  3.x, etc.). Export it in your shell before launching.
+- **Enough GPU memory** for the category's shrunken per-rank stack, KV cache,
+  activations and backend workspaces. Profiling normally uses dummy weights
+  and the minimum layer prefix needed to expose the category, not the full
+  checkpoint. Native MoE has its own deployment contract. Real `bench run`
+  recordings normally load the full model.
 
 ## Where to go next
 

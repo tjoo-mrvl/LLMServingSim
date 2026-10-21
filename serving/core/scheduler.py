@@ -16,16 +16,33 @@ import numpy as np
 
 # class that shedules request of astra-sim
 class Scheduler:
+    """vLLM V1-style continuous batching over a per-tier block pool.
+
+    Shape follows ``vllm/v1/core/sched/scheduler.py`` (v0.19.0): a persistent
+    ``running`` set is served first, preempting only from its own tail, then the
+    ``waiting`` queue is admitted while budget and slots remain -- never by
+    preempting. A step that preempted skips admission entirely, which is what
+    keeps the running set from oscillating.
+
+    There is one ``schedule()`` for prefix caching on and off. The pool handles
+    ``enable_caching=False`` the way vLLM does (allocate through the same free
+    list, never index), so the two separate schedulers this file used to carry
+    had no reason to exist -- and their drifting apart was its own source of bugs.
+    """
+
     def __init__(self, model, node_id, instance_id, max_num_seqs, max_num_batched_tokens,
                  num_npus, tp_size, pp_size, npu_mem, cpu_mem,
                  start_npu, pd_type, fp, block_size, req_num,
-                 prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
-                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto', quantization=None):
+                 enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage,
+                 enable_chunked_prefill=False,
+                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
+                 npu_memory_utilization=1.0, reserve_full_isl=True,
+                 acceptance_model=None, async_scheduling=True):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
         self.instance_id = instance_id
-        self.max_num_seqs = max_num_seqs
+        self.max_num_seqs = int(max_num_seqs)
         self.max_num_batched_tokens = min(max_num_batched_tokens, self.config['max_position_embeddings'])
         self.long_prefill_token_threshold = long_prefill_token_threshold
         self.num_npus = num_npus
@@ -38,843 +55,724 @@ class Scheduler:
         self.enable_prefix_sharing = enable_prefix_sharing
         self.enable_chunked_prefill = enable_chunked_prefill
         self.prefix_storage = prefix_storage
-        self.prioritize_prefill = prioritize_prefill
-        # lists are sorted in arrival time manner
-        self.request = []
+        # vLLM's scheduler_reserve_full_isl, True by default there: admit a
+        # request only if its whole sequence fits, not merely its first chunk.
+        self.reserve_full_isl = reserve_full_isl
+        # vLLM's ``need_mamba_block_aligned_split``:
+        # ``has_mamba_layers and mamba_cache_mode == "align"``, and "align" is
+        # what prefix caching selects. See ``_mamba_block_aligned_split``.
+        _stack = get_layer_stack(model) or []
+        _is_hybrid = any(spec.attn == 'linear_attention' for spec in _stack)
+        _is_moe = any(getattr(spec, 'mlp', None) == 'moe' for spec in _stack)
+        # vLLM's ``VllmConfig.use_v2_model_runner`` via
+        # ``_is_default_v2_model_runner_model``: V2 is the default for anything
+        # that is not MoE, except that a hybrid stack stays on V1 unless its
+        # architecture is explicitly a default-V2 one. vLLM also forces V2 for a
+        # short list of architectures
+        # (``config/vllm.py::default_v2_model_runner_architectures``); no config
+        # under ``configs/model/`` is on it, and a snapshot of a list that moves
+        # every release would drift silently, so adding one from that list means
+        # revisiting this. It matters only for ``_async_adds_a_batch``.
+        self._uses_v2_model_runner = (not _is_moe) and (not _is_hybrid)
+        self._needs_mamba_aligned_split = bool(enable_prefix_caching) and _is_hybrid
+        if self._needs_mamba_aligned_split and not enable_chunked_prefill:
+            # vLLM asserts this, in the same block that picks "align"
+            # (models/config.py: `assert enable_chunked_prefill, "Chunked
+            # prefill is required for mamba cache mode 'align'."`). The reason
+            # is structural rather than incidental: "align" exists so a state
+            # checkpoint lands on a block boundary, and the only lever for that
+            # is where a chunk ends -- with no chunking there is no lever, and
+            # the invariant the split protects cannot hold.
+            raise ValueError(
+                f"instance {instance_id}: {model} has linear-attention layers "
+                f"and prefix caching is on, which selects vLLM's mamba cache "
+                f"mode 'align' -- and that requires chunked prefill, because "
+                f"aligning a chunk end to a block boundary is what makes a "
+                f"state checkpoint addressable. vLLM refuses to start this "
+                f"combination. Enable chunked prefill, or turn prefix caching "
+                f"off (which selects 'none' and checkpoints nothing)."
+            )
+        # None when speculative decoding is off. See ``spec_decode.py``: which
+        # draft tokens the target accepts is the one thing a simulator cannot
+        # compute, so it is a policy with a per-model published default.
+        self.spec = acceptance_model
+
+        # Requests admitted and still generating. Persistent across steps: this
+        # is what gives the scheduler a notion of "already running", which the
+        # old single re-derived pool did not have.
+        self.running = []
+        # Not yet admitted, sorted by (arrival, id). A preempted request is
+        # prepended, as in vLLM's waiting.prepend_request().
+        self.waiting = []
         self.inflight = []
         self.done = []
         self.batch_ids = -1
 
-        # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype, quantization=quantization)
+        # vLLM's ``scheduler_config.async_scheduling``, True by default there.
+        # It makes ``max_concurrent_batches`` 2 at pp_size 1 (``config/vllm.py``:
+        # "Async scheduling requires 2 concurrent batches to overlap"), so the
+        # engine composes the *next* batch while the current one is still on the
+        # GPU. A request that arrives after that composition cannot join it and
+        # waits one more step. ``_arrival_cutoff`` is where that shows up.
+        self.async_scheduling = bool(async_scheduling)
+        # Clock of the batch that completed most recently, and the clock at
+        # which it was composed. Together they answer "was this instance busy
+        # right up to now, and if so what could the scheduler see when it built
+        # the batch that is finishing?"
+        self._last_batch_start = None
+        self._last_batch_end = None
 
-        # logger
+        # Speculative-decoding counters, reported as vLLM reports them: the
+        # acceptance rate is accepted/drafted.
+        self.spec_drafted = 0
+        self.spec_accepted = 0
+
+        # Tokens recomputed because a request was preempted, and how many
+        # preemptions happened. Both are reported: in the prefix-caching-off mode
+        # a large recompute count is expected and is what that mode costs, while
+        # in the prefix-caching modes it should stay near zero.
+        self.recompute_tokens = 0
+        self.num_preemptions = 0
+
+        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem,
+                                  block_size, fp, enable_prefix_caching, enable_prefix_sharing,
+                                  prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size,
+                                  pp_size=pp_size, kv_cache_dtype=kv_cache_dtype,
+                                  npu_memory_utilization=npu_memory_utilization,
+                                  num_speculative_tokens=(
+                                      acceptance_model.N if acceptance_model else 0))
+        self.kv = self.memory.kv
+
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
-    
- 
+
+    # ==================== scheduling ====================
+
     def schedule(self, current, sys, batch_id=-1):
-        if self.enable_prefix_caching:
-            return self.schedule_with_prefix(current, sys, batch_id)
-        else:
-            return self.schedule_base(current, sys, batch_id)
+        if sys != self.start_npu:
+            return self._schedule_existing(sys, batch_id)
 
-    def _get_reload_size(self, batch_req, batch_len):
-        load_size = 0
-        for req in batch_req[:batch_len]:
-            if req.evict:
-                load_size += self.memory.get_evict_kv(req)
-        return load_size
+        # The start NPU is a joiner too, and it has to try joining *before* the
+        # pipeline-depth cap below. With DP groups any NPU of the instance may
+        # open a round -- the idle-member dummy in particular -- and ``add_done``
+        # only completes a batch once ``start_npu`` has run it, so a batch opened
+        # by another NPU would otherwise never finish and the group's collective
+        # would block forever. Gating the join on a *full* pipeline missed
+        # exactly that case: a dummy opened by a non-start NPU leaves
+        # ``pp_size - 1`` slots free, so the start NPU took the build path
+        # instead, found nothing to build (its member is idle) and answered
+        # "pass" forever. Joining never adds a batch, so it cannot breach the cap.
+        #
+        # For a non-DP instance every in-flight batch was built here, so
+        # ``start_npu`` is already in ``fired``, this returns None, and the cap
+        # below decides exactly as it did before.
+        existing = self._schedule_existing(sys, batch_id)
+        if existing is not None:
+            return existing
 
-    # batch the request scheduling method
-    def schedule_base(self, current, sys, batch_id=-1):
-        # first NPU to process new batch
-        if sys == self.start_npu:
-            # nothing to batch return None
-            if len(self.request) != 0 and self.request[0].arrival > current:
-                return None
-            # constraint of inflight batches considering parallelism
-            if len(self.inflight) >= self.pp_size:
-                # wait it to be done
-                return None
+        # One batch in flight per pipeline stage: vLLM's ``batch_queue``, whose
+        # maxlen is ``max_concurrent_batches`` == ``pipeline_parallel_size``.
+        if len(self.inflight) >= self.pp_size:
+            return None
 
-            # scheduling start
-            batch_req = [req for req in self.request if req.arrival <= current]
+        token_budget = self.max_num_batched_tokens
+        # (request, tokens scheduled, num_computed_tokens before this step)
+        scheduled = []
+        preempted = []
 
-            # max_num_seqs limits total running requests (vLLM behavior)
-            running_reqs = sum(len(b.requests) for b in self.inflight)
-            available_slots = max(0, int(self.max_num_seqs) - running_reqs)
-            batch_len = min(len(batch_req), available_slots)
+        token_budget = self._schedule_running(scheduled, preempted, token_budget)
+        # vLLM skips the whole waiting phase on any step that preempted
+        # (`if not preempted_reqs:`). Without that the running set oscillates
+        # preempt -> refill -> preempt.
+        if not preempted:
+            token_budget = self._schedule_waiting(current, scheduled, token_budget)
+            if not scheduled and self._async_adds_a_batch():
+                # The lag only exists while there is a batch to compose ahead
+                # of, and there is none: nothing was admitted and nothing is
+                # running. vLLM's batch queue is empty in this state, so its
+                # ``schedule()`` admits whatever has arrived. Keeping the lag
+                # here would hide an already-queued request behind a cutoff
+                # that only a completed batch can advance -- the main loop
+                # answers "pass", the clock never moves (it advances only for
+                # arrivals still pending in the router), and the run spins.
+                token_budget = self._schedule_waiting(
+                    current, scheduled, token_budget, cutoff=current)
 
-            # nothing to batch
-            if batch_len == 0:
-                return None
+        if not scheduled:
+            return None
+        return self._build_batch(current, sys, scheduled)
 
-            # can make batch and proceed
-            batch_req = batch_req[:batch_len]
-
-            kv_size = 0
-            evict_size = 0
-
-            # Get decode requests for preemption decisions
-            gen_req = [req for req in batch_req if not req.is_prefill()]
-            
-            if self.prioritize_prefill and not self.enable_chunked_prefill:
-                prefill_req = [req for req in batch_req if req.is_prefill()]
-
-                if len(prefill_req) != 0:
-                    batch_req = prefill_req
-                    batch_len = min(len(batch_req), available_slots)
-                    batch_req = batch_req[:batch_len]
-            
-            # Chunked prefill: process decode requests first, then prefill requests
-            if self.enable_chunked_prefill:
-                prefills = [req for req in batch_req if req.is_prefill()]
-                decodes = [req for req in batch_req if not req.is_prefill()]
-                batch_req = decodes + prefills
-                batch_len = len(batch_req)
-            
-            # ============ STEP 1: Token budget allocation (FIRST) ============
-            # Build scheduled_tokens dict: req.id -> tokens to process this step
-            scheduled_tokens = {}
-            
-            if self.enable_chunked_prefill:
-                # vLLM-style chunked prefill: schedule running (decode + ongoing prefill)
-                # first, then waiting (new prefill) requests. Token budget is the main
-                # constraint; long_prefill_token_threshold caps per-request tokens per step.
-                token_budget = self.max_num_batched_tokens
-                new_batch_req = []
-                threshold = self.long_prefill_token_threshold
-                # Decode requests first (each decode request = 1 token)
-                for req in batch_req:
-                    if not req.is_prefill():
-                        if token_budget <= 0:
-                            break
-                        new_batch_req.append(req)
-                        scheduled_tokens[req.id] = 1
-                        token_budget -= 1
-                # Then prefill requests (chunked)
-                for req in batch_req:
-                    if req.is_prefill():
-                        if token_budget <= 0:
-                            break
-                        remaining = req.original_input - req.num_computed_tokens
-                        # Per-request cap: long_prefill_token_threshold
-                        if 0 < threshold < remaining:
-                            remaining = threshold
-                        chunk = min(remaining, token_budget)
-                        if chunk <= 0:
-                            break
-                        req.chunk_len = chunk
-                        new_batch_req.append(req)
-                        scheduled_tokens[req.id] = chunk
-                        token_budget -= chunk
-                batch_req = new_batch_req
-                batch_len = len(batch_req)
-
-            else:
-                # Non-chunked: compute scheduled tokens for each request
-                total_len = 0
-                for req in batch_req:
-                    if req.is_prefill():
-                        scheduled_tokens[req.id] = req.input
-                        total_len += req.input
-                    else:
-                        scheduled_tokens[req.id] = 1
-                        total_len += 1
-
-                while total_len > self.max_num_batched_tokens:
-                    # print(f"[NON_CHUNKED] total_len({total_len} = sum([req 0 ~ {batch_len - 1}])) exceed 'max_num_batched_tokens'")
-                    last_req = batch_req[-1]
-                    total_len -= scheduled_tokens[last_req.id]
-                    del scheduled_tokens[last_req.id]
-                    batch_req = batch_req[:-1]
-                    batch_len -= 1
-                
-                # DEBUG: Check if total_len reached max
-                # if total_len >= self.max_num_batched_tokens * 0.9:
-                #     print(f"[NON-CHUNKED] Near max tokens! total_len: {total_len}/{self.max_num_batched_tokens}")
-                #     print(f"              Batch: {batch_len} reqs, scheduled_tokens: {scheduled_tokens}")
-            
-                # Early return due to max_num_batched_tokens limitation (It occurs only when No chunked-prefill)
-                if batch_len == 0:
-                    print("     [WARNNING] Cannot load the request to batch due to max_num_batched_tokens limitation")
-                    return None
-            # ============ STEP 2: KV size calculation (with scheduled_tokens) ============
-            temp_len = batch_len
-            for i in range(batch_len, -1, -1):
-                kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                load_size = self._get_reload_size(batch_req, i)
-                if self.memory.is_avail(kv_size + load_size, Device.NPU):
-                    temp_len = i
-                    break
-            
-            # ============ STEP 3: Eviction if needed ============
-            while temp_len == 0:
-                # print("Evict Request to CPU due to memory limitation")
-                # preempt request one by one until there is enough space
-                if len(gen_req) == 0:
-                    return None
-                
-                # check already evicted request
-                if gen_req[-1].evict:
-                    gen_req = gen_req[:-1]
+    def _schedule_running(self, scheduled, preempted, token_budget):
+        """Phase A: serve requests already running, preempting from the tail."""
+        i = 0
+        while i < len(self.running) and token_budget > 0:
+            req = self.running[i]
+            num_new = self._num_new_tokens(req, token_budget)
+            if num_new > 0 and self._needs_mamba_aligned_split:
+                aligned = self._mamba_block_aligned_split(
+                    req, num_new, req.num_computed_tokens)
+                if aligned <= 0:
+                    # This step's budget cannot cover a whole block for a chunk
+                    # that has to end block-aligned. Not the deadlock the guard
+                    # below catches: the split only floors to zero when
+                    # ``block_size <= max_prefill_tokens``, so a fresh step's
+                    # budget does cover one and the request moves next step.
+                    i += 1
                     continue
+                num_new = aligned
+            if num_new <= 0:
+                # Nothing left to compute for this request yet. vLLM continues
+                # rather than breaking here, so a later request is not blocked.
+                # Legitimate only while another batch is in flight and about to
+                # advance this request (pp_size > 1); otherwise nothing will ever
+                # move it and the run cannot terminate, so say so loudly.
+                if not any(req in b.requests for b in self.inflight):
+                    raise RuntimeError(
+                        f"[Scheduler] [node_id={self.node_id},inst={self.instance_id}] "
+                        f"request {req.id} is running with nothing to schedule and no "
+                        f"batch in flight: num_computed_tokens="
+                        f"{req.num_computed_tokens}, num_tokens_reached="
+                        f"{req.num_tokens_reached}, output={req.output}. This deadlocks "
+                        f"the run -- num_tokens_reached was not advanced when a token "
+                        f"was produced."
+                    )
+                i += 1
+                continue
 
-                # else
-                req_to_evict = gen_req[-1]
-                evicted_kv_size = self.memory.get_evict_kv(req_to_evict)
-                evict_size += evicted_kv_size
-                req_to_evict.evict = True
-                self.logger.info("Eviction of the request #%d", req_to_evict.id)
-                gen_req = gen_req[:-1]
-                # spill to cpu (host) memory. get_evict_kv returns per-rank
-                # bytes; cpu_used is tracked in full-cluster bytes (matches
-                # MemoryModel.apply_kv_cache_events convention), so scale by
-                # num_npus when crossing the NPU->CPU boundary.
-                self.memory.free(evicted_kv_size, Device.NPU)
-                self.memory.allocate(evicted_kv_size * self.num_npus, Device.CPU)
+            blocks = None
+            while True:
+                blocks = self.kv.allocate_slots(req, num_new)
+                if blocks is not None:
+                    break
+                # Preempt the lowest-priority running request. Under FCFS that
+                # is the most recently admitted, i.e. the tail.
+                victim = self.running.pop()
+                self._preempt_request(victim)
+                preempted.append(victim)
+                if victim is req:
+                    break
 
-                if len(gen_req) < batch_len:
-                    batch_len = len(gen_req)
+            if blocks is None:
+                break
 
-                # check if can batch
-                for i in range(batch_len, -1, -1):
-                    kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                    load_size = self._get_reload_size(batch_req, i)
-                    if self.memory.is_avail(kv_size + load_size, Device.NPU):
-                        temp_len = i
-                        break
+            scheduled.append((req, num_new, req.num_computed_tokens))
+            token_budget -= num_new
+            i += 1
+        return token_budget
 
-            batch_len = temp_len
-            batch_req = batch_req[:batch_len]
+    def _async_adds_a_batch(self) -> bool:
+        """Whether async scheduling buys a lookahead the pipeline does not
+        already provide.
 
-            # Recompute kv_size for final batch
-            kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
-            load_size = self._get_reload_size(batch_req, batch_len)
+        vLLM's ``max_concurrent_batches`` (``config/vllm.py``) is ``2`` at
+        ``pp_size`` 1 with async scheduling on, and ``pp_size + 1`` above it --
+        but only on the **V2** model runner. On V1 it stays at ``pp_size``,
+        because "V1 Model Runner does not fully support async scheduling with
+        PP". So for a V1 model at ``pp_size > 1`` async adds no batch at all,
+        and the one-step-stale composition is already what ``schedule()``'s
+        ``len(self.inflight) >= self.pp_size`` cap models. Charging the lag
+        there too double-counts it: it moved ``moe_pp`` -6.9% and
+        ``moe_dp_tp_pp_uneven`` -12.7%, since delaying admission repacks
+        batches rather than simply adding time.
+        """
+        if not self.async_scheduling:
+            return False
+        if self.pp_size <= 1:
+            return True
+        return self._uses_v2_model_runner
 
-            # delete from request queue
-            for req in batch_req:
-                for i, req_ in enumerate(self.request):
-                    if req_.id == req.id:
-                        del self.request[i]
-                        break
+    def _arrival_cutoff(self, current):
+        """The latest arrival time this step's admission can see.
 
-                if req.evict:
-                    req.evict = False
-                    self.logger.info("Loading the request #%d", req.id)
+        Under vLLM's async scheduling the batch that executes next was composed
+        while the previous one was still running, so its view of the arrival
+        queue is one step stale. ``EngineCore.step_with_batch_queue`` keeps
+        ``max_concurrent_batches`` batches outstanding -- 2 at ``pp_size`` 1 when
+        async scheduling is on -- and submits batch k+1 right after k, then
+        blocks on k's future. So the batch dispatched at the end of step k saw
+        arrivals only up to the point where step k itself was composed.
 
-            # ============ STEP 4: Allocate memory ============
-            if kv_size > 0:
-                self.memory.allocate(kv_size, Device.NPU)
+        Returns ``current`` (no lag) when this instance was *not* busy right up
+        to now: an idle engine's queue is empty, nothing is scheduled ahead, and
+        vLLM picks a newly arrived request up immediately. That case is not
+        cosmetic -- freezing the cutoff in the past while the engine idles would
+        make a request that arrives later permanently invisible.
+        """
+        if not self._async_adds_a_batch():
+            return current
+        if self._last_batch_end is None or self._last_batch_start is None:
+            return current
+        if current > self._last_batch_end:
+            # The instance went idle and the clock advanced past the last
+            # completion, so there is no in-flight step to hide behind.
+            return current
+        return self._last_batch_start
 
-            # Reload evicted KV to NPU and remove the spilled copy from CPU.
-            # load_size is per-rank, cpu_used is full-cluster.
-            if load_size > 0:
-                self.memory.allocate(load_size, Device.NPU)
-                self.memory.free(load_size * self.num_npus, Device.CPU)
-            
-            # ============ STEP 5: Build batch with lists ============
-            total_len = 0
-            kv_len = 0
-            num_prefill = 0
-            num_decode = 0
-            q_list = []
-            k_list = []
-            prefill_q_list = []
-            prefill_k_list = []
-            decode_k_list = []
-            for req in batch_req:
-                if req.is_prefill():
-                    # Use scheduled_tokens for chunk size
-                    chunk_size = scheduled_tokens.get(req.id, req.original_input - req.num_computed_tokens)
+    def _schedule_waiting(self, current, scheduled, token_budget, cutoff=None):
+        """Phase B: admit from the waiting queue. Never preempts to admit.
 
-                    total_len += chunk_size
-                    if req.is_init:  # Only set queuing delay on first chunk
-                        req.set_que_delay(current)
-                    q_list.append(chunk_size)
-                    prefill_q_list.append(chunk_size)
-                    # prefill_k_list: already computed tokens (k_cache from previous chunks)
-                    prefill_k_list.append(req.num_computed_tokens)
-                    # k_list: total kv cache after this step (computed + new)
-                    # k_list.append(req.num_computed_tokens + chunk_size)
-                    num_prefill += 1
+        ``cutoff`` overrides the async-scheduling arrival lag; see
+        ``_arrival_cutoff`` and the retry in ``schedule()``.
+        """
+        if cutoff is None:
+            cutoff = self._arrival_cutoff(current)
+        while self.waiting and token_budget > 0:
+            if len(self.running) >= self.max_num_seqs:
+                break
+            req = self.waiting[0]
+            if req.arrival > cutoff:
+                # Arrival-sorted, so nothing behind it has arrived either.
+                break
 
-                else:
-                    # Decode
-                    total_len += 1
-                    q_list.append(1)
-                    num_decode += 1
-                    kv_len += req.num_computed_tokens
-                    decode_k_list.append(req.num_computed_tokens)
-                    # k_list.append(req.num_computed_tokens)
+            num_computed = req.num_computed_tokens
+            hit_blocks, num_npu_hit, num_lower_hit = [], 0, 0
+            if num_computed == 0:
+                hit_blocks, num_npu_hit, num_lower_hit = self.kv.get_computed_blocks(req)
+                req.npu_cache_hit = num_npu_hit
+                req.storage_cache_hit = num_npu_hit + num_lower_hit
+                req.prefix_cache_hit = req.storage_cache_hit
+                num_computed = num_npu_hit + num_lower_hit
 
-            # make batch, output doesn't matter here!! always one iteration
-            # batch is also 1
-            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, load_size)
-            # add already fired system
-            batch.fired.append(sys)
-            batch.requests.extend(batch_req)
-            self.inflight.append(batch)
-            self.logger.info(
-                "Scheduling new batch #%d to NPU[%d]",
-                batch.batch_id,
-                sys,
-            )
-            # print(f"[BATCH DEBUG] Batch: {len(new_batch_req)} reqs, scheduled_tokens: {scheduled_tokens}")
-            # batch.log()
-            # add scheduled_tokens to batch for debugging
-            batch.scheduled_tokens = scheduled_tokens
-            return batch
-        
-        # Schedule already batched request
-        else:
-            if len(self.inflight) == 0:
-                return None
+            num_new = req.num_tokens - num_computed
+            threshold = self.long_prefill_token_threshold
+            if 0 < threshold < num_new:
+                num_new = threshold
+            if not self.enable_chunked_prefill and num_new > token_budget:
+                # Cannot split this prefill, and it does not fit. Stop here
+                # rather than skipping ahead, to keep FCFS.
+                break
+            num_new = min(num_new, token_budget)
+            if num_new <= 0:
+                break
+            if self._needs_mamba_aligned_split:
+                # After the budget clamp, as vLLM applies it. A zero here means
+                # this step's budget cannot cover a whole block, so the queue
+                # stops -- FCFS, same as the branch above.
+                num_new = self._mamba_block_aligned_split(
+                    req, num_new, num_computed)
+                if num_new <= 0:
+                    break
+
+            if self.reserve_full_isl and not self.kv.can_fit_full_sequence(
+                    req, hit_blocks, num_npu_hit, num_lower_hit):
+                # Its first chunk would fit but the whole sequence would not, so
+                # admitting it now only defers a preemption. vLLM breaks here.
+                break
+
+            blocks = self.kv.allocate_slots(req, num_new, hit_blocks,
+                                            num_npu_hit, num_lower_hit)
+            if blocks is None:
+                # vLLM breaks here: a waiting request never causes a preemption.
+                break
+
+            self.waiting.pop(0)
+            if req.num_preemptions > 0:
+                # Resuming. Whatever neither tier could return has to be
+                # computed again; with no lower tier that is the whole sequence.
+                self.recompute_tokens += max(0, req.num_tokens_reached - num_computed)
+                self.logger.info("Resuming request #%d (%d of %d tokens recovered)",
+                                 req.id, num_computed, req.num_tokens_reached)
+            req.num_computed_tokens = num_computed
+            req.status = RequestStatus.RUNNING
+            self.running.append(req)
+            self.memory.record_prefix_stats(req)
+
+            scheduled.append((req, num_new, num_computed))
+            token_budget -= num_new
+        return token_budget
+
+    def _num_new_tokens(self, req, token_budget):
+        """Tokens to schedule for ``req`` this step, vLLM's uniform rule.
+
+        No prefill/decode branch: a request simply catches up to the length it
+        has reached. In steady-state decode that yields 1; for a resumed request
+        with ``num_computed_tokens`` reset to 0 it yields the whole sequence,
+        chunked by the budget.
+        """
+        req.num_spec_scheduled = self._draft_tokens_for(req)
+        num_new = req.num_tokens_with_spec - req.num_computed_tokens
+        threshold = self.long_prefill_token_threshold
+        if 0 < threshold < num_new:
+            num_new = threshold
+        num_new = min(num_new, token_budget)
+        # The budget may cut the draft short. Record what actually got a slot,
+        # since that is what gets verified -- vLLM's ``num_scheduled_spec_tokens``.
+        req.num_spec_scheduled = max(0, min(req.num_spec_scheduled, num_new - 1))
+        return num_new
+
+    def _mamba_block_aligned_split(self, req, num_new, start):
+        """Clip a prefill chunk so it ends where the mamba state can be cached.
+
+        vLLM's ``Scheduler._mamba_block_aligned_split``, which runs whenever a
+        model has mamba layers and prefix caching is on -- that pair is what
+        selects ``mamba_cache_mode "align"``. The invariant it protects: state
+        slot *p* holds the state after exactly ``(p + 1) * block_size`` tokens,
+        and state is only written at a chunk end, so **a chunk end must be
+        block aligned** or the slot holds a state no position can name.
+
+        Three rules, in vLLM's order:
+
+        * A chunk that is not the prompt's last is floored to a block boundary
+          -- unless flooring would leave nothing *and* the block is wider than
+          one chunk's budget, in which case it advances sub-block and realigns
+          at the next boundary instead.
+        * A chunk starting mid-block stops at the next boundary.
+        * No chunk runs past ``last_cache_position``, the last block-aligned
+          position in the sequence, mid-chunk.
+
+        Returning 0 is a real answer, not a failure: it is vLLM's "insufficient
+        budget for a block-aligned chunk", and the request simply waits for a
+        step whose budget covers a whole block.
+
+        Deliberately not modelled: the Eagle backoff, the partial-tail hash
+        boundary and the Marconi shared-prefix junction. Each adds a further
+        early stop, so leaving them out can only make a chunk longer than
+        vLLM's, never shorter.
+        """
+        prefill_end = max(req.original_input, req.num_tokens_reached - 1)
+        if start >= prefill_end:
+            return num_new                      # decoding: nothing to align
+
+        block_size = self.memory.block_size
+        last_cache_position = (
+            req.num_tokens_reached - req.num_tokens_reached % block_size
+        )
+
+        end = start + num_new
+        if end < prefill_end:
+            max_prefill_tokens = self.max_num_batched_tokens
+            if self.long_prefill_token_threshold > 0:
+                max_prefill_tokens = min(
+                    max_prefill_tokens, self.long_prefill_token_threshold)
+            aligned_end = end // block_size * block_size
+            if aligned_end > start or block_size <= max_prefill_tokens:
+                end = aligned_end
+
+        stops = (
+            (start // block_size + 1) * block_size if start % block_size else 0,
+            last_cache_position,
+        )
+        end = min((s for s in stops if start < s < end), default=end)
+        return max(end - start, 0)
+
+    def _draft_tokens_for(self, req):
+        """Draft tokens to verify alongside this request's real token.
+
+        Zero unless the request is **caught up**, i.e. in steady-state decode
+        with exactly one token to compute. That is not a prefill/decode branch
+        sneaking back in: it is where a draft exists at all. vLLM's drafter runs
+        after a decode step and fills ``spec_token_ids``, so a request working
+        through a prefill chunk, or recomputing after preemption, has none.
+        """
+        if self.spec is None or self.spec.N <= 0:
+            return 0
+        if req.num_tokens_reached - req.num_computed_tokens != 1:
+            return 0
+        return self.spec.N
+
+    def _preempt_request(self, req):
+        """Give up a running request's blocks so someone else can use them.
+
+        vLLM verbatim, including resetting ``num_computed_tokens``: that is not
+        "throw it away and re-prefill", it means "forget where you were and
+        re-derive it from the caches". ``free_blocks`` keeps the blocks' hashes,
+        so on re-admission ``get_computed_blocks`` finds whatever is still
+        resident, a lower tier returns what was written down, and only the
+        remainder is recomputed. Nothing here needs a special "preserve the
+        decode state" path -- the tiers are what preserve it.
+        """
+        self.kv.preempt(req)
+        req.status = RequestStatus.PREEMPTED
+        req.num_computed_tokens = 0
+        # The draft belonged to a step that will not complete, and vLLM drops
+        # it the same way (``scheduled_spec_decode_tokens.pop(preempted_req_id)``).
+        # Leaving it set would have the request re-admitted asking to verify
+        # tokens nothing proposed.
+        req.num_spec_scheduled = 0
+        req.num_preemptions += 1
+        self.num_preemptions += 1
+        # vLLM prepends, so a preempted request is first in line to come back.
+        self.waiting.insert(0, req)
+        self.logger.info("Preemption of the request #%d (count %d)", req.id, req.num_preemptions)
+
+    def _build_batch(self, current, sys, scheduled):
+        """Assemble the Batch the trace generator consumes.
+
+        Prefill-vs-decode is decided by the *scheduled token count*, not by any
+        request phase flag: >1 token is a chunk, exactly 1 is a decode. That is
+        what the attention profile axes want (prefill_chunk / kv_prefill vs
+        n_decode / kv_decode) and how the varlen kernel sees the batch anyway. It
+        is also the only classification that survives a resumed request, whose
+        recomputation must be traced as a chunk even though it is past its
+        original prompt length.
+        """
+        total_len = 0
+        kv_len = 0
+        num_prefill = 0
+        num_decode = 0
+        q_list = []
+        k_list = []
+        prefill_q_list = []
+        prefill_k_list = []
+        decode_k_list = []
+        decode_q_lens = []
+        scheduled_tokens = {}
+        spec_scheduled = {}
+        pd_kv_send_tokens = 0
+
+        for req, num_new, computed_before in scheduled:
+            scheduled_tokens[req.id] = num_new
+            # Snapshot the draft count for the same reason as the token count:
+            # ``req.num_spec_scheduled`` is what *this* step scheduled, and at
+            # pp_size > 1 the next ``schedule()`` runs while this batch is in
+            # flight and rewrites it -- to 0, since the request is no longer
+            # caught up. ``add_done`` would then find no draft to roll back,
+            # leave num_computed_tokens N-1 past num_tokens_reached, and the
+            # request could never be scheduled again.
+            spec_scheduled[req.id] = req.num_spec_scheduled
+            total_len += num_new
+            q_list.append(num_new)
+            k_list.append(computed_before)
+            # Classify by *why* the request has more than one token, not by the
+            # count. A speculative-decode step submits 1 + N queries that all
+            # read one sequence's KV; a prefill chunk of the same size reads a
+            # different amount and is a different kernel shape. Reading the
+            # count alone filed every verification step as a prefill.
+            if req.num_spec_scheduled > 0:
+                num_decode += 1
+                kv_len += computed_before
+                decode_k_list.append(computed_before)
+                decode_q_lens.append(num_new)
+            elif num_new > 1:
+                num_prefill += 1
+                prefill_q_list.append(num_new)
+                prefill_k_list.append(computed_before)
             else:
-                batch = None
-                # find batch
-                for b in self.inflight:
-                    if b.batch_id == batch_id:
-                        batch = b
-                if batch == None:
-                    return None
-                # check if this has been runned in the system
+                num_decode += 1
+                kv_len += computed_before
+                decode_k_list.append(computed_before)
+                decode_q_lens.append(1)
+            if req.is_init:
+                req.set_que_delay(current)
+            if self.pd_type == "prefill":
+                # The paired decode instance needs this chunk's KV, plus the KV
+                # of any prefix-cache hit -- it was never computed here, but the
+                # decode side still needs it.
+                pd_kv_send_tokens += num_new
+                if computed_before == 0:
+                    pd_kv_send_tokens += req.prefix_cache_hit
+
+            # vLLM advances num_computed_tokens at schedule time
+            # (_update_after_schedule), not at completion. With pp_size > 1 two
+            # batches can be in flight, and advancing late would let the same
+            # tokens be scheduled twice.
+            req.num_computed_tokens = computed_before + num_new
+
+        recall_bytes, write_through_bytes = self.kv.take_traffic()
+
+        batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list,
+                      num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list,
+                      current, self.kv.npu_used_bytes(), 0, recall_bytes,
+                      pd_kv_send_tokens=pd_kv_send_tokens,
+                      # One shot per batch, so a mixed batch takes the longest
+                      # decode query -- the kernel is launched for the whole
+                      # batch and its cost follows the widest row.
+                      decode_q_len=max(decode_q_lens) if decode_q_lens else 1)
+        batch.fired.append(sys)
+        batch.requests.extend(req for req, _, _ in scheduled)
+        batch.scheduled_tokens = scheduled_tokens
+        batch.spec_scheduled = spec_scheduled
+        # Written down to a victim tier off the critical path, so it carries no
+        # latency -- but the bytes still cost DRAM energy.
+        batch.write_through = write_through_bytes
+        self.inflight.append(batch)
+        self.logger.info("Scheduling new batch #%d to NPU[%d]", batch.batch_id, sys)
+        return batch
+
+    def _schedule_existing(self, sys, batch_id):
+        """Hand an already-formed batch to the next NPU of the instance."""
+        for batch in self.inflight:
+            if batch.batch_id == batch_id:
                 if sys in batch.fired:
                     return None
-                else:
-                    batch.fired.append(sys)
-                    self.logger.info(
-                        "Scheduling existing batch #%d to NPU[%d]",
-                        batch.batch_id,
-                        sys,
-                    )
-                    return batch
-    
-    def schedule_with_prefix(self, current, sys, batch_id=-1):
-        if sys == self.start_npu:
-            # nothing to batch return None
-            if len(self.request) != 0 and self.request[0].arrival > current:
-                return None
-            # constraint of inflight batches considering parallelism
-            if len(self.inflight) >= self.pp_size:
-                # wait it to be done
-                return None
+                batch.fired.append(sys)
+                self.logger.info("Scheduling existing batch #%d to NPU[%d]", batch.batch_id, sys)
+                return batch
+        return None
 
-            # scheduling start
-            batch_req = [req for req in self.request if req.arrival <= current]
+    # ==================== completion ====================
 
-            # max_num_seqs limits total running requests (vLLM behavior)
-            running_reqs = sum(len(b.requests) for b in self.inflight)
-            available_slots = max(0, int(self.max_num_seqs) - running_reqs)
-            batch_len = min(len(batch_req), available_slots)
-
-            # nothing to batch
-            if batch_len == 0:
-                return None
-
-            # can make batch and proceed
-            batch_req = batch_req[:batch_len]
-
-            # Prioritize prefill (without chunked prefill) or reorder for chunked prefill
-            if self.prioritize_prefill and not self.enable_chunked_prefill:
-                prefill_req = [req for req in batch_req if req.is_prefill()]
-                if len(prefill_req) != 0:
-                    batch_req = prefill_req
-                    batch_len = min(len(batch_req), available_slots)
-                    batch_req = batch_req[:batch_len]
-            
-            # Chunked prefill: process decode requests first, then prefill requests
-            if self.enable_chunked_prefill:
-                prefills = [req for req in batch_req if req.is_prefill()]
-                decodes = [req for req in batch_req if not req.is_prefill()]
-                batch_req = decodes + prefills
-                batch_len = len(batch_req)
-
-            # Get decode requests for preemption decisions
-            gen_req = [req for req in batch_req if not req.is_prefill()]
-            # gen_req = [req for req in batch_req if not (req.num_computed_tokens >= req.original_input)]
-            
-            # ============ STEP 0: Prefix Matching ============
-            # Only match prefix for NEW prefill requests (first chunk)
-            # Ongoing chunked prefills already have their prefix cache info
-            # for req in batch_req:
-            #     if req.is_prefill():
-            #         self.memory.prefix_match(req)
-            
-            # ============ STEP 1: Token budget allocation ============
-            scheduled_tokens = {}
-            
-            if self.enable_chunked_prefill:
-                # Chunked prefill: assign token budget to requests
-                token_budget = self.max_num_batched_tokens
-                new_batch_req = []
-                
-                # Decode requests first (each decode request = 1 token)
-                for req in batch_req:
-                    if not req.is_prefill():
-                        if token_budget <= 0:
-                            break
-                        new_batch_req.append(req)
-                        scheduled_tokens[req.id] = 1
-                        token_budget -= 1
-                
-                # Then prefill requests (chunked)
-                threshold = self.long_prefill_token_threshold
-                for req in batch_req:
-                    if req.is_prefill():
-                        if token_budget <= 0:
-                            break
-                        # Calculate remaining tokens without considering prefix cache
-                        # because it is already considered in "self.memory.prefix_match(req)" -> req.num_computed_tokens
-                        if req.num_computed_tokens == 0:
-                            self.memory.prefix_match(req)
-                        remaining = req.original_input - req.num_computed_tokens
-                        # Per-request cap: long_prefill_token_threshold
-                        if 0 < threshold < remaining:
-                            remaining = threshold
-                        chunk = min(remaining, token_budget)
-                        if chunk <= 0:
-                            break
-
-                        req.chunk_len = chunk
-                        new_batch_req.append(req)
-                        scheduled_tokens[req.id] = chunk
-                        token_budget -= chunk
-
-                batch_req = new_batch_req
-                batch_len = len(batch_req)
-            else:
-                # Non-chunked: compute scheduled tokens for each request
-                total_len = 0
-                for req in batch_req:
-                    if req.is_prefill():
-                        if req.num_computed_tokens == 0:
-                            self.memory.prefix_match(req)
-                        # Consider prefix cache hit for non-chunked prefill
-                        prefix_hit = req.prefix_cache_hit
-                        tokens_to_compute = max(req.original_input - prefix_hit, 1)
-                        scheduled_tokens[req.id] = tokens_to_compute
-                        req.chunk_len = tokens_to_compute  # Set chunk_len for add_done()
-                        total_len += tokens_to_compute
-                    else:
-                        scheduled_tokens[req.id] = 1
-                        total_len += 1
-
-                while total_len > self.max_num_batched_tokens:
-                    last_req = batch_req[-1]
-                    total_len -= scheduled_tokens[last_req.id]
-                    del scheduled_tokens[last_req.id]
-                    batch_req = batch_req[:-1]
-                    batch_len -= 1
-            
-            # ============ STEP 1.5: Lock prefix for scheduled requests ============
-            newly_locked = set()
-            for req in batch_req:
-                # if req.is_prefill() and req.num_computed_tokens == 0:
-                if req.is_prefill() and req.npu_last_node is not None and not req._prefix_locked:
-                    self.memory.lock_prefix(req, Device.NPU)
-                    req._prefix_locked = True
-                    newly_locked.add(req.id)
-            
-            # ============ STEP 2: KV size calculation ============
-            kv_size = 0
-            evict_size = 0
-            temp_len = batch_len
-            total_useable_size = self.memory.avail_size(Device.NPU) + self.memory.evictable_size(Device.NPU)
-            
-            for i in range(batch_len, -1, -1):
-                kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                if total_useable_size >= kv_size:
-                    temp_len = i
-                    break
-            
-            # ============ STEP 3: Eviction if needed ============
-            evicted_req = []
-            while temp_len == 0:
-                # print("eviction occurs!!")
-                if len(gen_req) == 0:
-                    # print("gen_req length == 0 (No decode) => return None (No Batch)")
-                    # No request to evict but no memory - rollback prefix cache lock
-                    for req in batch_req:
-                        if req.is_prefill() and req._prefix_locked:
-                            
-                            self.memory.unlock_prefix(req, Device.NPU)
-                            self.memory.erase_prefix_info(req)
-                            req._prefix_locked = False
-                    return None
-                
-                # Check already evicted request
-                if gen_req[-1].evict:
-                    gen_req = gen_req[:-1]
-                    continue
-                
-                # Evict the last decode request
-                # (DEPRECATED) self.memory.unlock_prefix(gen_req[-1], Device.NPU)
-                # (DEPRECATED) self.memory.erase_prefix_info(gen_req[-1])
-                if gen_req[-1].is_prefill() and getattr(gen_req[-1], '_prefix_locked', False):
-                    self.memory.unlock_prefix(gen_req[-1], Device.NPU)
-                    # self.memory.erase_prefix_info(gen_req[-1])
-                    gen_req[-1]._prefix_locked = False
-                
-                current_usable_size = self.memory.avail_size(Device.NPU) + self.memory.evictable_size(Device.NPU)
-                
-                gen_req[-1].evict = True
-                evicted_req.append(gen_req[-1])
-                self.logger.info("Eviction of the request #%d", gen_req[-1].id)
-                gen_req = gen_req[:-1]
-                
-                if len(gen_req) < batch_len:
-                    batch_len = len(gen_req)
-                
-                # Check if can batch now
-                for i in range(batch_len, -1, -1):
-                    kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                    if current_usable_size >= kv_size:
-                        temp_len = i
-                        break
-
-            # Unlock prefix for requests that didn't make it into the batch
-            for req in batch_req[temp_len:]:
-                if req.is_prefill() and req._prefix_locked:
-                    self.memory.unlock_prefix(req, Device.NPU)
-                    self.memory.erase_prefix_info(req)
-                    req._prefix_locked = False
-
-            batch_len = temp_len
-            batch_req = batch_req[:batch_len]
-            
-            # Recompute kv_size for final batch
-            kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
-            evict_size = (kv_size - self.memory.avail_size(Device.NPU)) if kv_size > self.memory.avail_size(Device.NPU) else 0
-            
-            if evict_size > 0:
-                self.memory.evict_prefix_cache(evict_size, Device.NPU)
-
-            # ============ STEP 4: Allocate memory & handle evicted requests ============
-            evict_load_size = 0
-            prefix_load_size = 0
-            
-            for req in batch_req:
-                # Remove from request queue
-                for i, req_ in enumerate(self.request):
-                    if req_.id == req.id:
-                        del self.request[i]
-                        break
-
-                # Load prefix cache from storage if needed
-                if req.is_prefill() and req.storage_cache_hit > req.npu_cache_hit:
-                    prefix_load_size += (req.storage_cache_hit - req.npu_cache_hit) * self.memory.get_kv(1)
-
-                # Handle evicted requests
-                if req.evict:
-                    self.memory.prefix_match(req)
-                    self.memory.lock_prefix(req, Device.NPU)
-                    if self.prefix_storage is not None:
-                        self.memory.unlock_prefix(req, Device.CPU)
-                    evict_load_size += self.memory.get_evict_kv(req)
-                    req.evict = False
-                    self.logger.info("Loading the request #%d", req.id)
-
-            # ============ STEP 5: Build batch with lists ============
-            total_len = 0
-            kv_len = 0
-            num_prefill = 0
-            num_decode = 0
-            q_list = []
-            k_list = []
-            prefill_q_list = []
-            prefill_k_list = []
-            decode_k_list = []
-            
-            # Evict storage prefix cache if needed
-            total_size = 0
-            for req in batch_req:
-                total_size += self.memory.get_total_kv(req) * self.num_npus
-            for req in evicted_req:
-                total_size += self.memory.get_total_kv(req) * self.num_npus
-            
-            if self.prefix_storage is not None:
-                storage_evict_size = (total_size - self.memory.avail_size(self.prefix_storage)) if total_size > self.memory.avail_size(self.prefix_storage) else 0
-                if storage_evict_size > 0:
-                    self.memory.evict_prefix_cache(storage_evict_size, self.prefix_storage)
-
-            for req in batch_req:
-                # Update the prefix cache for incoming batch
-                # NOTE: Moved to add_done() to ensure prefix cache is updated after chunk computation
-                # self.memory.cache_unfinished_req(req, Device.NPU)
-                # if self.prefix_storage is not None:
-                #     self.memory.cache_unfinished_req(req, self.prefix_storage)
-                
-                if req.is_prefill():
-                    # Use scheduled_tokens for chunk size. num_computed_tokens
-                    # already includes any prefix-cache hit (memory_model.py
-                    # bumps it on first prefix_match), so chunk_size is already
-                    # the count of tokens actually computed this iteration —
-                    # no further prefix-hit subtraction is needed downstream.
-                    chunk_size = scheduled_tokens.get(req.id, req.original_input - req.num_computed_tokens)
-                    if chunk_size > self.max_num_batched_tokens:
-                        raise Exception("Chunk length exceeds max num batched tokens")
-
-                    total_len += chunk_size
-                    if req.is_init:  # Only set queuing delay on first chunk
-                        req.set_que_delay(current)
-
-                    q_list.append(chunk_size)
-                    num_prefill += 1
-                    prefill_q_list.append(chunk_size)
-                    # prefill_k_list: already computed tokens (k_cache from previous chunks)
-                    prefill_k_list.append(req.num_computed_tokens)
-                else:
-                    # Decode: use num_computed_tokens (inevitable modification)
-                    total_len += 1
-                    q_list.append(1)
-                    num_decode += 1
-                    kv_len += req.num_computed_tokens  # inevitable modification: was req.input
-                    decode_k_list.append(req.num_computed_tokens)  # inevitable modification: was req.input
-                
-                k_list.append(req.num_computed_tokens)  # inevitable modification: was req.input
-            
-            # Storage needs to hold evicted cache
-            if self.prefix_storage is not None:
-                for req in evicted_req:
-                    self.memory.storage_cache_evicted_req(req)
-
-            
-            # For debugging
-            # self.memory.npu_prefix_cache.pretty_print()
-            # self.memory.npu_prefix_cache.print_prefix_info()
-            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, evict_load_size + prefix_load_size)
-            batch.fired.append(sys)
-            batch.requests.extend(batch_req)
-            self.inflight.append(batch)
-            self.logger.info(
-                "Scheduling new batch #%d to NPU[%d]",
-                batch.batch_id,
-                sys,
-            )
-            # print(f"[BATCH DEBUG] Batch: {len(new_batch_req)} reqs, scheduled_tokens: {scheduled_tokens}")
-            batch.scheduled_tokens = scheduled_tokens
-            # batch.log()
-            return batch
-        # Schedule already batched request
-        else:
-            if len(self.inflight) == 0:
-                return None
-            else:
-                batch = None
-                # find batch
-                for b in self.inflight:
-                    if b.batch_id == batch_id:
-                        batch = b
-                if batch is None or sys in batch.fired:
-                    return None
-                else:
-                    batch.fired.append(sys)
-                    self.logger.info(
-                        "Scheduling existing batch #%d to NPU[%d]",
-                        batch.batch_id,
-                        sys,
-                    )
-                    return batch
-        
-    # pop inflight, add to done
     def add_done(self, id, sys, finish):
         prompt_t = 0
         gen_t = 0
         end_reqs = []
         if len(self.inflight) == 0:
             return prompt_t, gen_t, end_reqs
+
         batch = None
-        # find batch
-        id -= 1
         idx = 0
+        id -= 1
         for i, b in enumerate(self.inflight):
             if b.batch_id == id:
                 batch = b
                 idx = i
-        # no batch return
-        if batch == None:
+        if batch is None or sys in batch.end:
             return prompt_t, gen_t, end_reqs
-        # already done
-        if sys in batch.end:
+
+        batch.end.append(sys)
+        # A prefill instance also waits for its paired decode NPUs, which
+        # receive the streamed KV.
+        last_npu = self.num_npus * (2 if self.pd_type == "prefill" else 1) - 1
+        if self.start_npu not in batch.end or (self.start_npu + last_npu) not in batch.end:
             return prompt_t, gen_t, end_reqs
-        else:
-            # add to done system
-            batch.end.append(sys)
-            # check all npus are done
-            if self.pd_type != "prefill":
-                if self.start_npu not in batch.end or (self.start_npu + self.num_npus - 1) not in batch.end:
-                    return prompt_t, gen_t, end_reqs
-            else:
-                if self.start_npu not in batch.end or (self.start_npu + self.num_npus * 2 - 1) not in batch.end:
-                    return prompt_t, gen_t, end_reqs
-        self.logger.info(
-            "Batch #%d is done",
-            batch.batch_id,
-        )
-                
-        pool = []
+
+        self.logger.info("Batch #%d is done", batch.batch_id)
+
         for req in batch.requests:
-            # For chunked prefill, use computed tokens to determine prefill vs decode
-            # Use is_prefill() method which checks num_computed_tokens < original_input
-            is_prefill_req = req.is_prefill()
-            
-            # change phase
-            if is_prefill_req:
-                # Get chunk_len from scheduling step
-                chunk_len = req.chunk_len if req.chunk_len > 0 else (req.original_input - req.num_computed_tokens)
-                if chunk_len > self.max_num_batched_tokens:
-                    raise Exception("Chunk length exceeds max num batched tokens")
+            if req.status == RequestStatus.FINISHED:
+                # With pp_size > 1 a request is legitimately in more than one
+                # in-flight batch, so it can finish on an earlier batch while a
+                # later one is still running. vLLM V1 skips exactly this in
+                # ``update_from_output`` -- "the request is already finished.
+                # This can happen if the request is aborted while the model is
+                # executing it (e.g., in pipeline parallelism)" -- and drops that
+                # batch's output whole, tokens included: they are past the
+                # request's target, so nothing wants them.
+                #
+                # Without this the completion path below runs once per in-flight
+                # batch: duplicate rows in the per-request CSV, req_cnt counted
+                # twice, end_time and latency overwritten with the later batch's
+                # clock, and a KeyError in cache_blocks, whose req_to_blocks
+                # entry the first pass already freed.
+                continue
+            num_new = batch.scheduled_tokens[req.id]
+            # num_computed_tokens was already advanced at schedule time.
+            prefill_done_now = req.is_init and req.num_computed_tokens >= req.original_input
 
-                # Update num_computed_tokens
-                req.num_computed_tokens += chunk_len
-                req.chunk_len = 0  # Reset for next step
-                
-                # Check if prefill is complete
-                if req.num_computed_tokens >= req.original_input:
-                    # Update prefix cache before clearing is_init (for stats tracking)
-                    if self.enable_prefix_caching:
-                        self.memory.cache_unfinished_req(req, Device.NPU)
-                        if self.prefix_storage is not None:
-                            self.memory.cache_unfinished_req(req, self.prefix_storage)
-                    req.is_init = False
-                    # Include prefix cache hit tokens in prompt throughput
-                    prompt_t += chunk_len + req.prefix_cache_hit
-                    req.final_prefix_hit = req.prefix_cache_hit  # snapshot before erase (for CSV)
-                    req.set_ttft(finish)
-                    
-                    if self.pd_type == "prefill":
-                        # Prefill instance: send to decode instance
-                        self.logger.info("Request #%d is prefill done", req.id)
-                        self.logger.info("Request #%d is sent to decode instance", req.id)
-                        # req.num_computed_tokens += 1  # First decode token was generated
-                        
-                        # remove kv cache here
-                        if self.enable_prefix_caching:
-                            self.memory.unlock_prefix(req, Device.NPU)
-                        else:
-                            kv_size = self.memory.get_evict_kv(req)
-                            self.memory.free(kv_size, Device.NPU)
-
-                        end_reqs.append(req)
-                        continue
-                    else:
-                        # Non-PD: prefill complete, first output token generated
-                        # The last prefill token passing through lm_head generates the first output
-                        gen_t += 1
-                        # req.num_computed_tokens += 1  # Count the first generated token
-                        # req.set_ttft(finish)
-                        # pool.append(req)
-                        # continue
-                else:
-                    # Prefill not complete, return to pool for next chunk
-                    prompt_t += chunk_len
-                    # pool.append(req)
-                    # continue
-            else:
-                # Decode phase
-                if req.is_init:
-                    # Full prefix cache hit: all input tokens were cached, so the
-                    # request never entered the prefill-complete path where is_init
-                    # is cleared. Lock the prefix node (was skipped because
-                    # is_prefill() returned False during scheduling), count prefix
-                    # stats once, then clear is_init.
-                    if self.enable_prefix_caching:
-                        if req.npu_last_node is not None and not req._prefix_locked:
-                            self.memory.lock_prefix(req, Device.NPU)
-                            req._prefix_locked = True
-                        self.memory.cache_unfinished_req(req, Device.NPU)
-                        if self.prefix_storage is not None:
-                            self.memory.cache_unfinished_req(req, self.prefix_storage)
-                    req.is_init = False
-                    req.set_ttft(finish)
-                    # Full prefix hit: count all cached tokens as prompt throughput
-                    prompt_t += req.prefix_cache_hit
-                    req.final_prefix_hit = req.prefix_cache_hit  # snapshot before erase (for CSV)
-                gen_t += 1
-                req.add_itl(finish)
-                req.num_computed_tokens += 1
-
-            # Update computed tokens for decode
-            # req.num_computed_tokens += 1
-
-            # check done
-            if req.output <= req.num_computed_tokens + 1:
-                # print("Request #{} is done".format(req.id))
-                self.logger.info("Request #%d is done", req.id)
-                # remove kv cache here
+            if prefill_done_now:
+                # TTFT is recorded exactly once. A resumed request has is_init
+                # cleared, so it can never overwrite its own TTFT.
+                req.is_init = False
+                req.set_ttft(finish)
+                prompt_t += num_new + req.prefix_cache_hit
                 if self.enable_prefix_caching:
-                    self.memory.cache_finished_req(req, Device.NPU) # insert happens here
-                    if self.prefix_storage is not None:
-                        self.memory.cache_finished_req(req, Device.CPU)
-                else:
-                    kv_size = self.memory.get_evict_kv(req)
-                    self.memory.free(kv_size, Device.NPU)
+                    self.kv.cache_blocks(req, req.num_computed_tokens)
+                if self.pd_type == "prefill":
+                    # The prefill instance ran through lm_head and the sampler, so
+                    # the first output token exists: advance the reached length or
+                    # the decode instance receives a request with nothing left to
+                    # schedule (num_tokens_reached == num_computed_tokens) and
+                    # deadlocks. gen_t is deliberately left to the decode side,
+                    # which is where this token has always been counted.
+                    req.num_tokens_reached += 1
+                    self.logger.info("Request #%d is prefill done, sent to decode instance", req.id)
+                    self.kv.free(req)
+                    self._retire(req)
+                    end_reqs.append(req)
+                    continue
+            elif num_new > 1:
+                # Chunk of a prefill, or a resumed request catching up.
+                prompt_t += num_new
+                if self.enable_prefix_caching:
+                    self.kv.cache_blocks(req, req.num_computed_tokens)
+
+            # A token is produced exactly when the request has caught up to the
+            # length it had reached. A resumed request recomputing its history
+            # has not, so it stays silent until it does.
+            if req.num_computed_tokens >= req.num_tokens_reached:
+                # Speculative decoding commits the bonus token plus whatever
+                # prefix of the draft the target accepted, and rolls the
+                # rejected slots back -- vLLM's
+                # ``request.num_computed_tokens -= num_rejected``. The rollback
+                # comes first so the prefix cache below indexes only committed
+                # tokens; a block holding a rejected token must never be hashed,
+                # or a later request could hit on text the model never emitted.
+                accepted = 0
+                n_draft = batch.spec_scheduled.get(req.id, 0)
+                if n_draft:
+                    accepted = self.spec.draw(n_draft)
+                    req.num_computed_tokens -= (n_draft - accepted)
+                    self.spec_drafted += n_draft
+                    self.spec_accepted += accepted
+                req.num_spec_scheduled = 0
+                # A verification step commits 1 + accepted tokens at once, which
+                # can run past the requested length. vLLM stops at max_tokens
+                # and discards the excess, so the overshoot is not generated
+                # output and must not be counted as throughput.
+                committed = min(1 + accepted,
+                                max(req.output - req.num_tokens_reached, 0))
+                req.num_tokens_reached += committed
+                gen_t += committed
+                if not prefill_done_now:
+                    req.add_itl(finish)
+                if self.enable_prefix_caching:
+                    self.kv.cache_blocks(req, req.num_computed_tokens)
+
+            if req.num_tokens_reached >= req.output:
+                self.logger.info("Request #%d is done", req.id)
+                if self.enable_prefix_caching:
+                    self.kv.cache_blocks(req, req.num_computed_tokens)
+                self.kv.free(req)
                 req.add_latency(finish)
+                self._retire(req)
                 self.done.append(req)
                 end_reqs.append(req)
 
-            # return to pool
-            else:
-                # print("Request #{} is not finished => go to pool".format(req.id))
-                # Update prefix cache after chunk completion (moved from schedule_with_prefix())
-                if self.enable_prefix_caching:
-                    self.memory.cache_unfinished_req(req, Device.NPU)
-                    if self.prefix_storage is not None:
-                        self.memory.cache_unfinished_req(req, self.prefix_storage)
-                pool.append(req)
-        # return to request pool, both are already sorted with arrival_time
-        if self.prioritize_prefill:
-            self.request = self._merge_by_arrival_id(pool, self.request)
-        else:
-            self.request = pool + self.request
+        # What the next admission is allowed to see. ``batch.batch_time`` is the
+        # clock at which this batch was composed; under async scheduling that is
+        # also the newest arrival the batch replacing it could have seen.
+        self._last_batch_start = batch.batch_time
+        self._last_batch_end = finish
+
         del self.inflight[idx]
-        del batch
-
         return prompt_t, gen_t, end_reqs
-    
 
-    ##### Helper Functions ######
-    # get new batch id
+    def _retire(self, req):
+        req.status = RequestStatus.FINISHED
+        try:
+            self.running.remove(req)
+        except ValueError:
+            pass
+
+    # ==================== queue management ====================
+
     def get_batch_id(self):
         self.batch_ids += 1
         return self.batch_ids
 
-    # add a request
     def add_request(self, req, is_init=True):
         new_req = Request(*(req), is_init=is_init)
-        # Maintain arrival-time sort order (required by schedule_base/schedule_with_prefix)
-        bisect.insort(self.request, new_req, key=lambda r: (r.arrival, r.id))
+        # Arrival order, which phase B relies on to stop at the first request
+        # that has not arrived yet. Dynamically released agentic sub-requests
+        # arrive mid-run, hence insort rather than append.
+        bisect.insort(self.waiting, new_req, key=lambda r: (r.arrival, r.id))
         return
-    
-    # add decode request to decode instance from prefill instnace
+
     def add_decode(self, req):
+        """Take over a request whose prefill ran on another instance.
+
+        The KV transfer itself is already charged: the prefill instance's trace
+        carries a per-layer send to the paired decode NPU. So this only claims
+        the blocks -- reporting no load bytes, or the transfer would be billed
+        twice.
+        """
         req.instance_id = self.instance_id
-        self.request.append(req)
-        if self.enable_prefix_caching:
-            self.memory.prefix_match(req)
-            kv_size = self.memory.get_evict_kv(req)
-            evict_size = max(0, kv_size - self.memory.avail_size(Device.NPU))
-            if evict_size > 0:
-                self.memory.evict_prefix_cache(evict_size, Device.NPU)
-            self.memory.cache_unfinished_req(req, Device.NPU)
-        else:
-            kv_size = self.memory.get_total_kv(req)
-            self.memory.allocate(kv_size, Device.NPU)
-    
-    # get first request's arrival time
-    def get_first_arrival_time(self):
-        return self.first_arrival_time if self.first_arrival_time != 0 else 1 # need to add event handler at first
-    
-    # merge requests in the request pool, ensuring they are sorted by arrival time
-    def _merge_by_arrival_id(self, left, right):
-        if not left:  
-            return right
-        if not right: 
-            return left
+        req.status = RequestStatus.RUNNING
+        hit_blocks, num_npu_hit, num_lower_hit = self.kv.get_computed_blocks(req)
+        num_computed = req.num_computed_tokens
+        if self.kv.allocate_slots(req, 1, hit_blocks, num_npu_hit, num_lower_hit) is None:
+            raise RuntimeError(
+                f"[Scheduler] [node_id={self.node_id},inst={self.instance_id}] decode "
+                f"instance cannot admit request {req.id}: {req.num_tokens_reached} tokens "
+                f"need more blocks than the pool has free "
+                f"({self.kv.npu_pool.get_num_free_blocks()} of {self.kv.npu_pool.num_blocks})"
+            )
+        req.num_computed_tokens = num_computed
+        self.kv.take_traffic()          # a P/D handoff is not a recall
+        self.running.append(req)
 
-        # Fast path: if ranges don't overlap, just concatenate
-        if (left[-1].arrival, left[-1].id) <= (right[0].arrival, right[0].id):
-            return left + right
-        if (right[-1].arrival, right[-1].id) <= (left[0].arrival, left[0].id):
-            return right + left
+    def is_request_empty(self):
+        return not self.waiting and not self.running and not self.inflight
 
-        # General merge
-        i = j = 0
-        out = []
-        while i < len(left) and j < len(right):
-            li, rj = left[i], right[j]
-            if (li.arrival, li.id) <= (rj.arrival, rj.id):
-                out.append(li); i += 1
-            else:
-                out.append(rj); j += 1
-        if i < len(left):  
-            out.extend(left[i:])
-        if j < len(right): 
-            out.extend(right[j:])
-        return out
-    
-    # print total system request metrics (TTFT, TPOT, ITL)
     def print_result(self):
         # Extract ttft, tpot, and itl values from the completed requests
         ttft_values = [req.ttft for req in self.done]
@@ -913,13 +811,6 @@ class Scheduler:
             print(i)
         return
 
-    # check all the request is done
-    def is_request_empty(self):
-        if len(self.request) == 0 and len(self.inflight) == 0:
-            return True
-        else:
-            return False
-        
     # save requests information to an output file
     def save_output(self, output_file, is_append=False):
         if not os.path.isabs(output_file):
@@ -934,9 +825,9 @@ class Scheduler:
             
             # Write the column headers
             if not is_append:
-                writer.writerow(['instance id', 'request id', 'model', 'input', 'output',
-                                'arrival', 'end_time', 'latency',
-                                'queuing_delay', 'TTFT', 'TPOT', 'prefix_cache_hit', 'ITL'])
+                writer.writerow(['instance id', 'request id', 'model', 'input', 'output', 
+                                'arrival', 'end_time', 'latency', 
+                                'queuing_delay', 'TTFT', 'TPOT', 'ITL'])
             
             # Write each request's information
             for req in self.done:
@@ -952,7 +843,6 @@ class Scheduler:
                     req.queuing_delay,
                     req.ttft,
                     req.tpot,
-                    req.final_prefix_hit,
                     req.itl
                 ])
 

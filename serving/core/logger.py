@@ -353,6 +353,16 @@ def print_rule(label: str = "", style: str = "sim.rule") -> None:
     _console.rule(label, style=style)
 
 
+def print_heading(title: str) -> None:
+    """Centre a section title with no rule characters around it.
+
+    For a section that opens under a rule already drawn by whatever printed
+    before it -- ``print_rule`` would draw a second full-width line, leaving two
+    stacked rules with the title buried in the lower one.
+    """
+    _console.print(f"[sim.tagline]{title}[/]", justify="center")
+
+
 def print_markup(message: str) -> None:
     """Print a line of Rich markup without any logging decoration.
 
@@ -427,6 +437,13 @@ def print_input_config(args: Any) -> None:
             return "xPU + CXL"
         return "None"
 
+    def _derived(x: Any) -> str:
+        # ``--block-size`` defaults to None, meaning "whatever the profile
+        # bundle records vLLM settling on". That is resolved per instance, so
+        # the banner cannot name one number -- but it must not print "None"
+        # either, which reads as "unset" rather than "derived".
+        return "derived per instance" if x is None else x
+
     items: list[tuple[str, Any]] = []
 
     def add(attr: str, label: str, conv=lambda v: v) -> None:
@@ -441,7 +458,7 @@ def print_input_config(args: Any) -> None:
     add("num_req", "Num requests")
     add("max_num_seqs", "Max num seqs", _inf0)
     add("max_num_batched_tokens", "Max batched tokens", _inf0)
-    add("block_size", "Block size (tokens)")
+    add("block_size", "Block size (tokens)", _derived)
     add("fp", "FP precision", _bits)
     add("request_routing_policy", "Request routing", _na)
     add("expert_routing_policy", "Expert routing", _na)
@@ -452,7 +469,6 @@ def print_input_config(args: Any) -> None:
     add("enable_attn_offloading", "Offload attention to PIM", _yn)
     add("enable_sub_batch_interleaving", "Sub-batch interleaving", _yn)
     add("enable_attn_prediction", "Realtime attention prediction", _yn)
-    add("prioritize_prefill", "Prioritize prefill", _yn)
     add("link_bw", "Link bandwidth (GB/s)")
     add("link_latency", "Link latency (ns)")
     add("network_backend", "Network backend", _na)
@@ -537,6 +553,7 @@ __all__ = [
     "ComponentLoggerAdapter",
     "console",
     "print_rule",
+    "print_heading",
     "print_markup",
     "print_banner",
     "print_input_config",

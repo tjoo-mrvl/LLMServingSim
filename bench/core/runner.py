@@ -28,18 +28,39 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 
+from bench.core import gate_stats as gate_stats_mod
 from bench.core import logger as log
 from bench.core import recorder
+from bench.core.kv_cache_metadata import ReadyResponseCapture
+from bench.core.execution_metadata import capture_execution
+
+
+# Observe caller overrides without changing vLLM's communication selection.
+_ALL_REDUCE_ENV = (
+    "VLLM_ALLREDUCE_USE_SYMM_MEM",
+    "VLLM_ALLREDUCE_USE_FLASHINFER",
+    "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC",
+)
+
+
+def _positive_int(value: str) -> int:
+    result = int(value)
+    if result <= 0:
+        raise argparse.ArgumentTypeError('must be a positive integer')
+    return result
 
 
 def register_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model", required=True,
                    help="HF model id passed verbatim to vllm.AsyncLLM.")
     p.add_argument("--dataset", required=True,
-                   help="Path to a LLMServingSim-format JSONL workload "
-                        "(produced by `python -m workloads.generators`).")
+                   help="Path to flat LLMServingSim-format JSONL requests with "
+                        "nonempty input_tok_ids. Session rows containing "
+                        "sub_requests are skipped; use a flat-only workload "
+                        "for a matched simulator comparison.")
     p.add_argument("--output-dir", required=True, dest="output_dir",
                    help="Output directory for this run "
                         "(meta.json/requests.jsonl/timeseries.csv).")
@@ -49,12 +70,15 @@ def register_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--data-parallel-size", type=int, default=1,
                    dest="data_parallel_size",
                    help="vLLM data_parallel_size (DP across engines).")
-    p.add_argument("--pipeline-parallel-size", type=int, default=1,
-                   dest="pipeline_parallel_size",
-                   help="vLLM pipeline_parallel_size (PP across stages).")
     p.add_argument("--enable-expert-parallel", action="store_true",
                    dest="enable_expert_parallel", default=False,
                    help="vLLM enable_expert_parallel for MoE models.")
+    p.add_argument("--disable-custom-all-reduce", action="store_true",
+                   default=False,
+                   help="Explicitly disable vLLM custom all-reduce. Off by default; "
+                        "other communication backends retain their vLLM defaults. "
+                        "The benchmark keeps its two communication fusion passes "
+                        "disabled. This flag alone does not enforce NCCL-only.")
     p.add_argument("--max-num-seqs", type=int, default=128,
                    dest="max_num_seqs",
                    help="vLLM scheduler max_num_seqs (per-engine running cap).")
@@ -69,10 +93,72 @@ def register_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--kv-cache-dtype", default="auto",
                    dest="kv_cache_dtype",
                    help="vLLM kv_cache_dtype.")
-    p.add_argument("--load-format", default="auto", dest="load_format",
-                   help="vLLM load_format (auto | safetensors | fastsafetensors | runai_streamer).")
+    p.add_argument("--kv-cache-memory-bytes", type=_positive_int, default=None,
+                   help="Explicit per-GPU KV cache budget. Use for capacity-matched "
+                        "controls; verify kv_cache.capacity.per_engine in meta.json. "
+                        "None keeps vLLM's automatic memory profiling.")
     p.add_argument("--seed", type=int, default=42,
                    help="Sampling seed for vLLM.")
+    p.add_argument("--resolve-only", action="store_true", dest="resolve_only",
+                   default=False,
+                   help="Boot the engine, write meta.json, and exit without "
+                        "replaying the dataset. Compare each engine's observed "
+                        "kv_cache.capacity.per_engine block count; the raw "
+                        "kv_cache.num_gpu_blocks can sum multiple DP engines. "
+                        "vLLM settles capacity at boot after subtracting "
+                        "the activation peak and CUDA context. Cheap with "
+                        "--load-format dummy (one boot, no weights, no "
+                        "replay), so a config can be checked against the "
+                        "simulator's block count. Unsupported observations are "
+                        "marked unknown. requests.jsonl "
+                        "and timeseries.csv are not written -- there is no "
+                        "run to record.")
+    p.add_argument("--skip-tokenizer-init", action="store_true",
+                   dest="skip_tokenizer_init", default=False,
+                   help="Boot vLLM without loading a tokenizer. The replay "
+                        "never needs one -- it feeds token ids directly "
+                        "(TokensPrompt) and pins the output length "
+                        "(min_tokens == max_tokens, ignore_eos), so nothing "
+                        "here tokenises input or reads generated text. What it "
+                        "buys is the ability to bench a checkpoint whose "
+                        "tokenizer is not on disk. For a config-only diagnostic, "
+                        "create a separate directory containing config.json, "
+                        "pass it as --model and use --load-format dummy. Bench "
+                        "does not materialize the repository's named JSON files "
+                        "into that layout. Real-weight runs still need weights.")
+    p.add_argument("--record-gate-stats", action="store_true",
+                   dest="record_gate_stats", default=False,
+                   help="Record the real gate's distinct-expert count per "
+                        "batch size into gate_stats.json, for the simulator's "
+                        "--expert-routing-policy CUSTOM to read back. The "
+                        "simulator otherwise derives that count from a "
+                        "*uniform* gate, which a trained gate undershoots by "
+                        "up to 13%% -- the concentration lives in the weights, "
+                        "so the closed form cannot know it. Needs the "
+                        "VLLM_MOE_ACTIVATED_LOG source patch (applied by "
+                        "scripts/docker-vllm.sh) and --enforce-eager, since "
+                        "the patch's .unique() is a data-dependent shape that "
+                        "cannot be captured into a cudagraph. Eager is no loss "
+                        "of fidelity for this: the gate's top-k output depends "
+                        "on the weights and the input, not on how the forward "
+                        "runs. MoE models only; a dense run writes nothing.")
+    p.add_argument("--enforce-eager", action="store_true",
+                   dest="enforce_eager", default=False,
+                   help="Run vLLM eager, with torch.compile and cudagraphs "
+                        "off. Leave it off for a compiled serving reference. "
+                        "An eager reference helps isolate execution-mode effects; "
+                        "ordinary layerwise acquisition preserves module "
+                        "boundaries. Record and match the target mode: simulated "
+                        "graph padding does not reproduce graph kernel fusion.")
+    p.add_argument("--load-format", default="auto", dest="load_format",
+                   help="vLLM load_format. 'dummy' skips reading weights and "
+                        "initializes them randomly. Useful for controlled "
+                        "dense-kernel diagnostics, but not automatically "
+                        "end-to-end ground truth: verify resolved KV capacity "
+                        "and execution paths, and use real weights or explicit "
+                        "routing controls for MoE. Token IDs and output counts "
+                        "are fixed by replay; routing and scheduling need not "
+                        "be invariant. Recorded in meta.json.")
     p.add_argument("--tick-seconds", type=float, default=1.0,
                    dest="tick_seconds",
                    help="Stat logger downsample interval (timeseries.csv row spacing).")
@@ -146,40 +232,138 @@ def _load_dataset(path: Path, cap: int = 0) -> list[dict]:
 async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Path) -> None:
     # Imports deferred so `validate` / `--help` works without vLLM installed.
     from vllm import AsyncEngineArgs, SamplingParams
+    from vllm.config import CompilationConfig, PassConfig
     from vllm.inputs import TokensPrompt
     from vllm.v1.engine.async_llm import AsyncLLM
 
     from bench.core.stat_logger import BenchStatLogger
 
+    gate_log = None
+    if args.record_gate_stats:
+        if not args.enforce_eager:
+            raise SystemExit(
+                "--record-gate-stats needs --enforce-eager: the source patch "
+                "calls .unique() on the router's output, whose shape is "
+                "data-dependent and cannot be captured into a cudagraph. The "
+                "gate's top-k output does not depend on the execution mode, so "
+                "the recorded curve still describes a compiled run."
+            )
+        gate_log = output_dir / "moe_activated.jsonl"
+        gate_log.unlink(missing_ok=True)
+        # Read by the patched select_experts inside the *worker* process, which
+        # inherits this environment, so it has to be set before the engine boots.
+        os.environ["VLLM_MOE_ACTIVATED_LOG"] = str(gate_log)
+
+    observation_meta = {"step_audit": {
+        "kind": "gate_observation",
+        "end_to_end_control_eligible": False,
+    }} if gate_log is not None else {}
+
+    # Retain the benchmark's separate compute/communication decomposition.
+    # Backend selection is independent: these two disabled compiler passes
+    # do not enforce NCCL-only or disable model-native fused operations.
+    compilation_config = CompilationConfig(pass_config=PassConfig(
+        fuse_allreduce_rms=False, fuse_gemm_comms=False,
+    ))
     engine_args = AsyncEngineArgs(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
-        pipeline_parallel_size=args.pipeline_parallel_size,
         data_parallel_size=args.data_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
+        disable_custom_all_reduce=args.disable_custom_all_reduce,
+        compilation_config=compilation_config,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_model_len=args.max_model_len,
         dtype=args.dtype,
         kv_cache_dtype=args.kv_cache_dtype,
-        load_format=args.load_format,
+        kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         seed=args.seed,
+        load_format=args.load_format,
+        skip_tokenizer_init=args.skip_tokenizer_init,
+        enforce_eager=args.enforce_eager,
+        worker_extension_cls='bench.core.execution_metadata.ExecutionObserver',
         disable_log_stats=False,
     )
     engine_kwargs_for_meta = _engine_kwargs_for_meta(engine_args)
+    engine_kwargs_for_meta["compilation_config"] = {"pass_config": {
+        name: getattr(compilation_config.pass_config, name)
+        for name in ("fuse_allreduce_rms", "fuse_gemm_comms")
+    }}
 
-    with log.stage("Booting AsyncLLM"):
-        with log.capture_stdio():
-            engine = AsyncLLM.from_engine_args(
-                engine_args, stat_loggers=[BenchStatLogger]
-            )
+    ready_capture = ReadyResponseCapture()
+    engine = None
+    try:
+        with log.stage("Booting AsyncLLM"):
+            with log.capture_stdio():
+                with ready_capture:
+                    engine = AsyncLLM.from_engine_args(
+                        engine_args, stat_loggers=[BenchStatLogger]
+                    )
+    except BaseException:
+        if engine is not None:
+            engine.shutdown()
+        raise
     started_at = datetime.datetime.utcnow().isoformat() + "Z"
+    try:
+        execution = await capture_execution(engine)
+    except BaseException:
+        engine.shutdown()
+        raise
+    if execution.get('status') != 'observed':
+        log.warning('Serving graph observation unavailable: %s', execution.get('reason'))
+
+    if args.resolve_only:
+        # Snapshot before shutdown, with the startup callback already restored.
+        try:
+            resolved_config = _resolved_config(engine)
+            kv_cache = _kv_cache_facts(engine, ready_capture)
+        finally:
+            engine.shutdown()
+        recorder.write_meta(
+            output_dir,
+            model=args.model,
+            vllm_version=_vllm_version(),
+            engine_kwargs=engine_kwargs_for_meta,
+            dataset_path=str(args.dataset),
+            dataset_hash=_hash_file(Path(args.dataset)),
+            num_requests=0,
+            started_at=started_at,
+            finished_at=datetime.datetime.utcnow().isoformat() + "Z",
+            tick_seconds=args.tick_seconds,
+            kv_cache=kv_cache,
+            hardware=_hardware_facts(),
+            resolved_config=resolved_config,
+            execution=execution,
+            resolve_only=True,
+        )
+        log.success("resolved config only -> %s  (num_gpu_blocks=%s)",
+                    output_dir, kv_cache.get("num_gpu_blocks"))
+        return
 
     try:
+        # Persist boot-time capacity before any requests. An interrupted run
+        # must not lose the facts needed to explain its memory conditions.
+        try:
+            resolved_config = _resolved_config(engine)
+        except Exception as exc:
+            log.warning("could not snapshot the resolved vLLM config: %s", exc)
+            resolved_config = {}
+        kv_cache = _kv_cache_facts(engine, ready_capture)
+        recorder.write_engine_start(output_dir,
+            model=args.model, started_at=started_at,
+            dataset_path=str(args.dataset), dataset_hash=_hash_file(Path(args.dataset)),
+            num_requests=len(requests),
+            engine_kwargs=engine_kwargs_for_meta, kv_cache=kv_cache,
+            resolved_config=resolved_config, execution=execution, **observation_meta)
+        if gate_log is not None:
+            gate_stats_mod.mark_phase(gate_log, "workload_start")
         with log.stage(f"Submitting {len(requests)} requests"):
             records = await _submit_all(
                 engine, requests, SamplingParams, TokensPrompt
             )
+        if gate_log is not None:
+            gate_stats_mod.mark_phase(gate_log, "workload_end")
     finally:
         with log.stage("Shutting AsyncLLM down"):
             engine.shutdown()
@@ -200,10 +384,36 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
         started_at=started_at,
         finished_at=finished_at,
         tick_seconds=args.tick_seconds,
+        # What vLLM resolved, not what we asked for: defaults filled in,
+        # max_model_len inferred, num_gpu_blocks profiled. kv_cache is pulled
+        # out with its observed scope: a client can sum several DP engines.
+        # Capacity matching uses directly observed per-engine block counts.
+        kv_cache=kv_cache,
+        hardware=_hardware_facts(),
+        resolved_config=resolved_config,
+        execution=execution,
+        **observation_meta,
     )
     recorder.write_requests(output_dir, records)
     header, rows = BenchStatLogger.downsample_to_csv_rows(args.tick_seconds)
     recorder.write_timeseries(output_dir, header, rows)
+
+    if gate_log is not None:
+        payload = gate_stats_mod.write(
+            output_dir, gate_log, args.model, _num_experts(engine))
+        if payload is None:
+            log.warning(
+                "--record-gate-stats: %s holds no usable row. Either this is "
+                "a dense model, or the VLLM_MOE_ACTIVATED_LOG patch is not "
+                "installed in this vLLM (scripts/docker-vllm.sh applies it). "
+                "No gate_stats.json written -- the simulator will use its "
+                "closed form, which is the documented fallback.", gate_log)
+        else:
+            log.success(
+                "gate stats: %d calls over %d batch sizes -> %s",
+                payload["n_calls"], len(payload["curve"]),
+                output_dir / gate_stats_mod.FILENAME)
+
     log.success(
         "%d requests, %d timeseries rows -> %s",
         len(records), len(rows), output_dir,
@@ -282,12 +492,203 @@ def _record_from_metrics(idx: int, req: dict, metrics) -> dict:
 
 def _engine_kwargs_for_meta(engine_args) -> dict:
     fields = (
-        "model", "tensor_parallel_size", "pipeline_parallel_size",
-        "data_parallel_size", "enable_expert_parallel", "max_num_seqs",
-        "max_num_batched_tokens", "max_model_len", "dtype", "kv_cache_dtype",
-        "load_format", "seed",
+        "model", "tensor_parallel_size", "data_parallel_size",
+        "enable_expert_parallel", "max_num_seqs", "max_num_batched_tokens",
+        "disable_custom_all_reduce",
+        "max_model_len", "dtype", "kv_cache_dtype", "kv_cache_memory_bytes", "seed", "load_format",
+        # Recorded for the same reason load_format is: a run booted from a
+        # tokenizer-less config directory should never be mistaken for one
+        # booted from the real checkpoint.
+        "skip_tokenizer_init",
+        # Recorded because it changes what the run *is*: a compiled engine and
+        # an eager one are two different ground truths, and only the eager one
+        # is comparable with a profiled latency.
+        "enforce_eager",
     )
     return {k: getattr(engine_args, k, None) for k in fields}
+
+
+# Values longer than this are recorded as a type tag instead, so one HF config
+# object cannot bury the rest of meta.json.
+_MAX_REPR = 200
+
+
+def _normalize(value, depth: int = 0):
+    """Reduce a config value to something JSON can hold.
+
+    Scalars pass through. Enums become their value. Short flat containers are
+    kept element-wise. Anything else -- an HF config object, a torch dtype, a
+    callable -- becomes a ``"<type>"`` tag: the field is still recorded as
+    present and resolved, without dragging its whole object graph into the file.
+    """
+    import enum
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, enum.Enum):
+        return _normalize(value.value, depth + 1)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        seq = list(value)
+        if len(seq) > 64:
+            return f"<{type(value).__name__} len={len(seq)}>"
+        return [_normalize(v, depth + 1) for v in seq]
+    if isinstance(value, dict):
+        if len(value) > 64 or depth > 2:
+            return f"<dict len={len(value)}>"
+        return {str(k): _normalize(v, depth + 1) for k, v in value.items()}
+    text = repr(value)
+    if len(text) <= _MAX_REPR:
+        return text
+    return f"<{type(value).__name__}>"
+
+
+def _config_fields(obj) -> dict:
+    """Field name -> normalized value for one config object.
+
+    vLLM's config classes are pydantic-decorated dataclasses, so try the
+    dataclass field list first, then pydantic's, then fall back to __dict__.
+    Order does not matter: the dict is sorted on the way out.
+    """
+    import dataclasses
+
+    names: list[str] = []
+    if dataclasses.is_dataclass(obj):
+        names = [f.name for f in dataclasses.fields(obj)]
+    elif hasattr(type(obj), "model_fields"):
+        names = list(type(obj).model_fields)
+    elif hasattr(obj, "__dict__"):
+        names = list(vars(obj))
+    out = {}
+    for name in sorted(names):
+        if name.startswith("_"):
+            continue
+        try:
+            out[name] = _normalize(getattr(obj, name))
+        except Exception as exc:                     # a property may raise
+            out[name] = f"<unreadable: {type(exc).__name__}>"
+    return out
+
+
+def _resolved_config(engine) -> dict:
+    """Snapshot vLLM's *resolved* configuration, one section per sub-config.
+
+    Reads the engine's own ``VllmConfig`` after boot, so these are the values
+    vLLM actually ran with rather than the arguments we asked for -- defaults
+    filled in, ``max_model_len`` inferred, ``num_gpu_blocks`` profiled. Walks
+    ``VllmConfig``'s field list rather than a hand-kept list of interesting
+    knobs, so a vLLM upgrade that adds one shows up here on its own.
+    """
+    cfg = getattr(engine, "vllm_config", None)
+    if cfg is None:
+        return {}
+    out = {}
+    for name, sub in _config_fields(cfg).items():
+        try:
+            value = getattr(cfg, name)
+        except Exception:
+            continue
+        if value is None or isinstance(value, (bool, int, float, str)):
+            out[name] = sub                      # a scalar on VllmConfig itself
+        else:
+            fields = _config_fields(value)
+            if name == "compilation_config":
+                # This is an execution axis, not a verbose diagnostic list.
+                # Preserve it even when there are more than 64 capture points.
+                sizes = getattr(value, 'cudagraph_capture_sizes', None)
+                if sizes is not None:
+                    fields['cudagraph_capture_sizes'] = list(sizes)
+                passes = getattr(value, "pass_config", None)
+                if passes is not None:
+                    fields["pass_config"] = _config_fields(passes)
+            out[name] = fields if fields else sub
+    return out
+
+
+def _num_experts(engine) -> int:
+    """The checkpoint's routed-expert count, whichever key it declares.
+
+    The families disagree: Mixtral and Qwen3-MoE write ``num_local_experts`` /
+    ``num_experts``, DeepSeek and GLM write ``n_routed_experts``. Recorded so a
+    reader can refuse a curve measured on a different ``E`` -- the distinct
+    count means nothing without it. 0 for a dense model, which is also what
+    makes the aggregate come back empty.
+    """
+    try:
+        cfg = engine.vllm_config.model_config.hf_config
+    except AttributeError:
+        return 0
+    for holder in (getattr(cfg, "text_config", None), cfg):
+        if holder is None:
+            continue
+        for key in ("n_routed_experts", "num_local_experts", "num_experts",
+                    "moe_num_experts"):
+            value = getattr(holder, key, None)
+            if value:
+                return int(value)
+    return 0
+
+
+def _kv_cache_facts(engine, ready_capture=None) -> dict:
+    """Raw client cache fields, with separately qualified startup capacities.
+
+    DP clients can sum engine counts. The legacy ``num_kv_tokens`` product is
+    raw arithmetic, not verified aggregate capacity when block sizes differ.
+    Only complete ``capacity.per_engine`` observations support matching an
+    individual engine's block pool; unknown observations are not inferred.
+    """
+    capacity = (ready_capture or ReadyResponseCapture()).snapshot(engine)
+    cfg = getattr(engine, "vllm_config", None)
+    if cfg is None:
+        return {"capacity": capacity}
+    cache = getattr(cfg, "cache_config", None)
+    if cache is None:
+        return {"capacity": capacity}
+    blocks = getattr(cache, "num_gpu_blocks", None)
+    block_size = getattr(cache, "block_size", None)
+    facts = {
+        "num_gpu_blocks": blocks,
+        "num_cpu_blocks": getattr(cache, "num_cpu_blocks", None),
+        "block_size": block_size,
+        "gpu_memory_utilization": getattr(cache, "gpu_memory_utilization", None),
+        "enable_prefix_caching": getattr(cache, "enable_prefix_caching", None),
+        "kv_cache_memory_bytes": getattr(cache, "kv_cache_memory_bytes", None),
+        "capacity": capacity,
+    }
+    if isinstance(blocks, int) and isinstance(block_size, int):
+        facts["num_kv_tokens"] = blocks * block_size
+    return facts
+
+
+def _hardware_facts() -> dict:
+    """Which accelerator this ran on, for matching against profiler/perf/<hw>/."""
+    facts = {"cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+    facts["all_reduce_environment"] = {
+        name: os.environ.get(name) for name in _ALL_REDUCE_ENV
+    }
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            facts["cpu_affinity"] = sorted(os.sched_getaffinity(0))
+        status = Path("/proc/self/status")
+        if status.exists():
+            for line in status.read_text().splitlines():
+                if line.startswith("Mems_allowed_list:"):
+                    facts["numa_mems_allowed"] = line.split(":", 1)[1].strip()
+    except OSError as exc:
+        facts["placement_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        import torch
+        facts["torch_version"] = torch.__version__
+        facts["cuda_version"] = getattr(torch.version, "cuda", None)
+        if torch.cuda.is_available():
+            facts["device_count"] = torch.cuda.device_count()
+            facts["device_name"] = torch.cuda.get_device_name(0)
+            props = torch.cuda.get_device_properties(0)
+            facts["device_total_memory_bytes"] = props.total_memory
+            facts["device_capability"] = f"{props.major}.{props.minor}"
+            facts["device_uuid"] = str(getattr(props, "uuid", "unknown"))
+    except Exception as exc:
+        facts["error"] = f"{type(exc).__name__}: {exc}"
+    return facts
 
 
 def _vllm_version() -> str:

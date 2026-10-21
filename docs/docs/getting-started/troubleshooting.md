@@ -72,6 +72,10 @@ If the host's `nvidia-smi` works but the container's doesn't, the
 toolkit is the problem. If the host's `nvidia-smi` fails too, install
 the NVIDIA driver first.
 
+A successful CUDA 12.4 visibility probe does not verify the CUDA 13 runtime
+required by the default vLLM image. Check that image separately using the
+[vLLM setup instructions](./installation/vllm).
+
 ## Hugging Face: gated model / 401 / 403
 
 **Symptom:** When profiling a Llama 3.x or gated Qwen variant:
@@ -92,8 +96,12 @@ meta-llama/Llama-3.1-8B is restricted...
    ./scripts/docker-vllm.sh
    ```
 
-The token gets forwarded into the container automatically. Confirm
-with `echo $HF_TOKEN` inside the container.
+The token gets forwarded into the container automatically. Check that it is
+set without printing the secret:
+
+```bash
+test -n "$HF_TOKEN" && echo "HF_TOKEN is set"
+```
 
 ## ASTRA-Sim build fails
 
@@ -115,6 +123,28 @@ with a CMake or compiler message.
 - **Outside the container.** `compile.sh` is meant to run inside the
   simulator container, not on the host. Use `./scripts/docker-sim.sh`
   first.
+
+## `model_parallel_NPU_group <= 0` or a Chakra `VersionError`
+
+**Symptom:** the Chakra conversion step aborts the run with
+`ValueError: model_parallel_NPU_group <= 0`, or with
+`google.protobuf.runtime_version.VersionError: Detected incompatible
+Protobuf Gencode/Runtime versions`.
+
+**Cause:** Chakra is installed into the container's site-packages by
+`scripts/compile.sh`, so an existing container keeps whatever version
+was installed when it was first built. After pulling a change to the
+converter or to the trace format, that stale copy can no longer read
+the traces the simulator writes.
+
+**Fix:** reinstall Chakra inside the simulator container:
+
+```bash
+cd astra-sim/extern/graph_frontend/chakra && pip3 install .
+```
+
+Rerunning `./scripts/compile.sh` does the same thing along with the
+C++ rebuild.
 
 ## Container name already in use
 
@@ -146,18 +176,53 @@ Same idea for `vllm_docker`.
 combination that doesn't have profile data:
 
 ```text
-FileNotFoundError: ../profiler/perf/<hardware>/<model>/<variant>/tp1/dense.csv
+FileNotFoundError: Profile variant folder not found:
+../profiler/perf/RTXPRO6000/meta-llama/Llama-3.1-8B/bf16-kvfp8. The
+variant name is derived from the checkpoint (weight dtype, plus a
+-kv<dtype> suffix when it declares a quantized KV cache), ...
 ```
 
-**Cause:** The `(hardware, model, dtype, kv_cache_dtype)` tuple
-doesn't have a profiled CSV bundle.
+**Cause:** The `(hardware, model, variant)` triple has no profiled
+bundle. The check is on the **variant folder**, so the message names the
+directory rather than a specific CSV. `ls` the parent path it prints to
+see which variants you do have.
+
+The variant is *derived*, and there is no flag to change it: the weight
+dtype comes from `quantization_config.quant_method` or `torch_dtype`,
+and a `-kvfp8` suffix appears when the checkpoint declares a quantized
+KV cache. Compare that expected label with the acquired bundle's source config
+and recorded engine settings; automatic dtype resolution has config-specific
+limitations, so labels alone do not prove compatible data. Re-profile when the
+required acquisition is missing rather than relabel incompatible rows.
+The profiler can also write intentionally
+different variants. For quantized checkpoints a matching floating dtype keeps
+the quantization name, while a different one uses `-act...`; those alternate
+measurements are not automatically selected by the simulator.
+See [profiler naming](/docs/profiler/running#precision-and-variant-names).
+
+Two neighbouring errors with different fixes:
+
+```text
+FileNotFoundError: meta.yaml missing at <variant>/meta.yaml. Re-run the
+profiler to produce it.
+```
+
+The folder exists but the bundle is incomplete — usually a profile run
+that was interrupted.
+
+```text
+FileNotFoundError: Architecture yaml not found for model_type='gemma2'
+at profiler/models/gemma2.yaml. Add profiler/models/gemma2.yaml
+describing the architecture.
+```
+
+The model's family has no catalog yet. See
+**[Adding a model architecture](/docs/profiler/adding-model-architecture)**.
 
 **Fix:** either
 
-- pick a hardware / model combo that's already profiled
-  (see the
-  [Simulator → Reading the output](/docs/simulator/reading-output)
-  table), or
+- pick a hardware / model / precision combo that's already profiled
+  (`ls profiler/perf/`), or
 - run the **[Profiler](/docs/profiler/overview)** to generate the
   missing bundle yourself.
 
@@ -166,13 +231,28 @@ doesn't have a profiled CSV bundle.
 **Symptom:**
 
 ```text
-WARNING: runtime --max-num-batched-tokens (4096) exceeds profiled
-sweep bound (2048). Lookups will extrapolate.
+max-num-batched-tokens=4096 exceeds profiled 2048 for
+RTXPRO6000/meta-llama/Llama-3.1-8B/bf16; attention/dense lookups will
+extrapolate
 ```
 
-**Cause:** You're running the simulator with a token budget larger
-than the one the profiler swept. Latency lookups will linearly
-extrapolate past the measured range.
+There is a matching one for the sequence cap:
+
+```text
+max-num-seqs=256 exceeds profiled 128 for
+RTXPRO6000/meta-llama/Llama-3.1-8B/bf16; per-sequence lookups will
+extrapolate
+```
+
+**Cause:** You're running the simulator past the bounds the profiler
+swept, taken from `meta.yaml::engine_effective`. Latency lookups
+linearly extrapolate past the measured range.
+
+Both are emitted **once per `(hardware, model, variant)`**, not once per
+iteration, so seeing them a single time does not mean it happened only
+once. And they are silent when `meta.yaml` has no
+`engine_effective` entry for the field, so a hand-authored bundle gets
+no warning at all.
 
 **Fix:**
 
@@ -189,24 +269,103 @@ especially with MoE + EP or large prefix caches.
 
 **Common causes & fixes:**
 
+- **Read-only backend output paths.** The analytical backend writes to
+  `astra-sim/log/` and `astra-sim/tmp__mem/`, in addition to the selected
+  inputs directory. A read-only source mount needs writable mounts for these
+  output directories; `--inputs-root` alone does not relocate the backend's
+  logs or temporary memory files. Check backend startup errors before treating
+  an apparent wait as a slow simulation.
 - **Block-copy disabled.** For MoE, keep `--enable-block-copy`
-  on (the default). It replays one transformer block's trace across
-  every layer instead of re-computing routing per layer. Safe with
-  `--expert-routing-policy BALANCED` (default, deterministic);
-  `RR`/`RAND` average out per-layer variance.
+  on (the default) to reuse rows for matching block/site sequences.
+  This is exact for deterministic BALANCED/RR routing at a fixed batch shape.
+  RAND reuses a draw and suppresses per-layer variation; turn copying off when
+  that variation matters. Contextual profiles disable copying.
 - **Verbose logging.** `--log-level DEBUG` writes a lot. Drop to
   `--log-level INFO` or `WARNING`.
 - **`--log-interval` too small.** Setting it to `0.1` makes the
   logger run every 100 ms; raise to `1.0` (default) or higher.
 
+## `masked_mha_available` crash partway through a profile run
+
+**Symptom:** profiling DeepSeek-V3.2 or GLM-5 dies after some minutes,
+with the sweep's progress bar part-way through a category:
+
+```text
+Exception: Call to collective_rpc method failed:
+'FlashInferMLASparseSM120Impl' object has no attribute 'masked_mha_available'
+```
+
+**Cause:** a vLLM 0.28.0 bug on Blackwell. `FlashInferMLASparseSM120Impl`
+is the only sparse-MLA backend whose `supports_compute_capability`
+accepts `major == 12`, so every Blackwell card uses it, and in 0.28.0 it
+does not override `supports_dense_mha_prefill` (which
+`attention/backend.py` defaults to `True`). `mla_attention.py` then
+builds a prefill backend and reads `self.impl.masked_mha_available`, an
+attribute only `SparseMLACommonImpl` sets — and that class is not in
+this impl's MRO.
+
+**Fix:** the default vLLM 0.31.0 image's registered SM120 implementation already
+inherits the sparse common implementation and sets `supports_dense_mha_prefill`
+to `False`. The obsolete repository backport of
+[PR #51395](https://github.com/vllm-project/vllm/pull/51395) has been removed.
+Recreating the container with the current launcher uses this upstream fix;
+an old 0.28.0 container must use the upstream fix or its matching historical
+repository checkout. This specific fix does not certify all sparse-MLA paths
+on the newer runtime.
+
+:::note[`profiler coverage` does not catch this one]
+Coverage fires three fixed shots. In the affected 0.28.0 run, the failure needed a batch that took
+the dense-MHA prefill path, which first appeared at shot 89 of 152 in
+the dense category — so a clean coverage report is not evidence that a
+full sweep will finish.
+:::
+
 ## Out of memory inside the vLLM container
 
-**Symptom:** Profiler crashes with CUDA OOM partway through the
-attention sweep.
+**Symptom:** Profiler crashes with CUDA OOM, usually partway through the
+attention sweep — the sweep's largest shots come late, so a run can look
+healthy for hours first.
 
-**Fix:** lower `MAX_NUM_BATCHED_TOKENS` in `profiler/profile.sh`,
-or skip the heavy categories with environment variables (see
-[Profiler → Running](/docs/profiler/running)).
+**Fix:** cut how far the KV axes reach, in `profiler/profile.sh`:
+
+```bash
+ATTENTION_MAX_KV=16384    # top of the kv_decode / prefill_key axes
+```
+
+Unset, that bound is the model's **own context window**, so a long-context
+checkpoint sweeps to 131k or beyond and the largest decode shots ask the
+engine for `n_decode × kv_decode` tokens of KV at once. Capping it bounds the
+biggest requested history and can reduce runtime. The shot count depends on
+all grid factors, query lengths and live KV capacity; see
+[profiling cost planning](../profiler/running#expected-runtime).
+
+If that is not enough, work down this list — each one trades away something
+different:
+
+| Knob | What it bounds | What you lose |
+| --- | --- | --- |
+| `ATTENTION_MAX_KV` | the top of the kv axes | long-context coverage; the simulator extrapolates past the last profiled kv |
+| `MAX_MODEL_LEN` | the engine's context, so the KV cache it reserves | the same reach, and it caps `ATTENTION_MAX_KV` too (the grid runs to `min(the two)`) |
+| `MAX_NUM_SEQS` | `n_decode` per shot | large-batch decode coverage |
+| `MAX_NUM_BATCHED_TOKENS` | tokens per shot, i.e. the activation peak | large prefill-chunk coverage |
+| `GPU_MEMORY_UTILIZATION` | the split between KV cache and everything else | see the caution below |
+
+:::caution[These are not free knobs]
+Every shot-feasibility filter is measured against the KV cache the engine
+actually resolved, so `GPU_MEMORY_UTILIZATION`, `MAX_MODEL_LEN` and
+`MAX_NUM_SEQS` change **which shots the sweep contains**, not just whether it
+survives. A bundle profiled under one paging regime does not describe another —
+keep them in step with what you simulate at, and record what you used. Lowering
+`GPU_MEMORY_UTILIZATION` in particular cuts both ways: it leaves more room for
+activations but shrinks the KV cache, which filters out more of the large-kv
+shots.
+:::
+
+MiniMax-M3 needs both a lower `MAX_MODEL_LEN` and a smaller
+`GPU_MEMORY_UTILIZATION` to fit at all; `profiler/profile.sh` says so inline.
+
+To skip whole categories instead, see
+[Profiler → Running](/docs/profiler/running).
 
 ## Still stuck?
 

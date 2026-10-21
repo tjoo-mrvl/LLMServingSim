@@ -9,6 +9,14 @@ Complete reference for every command-line flag accepted by
 `python -m serving`. For the conceptual side of each flag (what it
 *does* internally), see **[Simulator](/docs/simulator/architecture)**.
 
+:::tip[Runtime overrides can be set per instance]
+Flags marked **(per-instance)** below can also be written into an
+individual `instances[i]` object in the cluster config, which wins over
+the CLI value for that instance only. That is how one run serves
+heterogeneous instances. Flags without that marker remain run-wide. See
+**[Cluster config → Runtime overrides](./cluster-config#runtime-overrides-optional)**.
+:::
+
 ## Cluster topology
 
 | Flag | Type | Default | Description |
@@ -24,39 +32,88 @@ matching runtime knobs per `instances[i]`; see
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--max-num-seqs` | int | `128` | Max sequences in a batch. `0` = unlimited |
-| `--max-num-batched-tokens` | int | `2048` | Max tokens per iteration across all requests (token budget) |
-| `--long-prefill-token-threshold` | int | `0` | Per-request token cap per step for chunked prefill. `0` = disabled |
-| `--enable-chunked-prefill` | bool | `True` | Split long prefill across iterations. Use `--no-enable-chunked-prefill` to disable |
-| `--prioritize-prefill` | flag | off | Run prefill before decode in the same iteration |
-| `--block-size` | int | `16` | KV cache block size in tokens |
-| `--skip-prefill` | flag | off | Skip prefill, run decode only |
+| `--max-num-seqs` **(per-instance)** | int | `128` | Max sequences in a batch. `0` = unlimited |
+| `--max-num-batched-tokens` **(per-instance)** | int | `2048` | Max tokens per iteration across all requests (token budget). Clamped to the model config's `max_position_embeddings`, so `0` ("unlimited") resolves to the context length, not infinity |
+| `--long-prefill-token-threshold` **(per-instance)** | int | `0` | Per-request token cap per step for chunked prefill. `0` = disabled |
+| `--enable-chunked-prefill` **(per-instance)** | bool | `True` | Split long prefill across iterations. Use `--no-enable-chunked-prefill` to disable |
+| `--npu-memory-utilization` **(per-instance,** as `npu_mem.mem_util`**)** | float | `0.9` | Fraction of NPU memory usable for weights plus KV cache. Corresponds to vLLM's `--gpu-memory-utilization`; KV capacity is `npu_mem.mem_size * this - model weight`. Override per instance with `npu_mem.mem_util` |
+| `--reserve-full-isl` / `--no-reserve-full-isl` **(per-instance)** | flag | on | Admit a request only if its whole sequence fits, not merely its first chunk. Mirrors vLLM's `scheduler_reserve_full_isl`; without it chunked prefill over-admits and thrashes the KV cache |
+| `--async-scheduling` / `--no-async-scheduling` **(per-instance)** | flag | on | Model next-batch admission lookahead while the current batch runs. V1 pipeline parallelism already supplies the modeled in-flight window; V2 can add async lookahead. Idle instances admit current arrivals. The TTFT effect depends on workload and batching, not a fixed per-request delay |
+| `--block-size` **(per-instance)** | int | the profiled value, else `16` | KV cache block size in tokens. vLLM treats this as a **floor and an alignment unit**, not the answer: it takes `max(backend minimum, your value)` as the alignment, derives the smallest multiple of that whose attention page covers one mamba page, and raises the block size to it — never lowering it. On Qwen3.8-27B, asking for 16 gives **784** and asking for 64 gives **832**. The profiler records what the engine settled on in `meta.yaml::engine_resolved.per_tp[tp]` — **per TP degree**, since both the mamba page and the attention page scale with the rank's shard — and the simulator reads back the entry for the instance's `tp_size`, so lookups match the block size the latencies were measured at. An explicit value that disagrees is allowed but warned about. Bundles profiled before the field existed do not carry it and fall back to `16`; ones written before it was split by TP carry a flat value, which is read as a fallback |
+| `--skip-prefill` | flag | off | Legacy initialization flag: marks requests past first-token bookkeeping, but does not skip prompt computation or prepare cached KV. Not a decode-only workload generator |
 
 ## Routing
 
 | Flag | Choices | Default | Description |
 | --- | --- | --- | --- |
-| `--request-routing-policy` | `LOAD` / `RR` / `RAND` / `CUSTOM` | `LOAD` | Cross-instance request routing |
-| `--expert-routing-policy` | `BALANCED` / `RR` / `RAND` / `CUSTOM` | `BALANCED` | MoE expert token routing |
-| `--enable-block-copy` | bool | `True` | Replay one block's trace across layers (set False for per-layer EP variance) |
+| `--request-routing-policy` | `LOAD` / `RR` / `RAND` / `CUSTOM` | `LOAD` | Cross-instance request routing. `CUSTOM` requires implementing the hook in `serving/core/router.py`; its shipped stub raises `NotImplementedError` |
+| `--expert-routing-policy` | `BALANCED` / `RR` / `RAND` / `CUSTOM` | `BALANCED` | MoE expert token routing. `CUSTOM` reads the **measured** distinct-expert count from `--gate-stats` instead of deriving it from a uniform gate |
+| `--gate-stats` | path | `None` | A `gate_stats.json` (or its benchmark directory) recorded by [`bench run --record-gate-stats`](/docs/reference/bench-cli), used only with `--expert-routing-policy CUSTOM`. It supplies observed distinct-expert counts, not a latency coefficient or arbitrary load histogram. Relative paths resolve against the repo root. Missing, unreadable or mismatched files warn and fall back to `BALANCED`; see [MoE expert routing](/docs/simulator/moe-expert-routing) |
+| `--enable-block-copy` / `--no-enable-block-copy` **(per-instance)** | bool | `True` | Reuse rows across matching block/site sequences. Exact for deterministic BALANCED/RR routing at a fixed shape; RAND copying suppresses per-layer variation. Contextual profiles disable reuse |
 
 ## Precision
 
+**There are no precision flags.** Every dtype is read from the model config,
+because that is where each one is actually decided:
+
+| Cache | Config field | Rule |
+| --- | --- | --- |
+| Weights | `quantization_config.quant_method`, then `torch_dtype` / `dtype` | On a quantized checkpoint the dtype fields describe the *activation* dtype, so DeepSeek-V3.2 (`quant_method: fp8`, `torch_dtype: bfloat16`) is fp8, not bf16. Same rule as the profiler's, because it also picks which `perf/.../<variant>/` folder is read |
+| KV cache | `quantization_config.kv_cache_scheme` (compressed-tensors) or `kv_cache_quant_algo` (ModelOpt) | Either one present means fp8, otherwise the weight dtype. This is vLLM's own promotion at `attention.py:281`, and the direction its source states for itself: *"kv cache dtype should be specified in the FP8 checkpoint config and become the 'auto' behavior"* |
+| Mamba conv state | `mamba_cache_dtype` | `auto` falls back to the weight dtype |
+| Mamba recurrent state | `mamba_ssm_dtype` | `auto` falls back to the conv dtype. Qwen3.8-27B declares `float32`, so its recurrent state is 4 bytes where its conv state is 2 |
+| Sparse-indexer side cache | none — fixed by the model | DeepSeek/GLM store fp8 keys plus fp32 scales as uint8; MiniMax-M3 stores bf16. Neither follows the KV cache dtype |
+
+A dtype is a property of the checkpoint, and once a model carries five of
+them a flag per dtype is both unusable and unfaithful — it describes a model
+nobody can serve. To simulate a different precision, profile it: the
+profiler can write alternate `perf/.../<variant>/` bundles, but the simulator
+reads the checkpoint-default one. A quantized checkpoint's `--dtype` changes
+floating activations, not its weight quantization; different activations get an
+`-act...` suffix. See [profiler naming](/docs/profiler/running#precision-and-variant-names).
+
+## Speculative decoding
+
 | Flag | Choices | Default | Description |
 | --- | --- | --- | --- |
-| `--dtype` | `float16` / `bfloat16` / `float32` / `fp8` / `int8` | model's `torch_dtype`, fallback `bfloat16` | Model weight dtype |
-| `--kv-cache-dtype` | `auto` / `fp8` | `auto` (inherits dtype) | KV cache dtype. `fp8` halves KV memory and selects a `*-kvfp8` profile variant |
+| `--num-speculative-tokens` **(per-instance)** | int | `0` (off when no acceptance rate is supplied) | Positive values choose draft length N; `-1` requests the published N from `configs/spec_decode.json`. Omitting both flags leaves speculation off. Supplying a rate with N=`0` also requests the published N; without a published N that case remains off |
+| `--spec-acceptance-rate` **(per-instance)** | float | the model's published value | Fraction of drafted tokens the target accepts, so the mean accept length is `1 + rate * N`. **Marginal**, which is what every published source reports — not Leviathan's conditional per-position alpha. A model with no published figure must be given one |
+| `--spec-acceptance-policy` **(per-instance)** | `FIXED` / `DECAY` / `CUSTOM` | `FIXED` | How the accepted count is drawn. `DECAY` uses per-position rates, which fall with draft position — same mean, different spread |
+
+**Model-owned MTP drafter time is charged from its profiles; missing required
+catalog entries or measurements are errors.** vLLM runs the drafter **N times per step** —
+once, then `num_speculative_tokens - 1` more. Each pass is a norm pair,
+an `eh_proj`, **a full decoder layer**, and (DeepSeek/GLM) a norm plus
+`lm_head` — the decoder layer dominating by roughly 4:1 over the
+wrapper. Reporting any of it as free would claim a speedup no engine
+can deliver, so a model with MTP modules (`num_nextn_predict_layers`,
+`num_mtp_modules`, `mtp_num_hidden_layers`) is charged for all N
+passes, emitted after the target's head — which is where vLLM runs
+them, from `sample_tokens()`. It raises if the architecture catalog is
+missing `mtp.prologue` or `mtp.decoder_block`, or if the bundle has no
+profiled `mtp.csv`. All four modern families ship both; a new family
+needs a profile run with `--profile-mtp`.
+
+A model with **no** MTP modules drafts with a separate model or with
+n-gram — a serving choice rather than a checkpoint property, and the
+simulator has no second model to charge. That case warns instead of
+refusing, and says plainly that the reported speedup is an upper bound.
+
+The drafter's **KV cache** is charged either way: an MTP module wraps a
+real decoder layer, so it publishes a cache spec of its own. That is
++1.6% bytes/token on DeepSeek-V3.2's one module, +11.7% on
+MiniMax-M3's seven, +6.2% on Qwen3.8-27B.
 
 ## Prefix caching and offloading
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--enable-prefix-caching` | `True` | RadixAttention prefix caching. Use `--no-enable-prefix-caching` to disable |
+| `--enable-prefix-caching` **(per-instance)** | `True` | Prefix caching over a per-tier block pool with chained block hashes. Use `--no-enable-prefix-caching` to disable |
 | `--enable-prefix-sharing` | off | Second-tier prefix pool shared across instances within a node |
 | `--prefix-storage` | `None` | Where the second-tier pool lives. `None` / `CPU` / `CXL` |
-| `--enable-local-offloading` | off | Weight offloading to NPU (counts weight reads in profiling) |
-| `--enable-attn-offloading` | off | Attention computation offloading to PIM |
-| `--enable-sub-batch-interleaving` | off | Overlap GPU compute with PIM attention. Requires `--enable-attn-offloading` |
+| `--enable-local-offloading` **(per-instance)** | off | Weight offloading to NPU (counts weight reads in profiling) |
+| `--enable-attn-offloading` **(per-instance)** | off | Attention computation offloading to PIM. Requires the node's `cpu_mem.pim_config`; target CUDA graph replay is unsupported |
+| `--enable-sub-batch-interleaving` **(per-instance)** | off | Overlap GPU compute with PIM attention. Requires attention offloading and `pp_size: 1`; invalid combinations are rejected |
 
 ## Dataset and output
 
@@ -70,15 +127,16 @@ matching runtime knobs per `instances[i]`; see
 
 Each invocation writes ASTRA-Sim intermediates under a run-specific input
 root so parallel simulations do not overwrite each other's generated
-configs, traces, or Chakra workloads. Generated text traces are removed
-after Chakra conversion by default, and the run-specific input root is
+configs, traces, or Chakra workloads. Text traces are not generated by
+default, and the run-specific input root is
 removed after a successful simulation by default.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--run-id` | string | auto-generated | Path-safe id for this simulation run. Used in `astra-sim/inputs/runs/<run-id>` and the `{run_id}` output placeholder |
 | `--inputs-root` | path | `astra-sim/inputs/runs/<run-id>` | Override the generated ASTRA-Sim input root, for example to place intermediates on local SSD or tmpfs |
-| `--cleanup-inputs` / `--no-cleanup-inputs` | bool | `true` | Remove generated trace files after Chakra conversion and remove the generated run directory after a successful simulation. Use `--no-cleanup-inputs` to preserve traces, Chakra workloads, and input configs for debugging |
+| `--save-trace-text` / `--no-save-trace-text` | bool | `false` | Write each batch's trace as text, for inspection. Nothing in the pipeline reads it — the Chakra converter takes the trace rows directly — so it is produced only on request, and it is the only human-readable form of what the simulator emitted. Implies `--keep-inputs` |
+| `--keep-inputs` / `--no-keep-inputs` | bool | `false` | Keep the generated ASTRA-Sim inputs under `astra-sim/inputs/runs/<run-id>` after a successful simulation: the Chakra `.et` workloads and the generated network / system / memory configs, so a run can be replayed through ASTRA-Sim by hand |
 
 ## Logging
 
@@ -98,8 +156,9 @@ removed after a successful simulation by default.
 | Prefix caching | `--enable-prefix-caching` (default on), `--enable-prefix-sharing`, `--prefix-storage` |
 | Chunked prefill | `--enable-chunked-prefill` (default on), `--long-prefill-token-threshold` |
 | PIM attention offload | `--enable-attn-offloading` (cluster config sets `pim_config`) |
-| FP8 KV cache | `--kv-cache-dtype fp8` |
+| FP8 KV cache | (model config `quantization_config.kv_cache_scheme`) |
 | ns3 backend | `--network-backend ns3` |
+| Heterogeneous instances in one run | (cluster config per-instance overrides; see the tip above) |
 
 For the full conceptual treatment of each feature, browse the
 **[Simulator](/docs/simulator/architecture)** section. For runnable

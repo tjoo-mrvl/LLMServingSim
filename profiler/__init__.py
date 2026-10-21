@@ -6,20 +6,23 @@ subfolders per TP degree) is consumed directly by LLMServingSim's
 trace_generator at simulation time.
 
 Module map:
-    __main__.py                 CLI dispatch (profile / slice)
+    __main__.py                 CLI dispatch (profile / slice / coverage)
     core/                       profiler internals
         runner.py               full-run orchestration
         config.py               Architecture loader + ProfileArgs + engine defaults
         engine.py               vLLM engine lifecycle
-        categories.py           profile categories (dense / per_seq / attn / moe)
-        skew.py / fit_alpha.py  heterogeneous-decode skew sweep + fit
+        categories.py           ordinary layerwise profile categories
+        moe_profile.py          native MoE component acquisition
+        skew.py / skew_plan.py  dynamic heterogeneous acquisition
+        skew_calibration.py    offline supported-N fit and lookup
         writer.py               CSV output + meta.yaml
         logger.py               rich-based logging & progress UI
         hooks/                  vLLM-internal-API touchpoints
             extension.py        vLLM worker extension class
             batch.py            synthetic SchedulerOutput assembly
-            timings.py          layerwise_profile tree extraction
-            moe_hook.py         FusedMoE forced-routing patcher
+            activity_collector.py scoped native CUDA collection
+            timings.py          grouped timing normalization and catalog matching
+            moe_hook.py         native MoE runner discovery
     models/                     architecture yamls (one per HF model_type)
     power/                      nvidia-smi / IPMI power-logging shell helpers
     perf/                       profile output root (per hardware/model/variant)

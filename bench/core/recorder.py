@@ -1,7 +1,8 @@
 """Bench output writer.
 
-Writes the three artifacts of a bench run::
+Writes a startup snapshot and the completed artifacts of a bench run::
 
+    bench/results/<run_id>/engine_start.json
     bench/results/<run_id>/meta.json
     bench/results/<run_id>/requests.jsonl
     bench/results/<run_id>/timeseries.csv
@@ -20,9 +21,47 @@ from typing import Any
 META_SCHEMA_VERSION = 1
 
 
+def write_engine_start(output_dir: Path, **fields: Any) -> None:
+    """Preserve resolved capacity early; this is not a completed benchmark."""
+    payload = {"schema_version": META_SCHEMA_VERSION, "status": "engine_initialized", **fields}
+    with (output_dir / "engine_start.json").open('x') as stream:
+        stream.write(json.dumps(payload, indent=2) + '\n')
+
+
 def write_meta(output_dir: Path, **fields: Any) -> None:
-    """Write meta.json. Required fields: model, vllm_version, engine_kwargs,
-    dataset_path, dataset_hash, started_at, finished_at, num_requests."""
+    """Write meta.json.
+
+    Required: model, vllm_version, engine_kwargs, dataset_path, dataset_hash,
+    started_at, finished_at, num_requests.
+
+    Optional, written by ``runner.py`` when the engine can be interrogated:
+
+    ``kv_cache``
+        Raw client cache fields: ``num_gpu_blocks``, ``block_size``,
+        ``num_kv_tokens``, ``gpu_memory_utilization``. In reviewed vLLM 0.31
+        DP clients, the block count sums connected engines and block size is
+        the last READY value; their product is not a general token capacity.
+        Additive ``capacity`` schema 1 qualifies these fields and records
+        complete per-engine startup READY facts when the installed source and
+        topology are supported. Otherwise ``per_engine`` is null with an
+        unknown status and reason. Match simulator instances to observed engine
+        block pools, never to an inferred division of the raw client scalar.
+    ``hardware``
+        Accelerator name, total memory, compute capability, CUDA/torch
+        versions -- enough to match a run against a ``profiler/perf/<hw>/``
+        bundle.
+    ``resolved_config``
+        vLLM's whole resolved ``VllmConfig``, one key per sub-config, with
+        defaults filled in and inferred values (``max_model_len``,
+        ``num_gpu_blocks``) settled. Produced by walking the config's own field
+        list, so a vLLM upgrade that adds a knob appears here without a change
+        here. Values that are not JSON scalars are replaced by a short type tag.
+
+    These three are absent from runs recorded before they existed, and can be
+    ``{}`` if collection failed, so read them with ``meta.get(...)`` rather than
+    keying off ``schema_version``. The version is bumped only when an existing
+    field changes meaning or disappears -- adding keys does not break a reader.
+    """
     payload = {"schema_version": META_SCHEMA_VERSION, **fields}
     (output_dir / "meta.json").write_text(json.dumps(payload, indent=2))
 
@@ -49,8 +88,16 @@ def write_requests(output_dir: Path, records: list[dict]) -> None:
 def write_timeseries(output_dir: Path, header: list[str], rows: list[list]) -> None:
     """Write timeseries.csv. Default header::
 
-        ["t", "prompt_throughput", "gen_throughput",
-         "running", "waiting", "kv_cache_pct"]
+        ["t", "prompt_throughput", "prompt_compute_throughput",
+         "prompt_cached_throughput", "gen_throughput",
+         "running", "waiting", "preempted", "kv_cache_pct"]
+
+    ``preempted`` is the number of preemption events in the tick, summed over
+    DP engines. It is what tells a long ``prefill_time`` in requests.jsonl
+    apart from a genuinely trickled prefill: vLLM stamps ``scheduled_ts`` on
+    the first admission only and ignores re-admissions, so a preempted request
+    reports its whole round trip as prefill. Absent from runs recorded before
+    this column existed -- read the header rather than assuming a position.
     """
     import csv
     with (output_dir / "timeseries.csv").open("w") as f:

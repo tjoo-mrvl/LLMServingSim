@@ -2,7 +2,7 @@
 
 A ``Shot`` is one unit of work we hand to the vLLM worker: a list of
 (new_tokens, history) pairs describing the shape of every request in a
-synthetic batch, plus optional MoE routing hints. A ``Shot`` is
+synthetic batch. A ``Shot`` is
 serialized to a plain dict for cross-process transport (via
 ``llm.collective_rpc``) and rehydrated inside the worker.
 
@@ -13,17 +13,15 @@ the requests are exactly what the grid generators asked for — no
 risk of the scheduler splitting, chunking, or reordering.
 
 Key trick: setting ``num_computed_tokens = history`` tells vLLM
-"pretend the first `history` tokens are already computed and their KV
-is in the cache". Combined with ``prompt_token_ids = [1] * (new_tokens
-+ history)`` this gives the engine a request that attends to
-``history`` preloaded tokens while newly computing ``new_tokens``.
+"the first `history` tokens are already computed and their KV is in the
+cache". The measurement driver must fulfill that promise: ``history.py``
+initializes dummy KV in the exact pages before timing the query.
 Exactly the shape needed to sweep attention at arbitrary
 (prefill_chunk, kv_cache) configurations.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -37,14 +35,20 @@ class Shot:
             entry per synthetic request. ``new_tokens`` is what we'll
             feed into ``execute_model`` this step; ``history`` is the
             KV the engine should treat as preloaded.
-        experts: Optional MoE payload. When set, the worker activates
-            exactly ``experts["activated"]`` experts via forced
-            routing (see moe_hook.force_moe_routing). None for
-            non-MoE shots.
     """
 
     requests: list[tuple[int, int]]
-    experts: dict[str, Any] | None = None
+    # Query tokens per decode request. Carried rather than re-derived from
+    # ``requests``, because with more than one query token a decode is
+    # indistinguishable by shape from a prefill chunk -- which is exactly the
+    # confusion this axis exists to remove.
+    decode_q_len: int = 1
+    # How many of the leading ``requests`` are prefill sequences. Carried for
+    # the same reason ``decode_q_len`` is: a step can carry several prefill
+    # sequences, and then the boundary between them and the decodes cannot be
+    # read off the shapes -- a prefill chunk and a decode submitting the same
+    # number of query tokens look identical.
+    n_prefill: int = 0
 
     # Serialization roundtrip: these helpers keep cross-process
     # transport simple. collective_rpc serializes args as pickle, so
@@ -56,7 +60,8 @@ class Shot:
     def hydrate(cls, raw: dict[str, Any]) -> "Shot":
         return cls(
             requests=[tuple(r) for r in raw.get("requests", [])],
-            experts=raw.get("experts"),
+            decode_q_len=int(raw.get("decode_q_len") or 1),
+            n_prefill=int(raw.get("n_prefill") or 0),
         )
 
     # -----------------------------------------------------------------
@@ -84,28 +89,116 @@ class Shot:
         kv_prefill: int,
         n_decode: int,
         kv_decode: int,
+        decode_q_len: int = 1,
     ) -> "Shot":
         """Mixed prefill+decode batch for unified attention profiling.
 
         At most one prefill + ``n_decode`` decode requests. Either
         component can be absent (``prefill_chunk=0`` or ``n_decode=0``).
+
+        ``decode_q_len`` is how many query tokens each decode request submits.
+        It is 1 for ordinary decoding and ``1 + num_speculative_tokens`` for a
+        speculative-decoding verification step, which is a shape the other four
+        axes cannot express: *n* sequences each submitting *k+1* queries against
+        **their own** KV is neither one prefill chunk of ``n*(k+1)`` tokens nor
+        ``n*(k+1)`` single-token decodes, because the k+1 queries of one
+        sequence share that sequence's KV read. FlashAttention runs it as a
+        varlen batch of uniform query length, which is a different tile shape
+        again.
         """
         reqs: list[tuple[int, int]] = []
         if prefill_chunk > 0:
             reqs.append((prefill_chunk, kv_prefill))
         if n_decode > 0:
-            reqs.extend([(1, kv_decode)] * n_decode)
+            reqs.extend([(max(1, decode_q_len), kv_decode)] * n_decode)
         if not reqs:
             raise ValueError("attention Shot must have at least one request")
-        return cls(requests=reqs)
+        return cls(requests=reqs, decode_q_len=max(1, decode_q_len),
+                   n_prefill=1 if prefill_chunk > 0 else 0)
 
     @classmethod
-    def moe(cls, total_tokens: int, activated_experts: int) -> "Shot":
-        """Dense-style batch tagged with MoE routing metadata."""
-        return cls(
-            requests=[(total_tokens, 0)],
-            experts={"activated": activated_experts},
+    def attention_batch(
+        cls,
+        prefill_reqs: list[tuple[int, int]],
+        n_decode: int,
+        kv_decode: int,
+        decode_q_len: int = 1,
+    ) -> "Shot":
+        """Attention shot carrying **several** prefill sequences.
+
+        ``Shot.attention`` covers the one-sequence case, which is all a grid
+        indexed on a single sequence's chunk and context can express. A real
+        step routinely carries several -- one request finishing its prompt
+        beside another just starting -- and holding the total token count
+        fixed while splitting it across k sequences changes the cost in
+        opposite directions by family: 0.65-0.71x on dense GQA at k=7,
+        1.63-1.79x on sparse MLA. So the sweep has to be able to fire it.
+        """
+        reqs = list(prefill_reqs)
+        if n_decode > 0:
+            reqs.extend([(max(1, decode_q_len), kv_decode)] * n_decode)
+        if not reqs:
+            raise ValueError("attention Shot must have at least one request")
+        return cls(requests=reqs, decode_q_len=max(1, decode_q_len),
+                   n_prefill=len(prefill_reqs))
+
+    # History given to a linear-attention shot's decode requests. The value is
+    # arbitrary as far as cost goes -- a gated-DeltaNet state is fixed-size
+    # regardless of position, and a 64x spread in this number moves the
+    # measured time 1.1%. It is not arbitrary as far as *classification* goes;
+    # see ``Shot.linear_attention``. One block covers it at every block size
+    # the hybrid page unification produces, so it is free.
+    LINEAR_ATTN_DECODE_HISTORY = 256
+
+    @classmethod
+    def linear_attention(
+        cls,
+        prefill_tokens: int,
+        n_decode: int,
+        decode_history: int | None = None,
+    ) -> "Shot":
+        """Mixed prefill+decode batch for a linear-attention (mamba / GDN) sweep.
+
+        Unlike ``Shot.attention`` there is no kv **axis**: a gated-DeltaNet
+        layer keeps a fixed-size conv state and a fixed-size recurrent state
+        per sequence, neither a function of position, so cost does not depend
+        on how long the sequences are — measured, a 64x spread in kv length
+        moves it 1.1% and a skewed batch is indistinguishable from a uniform
+        one. There is no skew correction to apply either.
+
+        The decodes still carry history, though, because vLLM's *classification*
+        depends on it even where the cost does not.
+        ``split_decodes_and_prefills`` assumes a decodes-first batch and
+        short-circuits:
+
+            if query_lens[0].item() > decode_threshold:
+                # first request is not decode, so no decode requests
+                return 0, num_reqs, 0, num_tokens
+
+        A pure batch of 1-token requests takes an earlier fast path
+        (``max_query_len <= threshold`` => all decodes) and reaches the decode
+        kernel with no history at all. A **mixed** batch does not: with
+        zero-history decodes the whole batch was classified as prefill and the
+        decode kernel never ran, so the mixed-regime rows came out empty.
+        Since GDN runs a *different* kernel in the mixed regime than in the
+        pure one, those rows are exactly the ones that cannot be inferred from
+        anywhere else.
+        """
+        history = (
+            cls.LINEAR_ATTN_DECODE_HISTORY if decode_history is None
+            else decode_history
         )
+        reqs: list[tuple[int, int]] = []
+        if prefill_tokens > 0:
+            reqs.append((prefill_tokens, 0))
+        if n_decode > 0:
+            reqs.extend([(1, history)] * n_decode)
+        if not reqs:
+            raise ValueError(
+                "linear_attention Shot needs prefill_tokens or n_decode"
+            )
+        return cls(requests=reqs, n_prefill=int(prefill_tokens > 0))
+
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +210,59 @@ class Shot:
 # version we run in the worker) without pulling in every vLLM symbol.
 
 
+def _kv_group_block_sizes(model_runner) -> list[int]:
+    """Block size of each KV cache group, in tokens, as the KV manager counts them.
+
+    A model can have several KV cache groups — cross-layer managers, and any
+    hybrid stack, where full-attention layers page KV per token while mamba /
+    linear-attention layers hold one fixed-size state per sequence. Each group
+    has its own block size, and a request occupies blocks in *every* group at
+    once, so the caller has to reserve for all of them.
+
+    Read from ``kv_cache_config`` rather than from the worker's block tables:
+    v0.28 ships two GPU model runners and defaults to the newer one, which
+    keeps no persistent ``input_batch`` (it builds one per step) and holds its
+    block tables under a different type. Both runners derive their tables from
+    ``kv_cache_config``, so that is the version-independent source — and it is
+    the KV-manager block size directly, with no kernel-block arithmetic.
+    """
+    kv_cache_config = getattr(model_runner, "kv_cache_config", None)
+    if kv_cache_config is not None:
+        groups = getattr(kv_cache_config, "kv_cache_groups", None)
+        if groups:
+            return [int(g.kv_cache_spec.block_size) for g in groups]
+
+    # Legacy fallback: the V1 runner's persistent input batch. ``block_size``
+    # there is the *kernel* block size, which equals the manager's only when
+    # blocks aren't subdivided — hence the multiply.
+    block_tables = model_runner.input_batch.block_table.block_tables
+    return [int(bt.block_size) * int(bt.blocks_per_kv_block) for bt in block_tables]
+
+
+def validate_shot_limits(shot: Shot, config):
+    """Reject synthetic batches before allocating pages or launching GPU work.
+
+    Direct worker calls bypass the scheduler's safety checks. Use the actual
+    acquisition buffer limits here, not the smaller logical sampling budget.
+    """
+    if not shot.requests or any(type(q) is not int or type(h) is not int or q < 1 or h < 0
+                                for q, h in shot.requests):
+        raise ValueError('Profiling shots require positive query and nonnegative history lengths')
+    if type(shot.n_prefill) is not int or not 0 <= shot.n_prefill <= len(shot.requests):
+        raise ValueError('Invalid profiling prefill request count')
+    scheduler, model = config.scheduler_config, config.model_config
+    if len(shot.requests) > scheduler.max_num_seqs:
+        raise ValueError(f'Profiling shot has {len(shot.requests)} requests, exceeding '
+                         f'engine max_num_seqs={scheduler.max_num_seqs}')
+    tokens = sum(q for q, _ in shot.requests)
+    if tokens > scheduler.max_num_batched_tokens:
+        raise ValueError(f'Profiling shot has {tokens} query tokens, exceeding '
+                         f'engine max_num_batched_tokens={scheduler.max_num_batched_tokens}')
+    if max(q + h for q, h in shot.requests) + 1 > model.max_model_len:
+        raise ValueError(f'Profiling shot needs history + query + one output within '
+                         f'max_model_len={model.max_model_len}')
+
+
 def assemble_scheduler_output(shot: Shot, model_runner):
     """Build a ``SchedulerOutput`` describing the shot's synthetic batch.
 
@@ -125,12 +271,12 @@ def assemble_scheduler_output(shot: Shot, model_runner):
         the set of request IDs we created so callers can correlate
         with ``execute_model``'s output if needed.
     """
+    validate_shot_limits(shot, model_runner.vllm_config)
     # Local imports: these symbols must come from whatever vLLM is
     # actually installed in the worker — not from a cached import at
     # host-side module load time.
     from vllm import SamplingParams
     from vllm.v1.core.sched.output import (
-        CachedRequestData,
         NewRequestData,
         SchedulerOutput,
     )
@@ -144,53 +290,42 @@ def assemble_scheduler_output(shot: Shot, model_runner):
         max_tokens=1,
     )
 
-    # vLLM may have multiple KV-cache groups (cross-layer managers,
-    # hybrid architectures). We honor all of them by reading the
-    # worker's live block_table list.
-    block_tables = model_runner.input_batch.block_table.block_tables
-    block_sizes = [
-        bt.block_size * bt.blocks_per_kv_block
-        for bt in block_tables
-    ]
-    num_kv_groups = len(block_sizes)
+    from .cache_pages import allocate_shot_blocks
+    allocations = allocate_shot_blocks(shot, model_runner)
+    num_kv_groups = len(model_runner.kv_cache_config.kv_cache_groups)
 
     scheduled: list = []
     num_scheduled_tokens: dict[str, int] = {}
     total_num_scheduled_tokens = 0
 
-    # Track the next free block index per KV group. We assign blocks
-    # greedily in arrival order; since these are fresh dummy requests
-    # there's no overlap concern.
-    block_cursor = [0] * num_kv_groups
     req_ids: list[str] = []
 
     for idx, (new_tokens, history) in enumerate(shot.requests):
         req_id = f"r{idx}"
         total_len = new_tokens + history
 
-        # For each KV group, reserve enough blocks to cover total_len.
-        # We round up because partial blocks still consume one slot.
-        group_block_ids: list[list[int]] = []
-        for g, bs in enumerate(block_sizes):
-            num_blocks = math.ceil(total_len / bs) if total_len else 1
-            ids = list(range(block_cursor[g], block_cursor[g] + num_blocks))
-            block_cursor[g] += num_blocks
-            group_block_ids.append(ids)
-
         scheduled.append(
             NewRequestData(
                 req_id=req_id,
-                # Contents don't matter — we use token id 1 uniformly.
+                # A shape-only template. The preparation driver supplies
+                # reproducible valid token IDs before measurement.
                 # Length must equal `history + new_tokens` so vLLM
                 # thinks it's handling a real sequence.
                 prompt_token_ids=[1] * total_len,
+                # V2-model-runner only, and it asserts rather than defaults:
+                # ``add_requests`` passes this straight through as the
+                # request's ``all_token_ids``. vLLM's own scheduler fills it
+                # with ``req._all_token_ids`` (prompt plus everything
+                # generated so far), which for a fresh synthetic request is
+                # just the prompt again.
+                prefill_token_ids=[1] * total_len,
                 mm_features=[],
                 sampling_params=sampling_params,
                 pooling_params=None,
-                block_ids=tuple(group_block_ids),
+                block_ids=allocations[idx],
                 # This is the "KV cache already contains `history`
-                # tokens" marker — the crux of how we inject arbitrary
-                # kv_cache shapes without actually prefilling.
+                # tokens" marker. It declares geometry, not initialized
+                # storage; dummy KV initialization happens separately.
                 num_computed_tokens=history,
                 lora_request=None,
             )
@@ -199,15 +334,15 @@ def assemble_scheduler_output(shot: Shot, model_runner):
         total_num_scheduled_tokens += new_tokens
         req_ids.append(req_id)
 
-    scheduler_output = SchedulerOutput(
-        scheduled_new_reqs=scheduled,
-        scheduled_cached_reqs=CachedRequestData.make_empty(),
-        num_scheduled_tokens=num_scheduled_tokens,
-        total_num_scheduled_tokens=total_num_scheduled_tokens,
-        scheduled_spec_decode_tokens={},
-        scheduled_encoder_inputs={},
-        num_common_prefix_blocks=[0] * num_kv_groups,
-        finished_req_ids=set(),
-        free_encoder_mm_hashes=[],
-    )
+    # Start from vLLM's own empty instance rather than naming every field.
+    # SchedulerOutput grows a field or two most releases (v0.28 alone added
+    # eight, plus spec-decode bookkeeping); constructing positionally means
+    # each of those is a breakage we'd have to chase. ``make_empty`` is
+    # maintained alongside the dataclass, so it always fills whatever the
+    # installed version requires, and we override only what a shot defines.
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.scheduled_new_reqs = scheduled
+    scheduler_output.num_scheduled_tokens = num_scheduled_tokens
+    scheduler_output.total_num_scheduled_tokens = total_num_scheduled_tokens
+    scheduler_output.num_common_prefix_blocks = [0] * num_kv_groups
     return scheduler_output, set(req_ids)

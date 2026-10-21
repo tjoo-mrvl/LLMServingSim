@@ -7,7 +7,7 @@ and the `examples/` folder ships ready-to-edit invocation templates.
 
 ## Layout
 
-```
+```text
 workloads/
 ├── *.jsonl                    workload files (flat or agentic; see Format)
 ├── generators/                JSONL generators
@@ -79,12 +79,13 @@ of the `sub_requests` key.
 ### ShareGPT traces
 
 Generated on demand by `python -m workloads.generators sharegpt --model <hf-id>
---num-reqs <n> --sps <r>` (see `generators/`). Output files land directly in
-this directory and follow the flat-request format above with `input_tok_ids`
+--num-reqs <n> --sps <r> --output workloads/<name>.jsonl` (see `generators/`).
+The required `--output` selects the destination. Files follow the flat-request format with `input_tok_ids`
 populated for prefix-cache hashing.
 
 
 ### SWE-bench agentic traces
+
 Agentic sessions derived from real SWE-bench coding tasks with LLM calls chained
 by tool calls (bash, grep, file edits). Each session is a complete coding task
 consisting of multiple LLM sub-requests (6--20 per session) interleaved with tool
@@ -94,7 +95,14 @@ executions.
 | --- | --- | --- | --- | --- | --- |
 | `swe-bench-qwen3-30b-a3b-50-sps0.2.jsonl` | 50 | 765 | 15.3 | 0.2 | Qwen3-30B-A3B |
 
+**There is no SWE-bench generator.** `workloads.generators` has exactly one
+subcommand, `sharegpt`; this file was produced out of band and committed. To
+build your own agentic workload, emit the JSONL directly — the schema is above,
+and the format reference is
+[Workloads → JSONL format](https://llmservingsim.ai/docs/workloads/jsonl-format).
+
 ### Other
+
 | File | Description |
 | --- | --- |
 | `example_trace.jsonl` | Small example trace for quick testing |
@@ -131,6 +139,41 @@ python -m workloads.generators sharegpt \
 fill `output_tok_ids` with the model's natural responses (free
 generation). Without it, `output_tok_ids` come straight from the
 ShareGPT assistant turn.
+
+The source, length and arrival options are:
+
+| Group | Flags |
+| --- | --- |
+| Required | `--model`, `--num-reqs`, `--sps`, `--output` |
+| Source and sampling | `--source`, `--seed`, `--max-sessions` |
+| Length filters | `--min-input-toks`, `--max-input-toks`, `--min-output-toks`, `--max-output-toks`, `--max-kv-toks` |
+| Fixed random lengths | `--fix-len`, `--fix-input-length`, `--fix-output-length` |
+| Arrival patterns | `--first-arrival-sec`, `--pulse`, `--pulse-n`, `--pulse-delay-sec`, `--pulse-poisson` |
+
+`--fix-len` generates random token IDs at the requested lengths; it does not
+read or pad ShareGPT conversations and skips `--use-vllm`. The full reference
+linked below describes defaults and interactions.
+
+Free-generation options:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--use-vllm` | off | enable free generation |
+| `--vllm-tp` | `1` | `tensor_parallel_size` for the offline engine |
+| `--vllm-dtype` | `bfloat16` | weight dtype |
+| `--vllm-max-num-seqs` | `1024` | `max_num_seqs`, high on purpose — this is a throughput job |
+| `--vllm-max-num-batched-tokens` | `16384` | `max_num_batched_tokens`, likewise |
+| `--vllm-max-model-len` | model's max | override `max_model_len` |
+| `--vllm-temperature` | `0.0` | `0` = greedy, so generation is reproducible for a seed |
+| `--vllm-repetition-penalty` | `1.1` | Passed to `SamplingParams.repetition_penalty`; `1.0` disables the penalty, values above `1.0` discourage repetition without guaranteeing EOS or output length |
+
+These are settings for the generation job, not for the simulated run:
+the generator records only token counts and ids, so a high
+`--vllm-max-num-seqs` here says nothing about what `--max-num-seqs` the
+workload should be simulated at.
+
+Full flag reference:
+[Workloads → ShareGPT generators](https://llmservingsim.ai/docs/workloads/sharegpt-generators).
 
 To create a workload manually, write JSON objects to a `.jsonl` file
 following the format above and pass the file path via `--dataset` to

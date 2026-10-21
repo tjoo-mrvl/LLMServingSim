@@ -8,11 +8,11 @@ Each category knows three things:
   3. Which slice of the ModelSpec's catalog it cares about
      (``catalog_slice``).
 
-Four concrete categories:
+Ordinary categories:
     DenseCategory       token-parameterized layers (embedding, qkv_proj, ...)
     SequenceCategory    sequence-parameterized layers (lm_head, sampler)
     AttentionCategory   the unified prefill+decode+mixed attention grid
-    ExpertCategory      MoE block (tokens × activated_experts)
+    Native MoE components use the separate moe_profile acquisition driver.
 
 Adding a new profile kind is a matter of subclassing ``Category`` and
 registering it in ``categories_for()``.
@@ -22,12 +22,20 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar, Iterator
+from typing import TYPE_CHECKING, ClassVar, Iterator
 
-from profiler.core.config import Architecture, LayerEntry, ProfileArgs
-from profiler.core.engine import RuntimeLimits
+from profiler.core.config import (
+    Architecture,
+    LayerEntry,
+    ProfileArgs,
+)
+if TYPE_CHECKING:
+    from profiler.core.engine import RuntimeLimits
 from profiler.core.hooks.batch import Shot
+from profiler.core.stack import ALL_AXES, ATTENTION_AXES
+from profiler.core.attention_shape import prefill_key
 from profiler.core.hooks.timings import TimingSample
+from profiler.core.sampling import for_category, geometric, union_grid
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +50,15 @@ class DensePoint:
 
 
 @dataclass(frozen=True)
+class ContextDensePoint:
+    layer: str
+    tokens: int
+    context: str
+    context_tokens: int
+    microseconds: float
+
+
+@dataclass(frozen=True)
 class SequencePoint:
     layer: str
     sequences: int
@@ -49,62 +66,60 @@ class SequencePoint:
 
 
 @dataclass(frozen=True)
-class AttentionPoint:
-    # Shape mirrors attention.csv (§ DESIGN doc): 4D keyed, one column
-    # per axis, plus microseconds.
-    prefill_chunk: int
-    kv_prefill: int
-    n_decode: int
-    kv_decode: int
+class MtpPoint:
+    layer: str
+    sequences: int
     microseconds: float
 
 
 @dataclass(frozen=True)
-class ExpertPoint:
-    tokens: int
-    activated_experts: int
+class AttentionPoint:
+    # 4D keyed, one column per axis, plus microseconds -- and a layer name,
+    # because the group can legitimately hold more than one kernel now. A
+    # sparse-attention model runs an indexer over the whole KV before the
+    # top-k selection, so it keys on exactly these axes and runs on every
+    # attention layer, but it is a different kernel with a different cost.
+    layer: str
+    prefill_chunk: int
+    # Query-weighted mean, over the batch's prefills, of how far each sequence's
+    # queries look back: its context plus half its own chunk (causal). The
+    # column it replaces, ``kv_prefill``, described a single sequence, so a
+    # step carrying several was summed into a number describing none of them
+    # -- three requests with 0, 1200 and 64 tokens of context came out as
+    # 1264. Recorded **uncapped**: a sparse kernel's cost saturates in this
+    # quantity but the indexer's does not, and the two share this grid, so the
+    # saturation is applied per kernel at lookup instead.
+    prefill_key: float
+    n_decode: int
+    kv_decode: int
+    # Query tokens per decode sequence: 1 for ordinary decoding, 1 + N for a
+    # speculative-decoding verification step. Neither a prefill chunk of the
+    # same token count nor that many single-token decodes -- the k+1 queries of
+    # one sequence share that sequence's KV read.
+    decode_q_len: int
     microseconds: float
 
 
-# Union alias for writer.py's benefit.
-Point = DensePoint | SequencePoint | AttentionPoint | ExpertPoint
+@dataclass(frozen=True)
+class LinearAttentionPoint:
+    # Carries ``layer`` unlike AttentionPoint: a linear-attention block runs
+    # several distinct kernels that key on the same axes -- the chunked prefill
+    # scan, and two different decode recurrences depending on whether the batch
+    # also holds a prefill -- and they are not interchangeable.
+    layer: str
+    prefill_tokens: int
+    n_decode: int
+    microseconds: float
+
+
+Point = (
+    DensePoint | ContextDensePoint | SequencePoint | MtpPoint | AttentionPoint | LinearAttentionPoint
+)
 
 
 # ---------------------------------------------------------------------------
 # Grid helpers (shared)
 # ---------------------------------------------------------------------------
-
-def _power_of_two_grid(max_value: int) -> list[int]:
-    """``[1, 2, 4, 8, ..., largest_pow2_le_max]``."""
-    values: list[int] = []
-    v = 1
-    while v <= max_value:
-        values.append(v)
-        v *= 2
-    return values
-
-
-def _token_grid(max_tokens: int) -> list[int]:
-    """Dense grid used for both dense and per_sequence sweeps.
-
-    Fine points at the low end (where decode-sized batches live),
-    coarser at the high end. Matches the shape of vLLM's typical
-    runtime load — small batches dominate.
-    """
-    if max_tokens < 1:
-        return []
-    pts: list[int] = []
-    # 1 .. 15 — every integer. Short-decode regime.
-    pts.extend(range(1, min(16, max_tokens + 1)))
-    # 16 .. 63 — step of 4. Transition regime.
-    pts.extend(range(16, min(64, max_tokens + 1), 4))
-    # 64 .. max — step of 16. Longer-chunk regime.
-    pts.extend(range(64, max_tokens + 1, 16))
-    # max might not be captured by the strided range above.
-    if pts[-1] != max_tokens:
-        pts.append(max_tokens)
-    return pts
-
 
 # ---------------------------------------------------------------------------
 # Category base
@@ -120,6 +135,26 @@ class Category(ABC):
     name: ClassVar[str]
     sink_filename: ClassVar[str]
     label: ClassVar[str]
+
+    #: Which axes of the layer stack this category's measurements depend on.
+    #: The engine is shrunk to the smallest prefix instantiating every value of
+    #: these, and a category should not pay for an axis it does not measure:
+    #: the profile tree merges same-class siblings, so a second layer of a type
+    #: already present adds no information, only its whole op count on every
+    #: shot. Estimate acquisition cost with the current collector on the
+    #: intended model and device. The default is every axis, and it is
+    #: the safe answer for anything new.
+    #:
+    #: Axes are a **conservative proxy** for what a category needs, which is
+    #: really "every block its entries live in". They agree where it matters
+    #: and the proxy over-shrinks nowhere, so no data is ever lost -- but it
+    #: does under-shrink: DeepSeek-V3.2's ``dense`` entries sit only in
+    #: ``attn.full_attention`` and ``mlp.dense`` (``moe`` is its own category),
+    #: so layer 0 alone would do, while the all-axes answer is 4 because the
+    #: MLP axis turns to MoE at layer 3. The attention Cartesian grid generally
+    #: dominates the one-dimensional dense sweep; an entry-to-block resolver would
+    #: have to cross-reference ``blocks`` with ``catalog`` to save three.
+    stack_axes: ClassVar[tuple[str, ...]] = ALL_AXES
 
     @abstractmethod
     def compose_shots(
@@ -159,10 +194,32 @@ class Category(ABC):
         """
 
 
-def _entry_dict(entries: dict[str, LayerEntry]) -> dict[str, dict]:
-    """Serialize a catalog group for RPC transport."""
+def _entry_dict(
+    entries: dict[str, LayerEntry],
+    arch: Architecture,
+) -> dict[str, dict]:
+    """Serialize a catalog group for RPC transport.
+
+    ``occurrences`` rides along because the worker cannot compute it: the
+    profiled tree only knows how many times a *module* was called, not how
+    many trace nodes the architecture emits for it. See ``hooks/timings.py``.
+    """
+    occurrences = arch.layer_occurrences()
+    # A whole MoE block is emitted only for MoE layers. Its parent decoder
+    # class can also include dense layers, so parent calls are not the number
+    # of MoE trace nodes. Other categories can intentionally merge siblings
+    # (e.g. q_b_proj + kv_b_proj) and retain parent-based normalization.
+    normalization = "invocations" if entries is arch.catalog.moe else "parent"
     return {
-        name: {"vllm": e.vllm, "within": e.within, "repr_match": e.repr_match, "tp_stable": e.tp_stable}
+        name: {
+            **({"callable": e.callable.name} if e.callable is not None else
+               {"operator": e.operator} if e.operator is not None else {"vllm": e.vllm}),
+            "within": e.within,        # str, list[str] or None; see LayerEntry
+            "not_within": e.not_within,
+            "tp_stable": e.tp_stable,
+            "occurrences": occurrences.get(name, 1),
+            "normalization": e.normalization or normalization,
+        }
         for name, e in entries.items()
     }
 
@@ -179,22 +236,36 @@ class DenseCategory(Category):
     label = "dense"
 
     def compose_shots(self, arch, args, limits, tp):
-        for n in _token_grid(limits.max_num_batched_tokens):
-            # Guard against absurdly small KV caches where even a
-            # dense prefill wouldn't fit in a single block budget.
-            if ((n + _BLOCK_SIZE - 1) // _BLOCK_SIZE) * _BLOCK_SIZE > limits.num_cache_tokens:
+        plan = for_category(args, limits, tp, include_stable=True)
+        for n in union_grid(limits.max_num_batched_tokens, args.grid_factor, plan.forward_sizes):
+            # Split a wide model-row bucket when a single request would
+            # exceed the context limit. Dense kernels still see exactly n rows.
+            width = limits.max_model_len - 1
+            if width < 1:
                 continue
-            # Context-length bound: a single request of length n must
-            # leave room for the sampler's +1 write.
-            if n >= limits.max_model_len:
+            count = (n + width - 1) // width
+            if count > limits.max_num_seqs:
                 continue
-            yield Shot.dense(total_tokens=n)
+            base, extra = divmod(n, count)
+            requests = [(base + (i < extra), 0) for i in range(count)]
+            bs = limits.block_size
+            if sum(((size + bs - 1) // bs) * bs for size, _ in requests) > limits.num_cache_tokens:
+                continue
+            yield Shot(requests=requests, n_prefill=len(requests))
 
     def extract_points(self, shot, timings, arch, tp):
-        # Dense shots are one request with all the new tokens packed
-        # together — total_tokens is just the sum across requests.
+        # Requests may be split to satisfy context limits; dense kernels see
+        # the same packed total number of new-token rows.
         total_tokens = sum(new for new, _ in shot.requests)
         for sample in timings:
+            if sample.context is not None or sample.context_tokens is not None:
+                from .hooks.callable_context import validate_context_text
+                validate_context_text(sample.context)
+                if type(sample.context_tokens) is not int or sample.context_tokens < 1:
+                    raise ValueError('Context tokens must be a positive integer')
+                yield ContextDensePoint(sample.layer, total_tokens, sample.context,
+                                        sample.context_tokens, sample.microseconds)
+                continue
             yield DensePoint(
                 layer=sample.layer,
                 tokens=total_tokens,
@@ -202,7 +273,7 @@ class DenseCategory(Category):
             )
 
     def catalog_slice(self, arch):
-        return _entry_dict(arch.catalog.dense)
+        return _entry_dict(arch.catalog.dense, arch)
 
     def shot_key(self, shot):
         return (sum(new for new, _ in shot.requests),)
@@ -225,11 +296,11 @@ class SequenceCategory(Category):
     label = "per_sequence"
 
     def compose_shots(self, arch, args, limits, tp):
-        for n in _token_grid(limits.max_num_seqs):
+        for n in geometric(limits.max_num_seqs, args.grid_factor):
             # N single-token requests → N new tokens + N blocks used.
             if n > limits.max_num_batched_tokens:
                 continue
-            if n * _BLOCK_SIZE > limits.num_cache_tokens:
+            if n * limits.block_size > limits.num_cache_tokens:
                 continue
             yield Shot.per_sequence(num_sequences=n)
 
@@ -245,7 +316,57 @@ class SequenceCategory(Category):
             )
 
     def catalog_slice(self, arch):
-        return _entry_dict(arch.catalog.per_sequence)
+        return _entry_dict(arch.catalog.per_sequence, arch)
+
+    def shot_key(self, shot):
+        return (len(shot.requests),)
+
+
+class MtpCategory(Category):
+    """The model's own drafter (MTP), keyed on the decode batch size.
+
+    This is a request-count table for one drafter pass. The V1 proposer uses
+    single-query decode shapes; V2's first pass can have distinct token and
+    request counts. Capture-derived request anchors improve sampling of this
+    existing axis but do not model that extra first-pass shape dimension.
+
+    The kernels arrive for free: the drafter runs inside ``sample_tokens()``
+    (``propose_draft_token_ids`` -> ``drafter.propose``), which the fire path
+    already calls inside the native CUDA collector. What this category adds is the
+    *axis* -- without it the drafter's time would be measured once, at whatever
+    batch the other categories happened to use.
+
+    Only runs when the engine was booted with ``--profile-mtp``; without it the
+    module does not exist and the catalog slice matches nothing.
+    """
+
+    name = "mtp"
+    sink_filename = "mtp.csv"
+    label = "mtp"
+
+    def compose_shots(self, arch, args, limits, tp):
+        # Drafter managers use their own request-domain captures; this table
+        # still describes one pass, not first-pass query/token layout effects.
+        plan = for_category(args, limits, tp)
+        for n in union_grid(limits.max_num_seqs, args.grid_factor, plan.mtp_counts()):
+            # N single-token decode requests, the shape a drafter pass sees.
+            if n > limits.max_num_batched_tokens:
+                continue
+            if n * limits.block_size > limits.num_cache_tokens:
+                continue
+            yield Shot.per_sequence(num_sequences=n)
+
+    def extract_points(self, shot, timings, arch, tp):
+        num_sequences = len(shot.requests)
+        for sample in timings:
+            yield MtpPoint(
+                layer=sample.layer,
+                sequences=num_sequences,
+                microseconds=sample.microseconds,
+            )
+
+    def catalog_slice(self, arch):
+        return _entry_dict(arch.catalog.mtp, arch)
 
     def shot_key(self, shot):
         return (len(shot.requests),)
@@ -261,10 +382,12 @@ _ATTN_CHUNK_START = 16      # smallest prefill chunk we profile
 _ATTN_N_DECODE_START = 1    # smallest decode batch
 _ATTN_KV_START = 16        # smallest KV context (for both prefill & decode)
 
-# Must match HOST_ENGINE_DEFAULTS["block_size"] (16). Used for
-# block-aligned KV-budget feasibility checks so shots are only
-# generated when the paged cache can actually hold them.
-_BLOCK_SIZE = 16
+# Block-aligned KV-budget feasibility checks read ``limits.block_size``, not a
+# constant: what we request in HOST_ENGINE_DEFAULTS is not always what the
+# engine uses. A hybrid stack makes vLLM enlarge the attention block until an
+# attention page is at least as many bytes as a mamba state page (784 tokens
+# on Qwen3.8-27B against the 16 we asked for), and a filter off by 49x either
+# emits shots the cache cannot hold or silently drops ones it can.
 
 
 def _geometric_grid(max_value: int, start: int, factor: float = 2.0) -> list[int]:
@@ -294,6 +417,73 @@ def _geometric_grid(max_value: int, start: int, factor: float = 2.0) -> list[int
     return values
 
 
+def _compose_prefill(
+    total_tokens: int,
+    key_mean: int,
+    min_chunk: int,
+    max_seqs: int,
+) -> list[tuple[int, int]] | None:
+    """The prefill sequences that put a batch at ``(total_tokens, key_mean)``.
+
+    ``key_mean`` is the query-weighted mean over the batch's prefills of how far
+    that sequence's queries look back: its context plus half its own chunk
+    (causal). With one sequence that is ``h + c/2``, so a single sequence can
+    only ever reach ``key_mean >= total_tokens / 2``. Below that the tokens
+    have to be spread over ``k = ceil(total_tokens / (2 * key_mean))``
+    sequences, which is the fewest that leaves each one a non-negative
+    context -- and the fewest matters, because a real step carries as few
+    prefill sequences as the token budget allows.
+
+    Returns None when the point is unreachable: no context can be negative,
+    and a chunk below ``min_chunk`` is not a prefill chunk (the axis itself
+    starts there).
+    """
+    if total_tokens <= 0:
+        return []
+    if key_mean <= 0:
+        return None
+    k = max(1, -(-total_tokens // (2 * key_mean)))
+    if k > max_seqs or total_tokens // k < min_chunk:
+        return None
+    base, extra = divmod(total_tokens, k)
+    # Keep chunks as even as integers allow. Odd chunks require rounding their
+    # half-token history; _attn_key records the actual coordinate after that.
+    chunks = [base + (1 if i < extra else 0) for i in range(k)]
+    # Give each request the same effective key, up to half-token rounding.
+    # Sequence- and query-weighted means therefore coincide for the grid's
+    # even chunks; heterogeneous runtime chunks need the query weighting.
+    reqs = []
+    for c in chunks:
+        h = key_mean - c / 2.0
+        if h < 0:
+            return None
+        reqs.append((c, int(round(h))))
+    return reqs
+
+
+def _attn_key(shot) -> tuple[int, float, int, int, int]:
+    """``(prefill tokens, mean prefill key, n_decode, kv_decode, q)``.
+
+    ``Shot.n_prefill`` says where the prefill sequences end, because with
+    more than one of them the boundary cannot be read off the shapes -- and
+    at ``q > 1`` a decode submits as many query tokens as a small prefill
+    chunk. Shots recorded before that field existed carry 0, and there the
+    old rule applies: at most one leading request with more than ``q``
+    tokens is the prefill.
+    """
+    reqs = list(shot.requests)
+    q = max(1, getattr(shot, "decode_q_len", 1))
+    n_pf = int(getattr(shot, "n_prefill", 0) or 0)
+    if not n_pf:
+        n_pf = 1 if (reqs and reqs[0][0] > q) else 0
+    prefill = reqs[:n_pf]
+    decodes = reqs[n_pf:]
+    total = sum(c for c, _ in prefill)
+    key = prefill_key(prefill)
+    kv_dec = decodes[0][1] if decodes else 0
+    return total, key, len(decodes), kv_dec, q
+
+
 class AttentionCategory(Category):
     """Unified attention profile covering pure-prefill, pure-decode,
     and mixed kernel shapes in a single 4D grid.
@@ -305,6 +495,10 @@ class AttentionCategory(Category):
     """
 
     name = "attention"
+    # Only the attention axes: which MLP a layer runs cannot change
+    # an attention kernel's cost, so a stack shrunk for the MLP axis
+    # is measuring the same kernel several times over.
+    stack_axes = ATTENTION_AXES
     sink_filename = "attention.csv"
     label = "attention"
 
@@ -314,28 +508,79 @@ class AttentionCategory(Category):
         # max_num_seqs. The KV axes are additionally capped by
         # ``args.attention_max_kv`` (CLI-configurable) to keep
         # profile time bounded on long-context models.
-        # prefill_chunk and kv axes both default to 2.0 (doubling);
-        # override via --attention-chunk-factor / --attention-kv-factor
-        # if you want denser sampling. n_decode stays on doubling.
+        #
+        # The prefill side is swept as ``(total prefill tokens, key length)``
+        # and the *batch composition* is derived, rather than as one sequence
+        # of ``chunk`` tokens with ``kv_prefill`` of context. The old form
+        # cannot reach a batch that carries several prefill sequences at all:
+        # with one sequence the key length is always at least half the token
+        # count, so "many tokens, short keys" -- 4 requests of 500 tokens with
+        # no context -- is unreachable, and that is where 32-39% of a real
+        # run's multi-prefill steps land, at the full token budget, which is
+        # exactly where a saturated run's TTFT is set.
         chunk_vals = _geometric_grid(
             limits.max_num_batched_tokens, _ATTN_CHUNK_START,
             factor=args.attention_chunk_factor,
         )
         n_dec_vals = _geometric_grid(
             limits.max_num_seqs, _ATTN_N_DECODE_START,
+            factor=args.attention_n_factor,
+        )
+        plan = for_category(args, limits, tp)
+        base_chunks, base_decode = set(chunk_vals), set(n_dec_vals)
+        decode_anchors = {q: set(plan.decode_counts(q)) for q in args.attention_decode_q_lens}
+        chunk_vals = sorted(base_chunks | set(plan.prefill_sizes()))
+        pure_decode_vals = sorted(base_decode | {n for values in decode_anchors.values() for n in values})
+        # ``runner`` resolves this against the live engine before any grid
+        # is composed, so None here means a caller bypassed that -- and a
+        # silently wrong cap is a whole sweep at the wrong resolution.
+        assert args.attention_max_kv is not None, (
+            "attention_max_kv is unresolved; call "
+            "engine.resolve_attention_max_kv(args, limits) after probe_limits"
         )
         kv_cap = min(args.attention_max_kv, limits.max_model_len)
         kv_vals = _geometric_grid(
             kv_cap, _ATTN_KV_START, factor=args.attention_kv_factor,
         )
+        # The prefill key axis needs more reach than the decode one. A
+        # decode's key length *is* its kv, so ``kv_cap`` bounds it; a prefill
+        # sequence's is its context plus half its own chunk, so a request at
+        # the top of the kv reach carrying a full-budget chunk sits half a
+        # budget above it. Sweeping only to ``kv_cap`` would leave every such
+        # step extrapolating.
+        key_vals = _geometric_grid(
+            kv_cap + limits.max_num_batched_tokens // 2,
+            _ATTN_KV_START, factor=args.attention_kv_factor,
+        )
+        # Query tokens per decode sequence. [1] by default -- the axis
+        # multiplies the whole sweep, and it only matters for speculative
+        # decoding, whose verification step submits 1 + N queries per sequence.
+        # Set --attention-decode-q-lens to the 1+N values you intend to
+        # simulate; the published N for the four modern families are 3, 4 and
+        # 5, so "1,2,4,6,8" brackets them.
+        q_vals = sorted({max(1, int(v)) for v in args.attention_decode_q_lens})
 
         for chunk in chunk_vals:
-            for kv_p in kv_vals:
-                # When there's no prefill, sweeping kv_prefill would
+            for kv_p in key_vals:
+                # When there's no prefill, sweeping the key axis would
                 # only produce duplicate rows. Collapse to kv_p=0.
                 if chunk == 0 and kv_p != 0:
                     continue
-                for n_dec in n_dec_vals:
+                # Derive the composition that puts this shot at
+                # (sum_c=chunk, mean key=kv_p). One sequence can only reach
+                # ``key >= chunk/2``; below that the tokens have to be spread
+                # over the fewest sequences that make the per-sequence
+                # context non-negative.
+                prefill_reqs = _compose_prefill(
+                    chunk, kv_p, min_chunk=min(_ATTN_CHUNK_START, chunk) if chunk else _ATTN_CHUNK_START,
+                    max_seqs=limits.max_num_seqs,
+                )
+                if chunk > 0 and prefill_reqs is None:
+                    continue
+                # Capture anchors belong to pure regimes. Do not multiply
+                # the mixed Cartesian grid by every graph token bucket.
+                counts = pure_decode_vals if chunk == 0 else n_dec_vals if chunk in base_chunks else [0]
+                for n_dec in counts:
                     for kv_d in kv_vals:
                         if n_dec == 0 and kv_d != 0:
                             continue
@@ -365,165 +610,263 @@ class AttentionCategory(Category):
                         # the boundary (observed during skew sweeps),
                         # so we stay strictly below.
                         #
-                        # 1. Combined sum bound (advisory).
-                        if chunk + n_dec > (
-                            limits.max_num_batched_tokens + limits.max_num_seqs
-                        ):
-                            continue
                         # 2. Request count vs max_num_seqs. vLLM V1
                         # pre-allocates input_batch for MSQ sequences;
                         # MSQ itself fits, MSQ+1 overflows the buffer.
-                        n_reqs = (1 if chunk > 0 else 0) + n_dec
+                        n_reqs = len(prefill_reqs or ()) + n_dec
                         if n_reqs > limits.max_num_seqs:
                             continue
                         # 3. Per-request sequence length vs max_model_len
                         # (hardware position-embedding index).
-                        if chunk > 0 and chunk + kv_p + 1 > limits.max_model_len:
+                        # Per **sequence**, not for the batch: with the
+                        # tokens spread over several prefill sequences each
+                        # one is shorter than the batch's total.
+                        if prefill_reqs and max(
+                            c + h for c, h in prefill_reqs
+                        ) + 1 > limits.max_model_len:
                             continue
-                        if n_dec > 0 and 1 + kv_d + 1 > limits.max_model_len:
-                            continue
-                        # 4. KV cache block budget. Each request
-                        # rounds up to a whole block, so block-aligned
-                        # totals can be up to ~2× the raw KV tokens
-                        # for tiny requests. Compute exactly.
-                        def _aligned(total_len: int) -> int:
-                            return ((total_len + _BLOCK_SIZE - 1)
-                                    // _BLOCK_SIZE) * _BLOCK_SIZE
-                        prefill_block_toks = (
-                            _aligned(chunk + kv_p) if chunk > 0 else 0
+                        bs = limits.block_size
+
+                        def _aligned(total_len: int, bs: int = bs) -> int:
+                            return ((total_len + bs - 1) // bs) * bs
+                        prefill_block_toks = sum(
+                            _aligned(c + h) for c, h in (prefill_reqs or ())
                         )
-                        decode_block_toks = (
-                            n_dec * _aligned(1 + kv_d) if n_dec > 0 else 0
-                        )
-                        if (prefill_block_toks + decode_block_toks
-                                > limits.num_cache_tokens):
-                            continue
-                        yield Shot.attention(
-                            prefill_chunk=chunk,
-                            kv_prefill=kv_p,
-                            n_decode=n_dec,
-                            kv_decode=kv_d,
-                        )
+                        # Prefill has no decode-query axis. Include it once
+                        # even when only speculative decode q values are requested.
+                        for q in (q_vals if n_dec else [1]):
+                            if chunk == 0 and n_dec not in base_decode and n_dec not in decode_anchors[q]:
+                                continue
+                            # The remaining bounds are per **token**, and a
+                            # decode request submits ``q`` of them rather than
+                            # one -- so they have to sit inside this loop.
+                            # They used to sit outside it, which counted every
+                            # decode as a single token: a shot at chunk=MNBT
+                            # whose n_dec*q ran past MSQ then passed the filter
+                            # and overflowed vLLM's own buffer, surfacing hours
+                            # into a sweep as ``operands could not be broadcast
+                            # together with shapes (2304,) (2432,) (2304,)`` --
+                            # 2304 being MNBT + MSQ and 2432 the real token
+                            # count. At q=1 every bound below is identical to
+                            # what it was, so existing grids are unchanged.
+                            #
+                            # 1. Combined sum bound (advisory).
+                            if chunk + n_dec * q > (
+                                limits.max_num_batched_tokens
+                                + limits.max_num_seqs
+                            ):
+                                continue
+                            # 3b. A decode request's own sequence length.
+                            if n_dec > 0 and q + kv_d + 1 > limits.max_model_len:
+                                continue
+                            # 4. KV cache block budget. Each request rounds up
+                            # to a whole block, so block-aligned totals can be
+                            # up to ~2x the raw KV tokens for tiny requests.
+                            # Compute exactly.
+                            decode_block_toks = (
+                                n_dec * _aligned(q + kv_d) if n_dec > 0 else 0
+                            )
+                            if (prefill_block_toks + decode_block_toks
+                                    > limits.num_cache_tokens):
+                                continue
+                            yield Shot.attention_batch(
+                                prefill_reqs=prefill_reqs or [],
+                                n_decode=n_dec,
+                                kv_decode=kv_d,
+                                decode_q_len=q,
+                            )
 
     def extract_points(self, shot, timings, arch, tp):
         # Shot.attention encodes the 4D key in its request list:
-        #   requests[0] = (prefill_chunk, kv_prefill)   if chunk>0
+        #   requests[:n_prefill] = the prefill sequences, (chunk, context) each
         #   requests[k] = (1, kv_decode) for each decode, k in [1..n_decode]
-        reqs = shot.requests
-        # Reconstruct the key from the shot shape.
-        if reqs and reqs[0][0] > 1:
-            # First request is the prefill.
-            prefill_chunk, kv_prefill = reqs[0]
-            decode_reqs = reqs[1:]
-        elif reqs and reqs[0][0] == 1 and len(reqs) > 0:
-            # No prefill; everything is a decode.
-            prefill_chunk, kv_prefill = 0, 0
-            decode_reqs = reqs
-        else:
-            raise RuntimeError(f"Unexpected attention shot shape: {reqs!r}")
+        (prefill_chunk, prefill_key, n_decode,
+         kv_decode, q) = _attn_key(shot)
 
-        n_decode = len(decode_reqs)
-        # All decodes share kv_decode by construction.
-        kv_decode = decode_reqs[0][1] if decode_reqs else 0
-
-        # Attention category has exactly one layer (the attention
-        # kernel). We expect at most one sample per shot. If multiple
-        # show up (e.g., the test model accidentally has >1 layer),
-        # average them so the profile still makes sense.
-        if not timings:
-            return
-        total_us = sum(t.microseconds for t in timings) / len(timings)
-        yield AttentionPoint(
-            prefill_chunk=prefill_chunk,
-            kv_prefill=kv_prefill,
-            n_decode=n_decode,
-            kv_decode=kv_decode,
-            microseconds=total_us,
-        )
+        # One point per matched layer. This used to average every sample into
+        # a single point, which was right while the catalog was required to
+        # declare exactly one attention entry -- it compensated for a
+        # multi-layer test model handing back several samples of the same
+        # kernel. Two things changed: the timing extractor now normalizes by
+        # parent invocations, so a multi-layer run yields one sample per
+        # canonical layer rather than several, and a sparse-attention catalog
+        # declares two genuinely different kernels here. Averaging them
+        # produced a number describing neither -- measured on
+        # DeepSeek-V3.2-Exp, MLAAttention and SparseAttnIndexer collapsed into
+        # one value per key.
+        for sample in timings:
+            yield AttentionPoint(
+                layer=sample.layer,
+                prefill_chunk=prefill_chunk,
+                prefill_key=prefill_key,
+                n_decode=n_decode,
+                kv_decode=kv_decode,
+                decode_q_len=q,
+                microseconds=sample.microseconds,
+            )
 
     def catalog_slice(self, arch):
-        return _entry_dict(arch.catalog.attention)
+        return _entry_dict(arch.catalog.attention, arch)
 
     def shot_key(self, shot):
-        reqs = shot.requests
-        if reqs and reqs[0][0] > 1:
-            pc, kp = reqs[0]
-            decodes = reqs[1:]
-        else:
-            pc, kp = 0, 0
-            decodes = reqs
-        n_dec = len(decodes)
-        kv_dec = decodes[0][1] if decodes else 0
-        return (pc, kp, n_dec, kv_dec)
+        # Use the same full-precision coordinate as extract_points and the
+        # CSV sink. Rounding only the resume key loses fractional-key matches.
+        return _attn_key(shot)
 
 
 # ---------------------------------------------------------------------------
 # MoE
 # ---------------------------------------------------------------------------
 
-class ExpertCategory(Category):
-    """MoE block (gate + grouped experts), keyed by
-    (tokens, activated_experts)."""
+def _chunk_aware_grid(
+    max_value: int,
+    chunk: int | None,
+    start: int = _ATTN_CHUNK_START,
+    factor: float = 2.0,
+) -> list[int]:
+    """Grid for an axis whose cost is a staircase in ``chunk``, not a line.
 
-    name = "moe"
-    sink_filename = "moe.csv"
-    label = "moe"
+    A linear-attention prefill scan works in fixed chunks, and the measured
+    cost tracks the chunk count. On Qwen3.8-27B one token past a 64-boundary
+    costs **13.5% more** than the boundary itself, and the whole interval to
+    the next boundary is nearly flat. A plain geometric grid lands only on
+    boundaries (64, 128, 256 ...), so interpolating between two samples
+    underestimates every token count just past one -- which is most of what a
+    chunked-prefill scheduler actually produces.
+
+    So sample three things: points inside the first chunk (cost still varies
+    with tokens there), each chunk boundary, and the single token past each
+    boundary, which pins the step. Falls back to the plain geometric grid when
+    the chunk length is unknown.
+    """
+    if max_value < 1:
+        return [0]
+    if not chunk or chunk < 2:
+        return _geometric_grid(max_value, start, factor)
+
+    values: set[int] = {0}
+    # Inside the first chunk.
+    v = start
+    while v < min(chunk, max_value):
+        values.add(v)
+        v = max(v + 1, int(round(v * factor)))
+    # Boundaries, and the token that starts the next chunk.
+    c = 1
+    while c * chunk <= max_value:
+        values.add(c * chunk)
+        if c * chunk + 1 <= max_value:
+            values.add(c * chunk + 1)
+        nxt = max(c + 1, int(round(c * factor)))
+        if nxt <= c:
+            break
+        c = nxt
+    values.add(max_value)
+    return sorted(values)
+
+
+class LinearAttentionCategory(Category):
+    """Linear-attention (mamba / gated-DeltaNet) block, keyed by
+    ``(prefill_tokens, n_decode)``.
+
+    Two axes rather than attention's four, because there is no kv axis: the
+    state is fixed-size per sequence regardless of position, so cost is
+    independent of sequence length (measured: 1.1% over a 64x kv spread) and
+    no skew correction applies either.
+
+    Two axes rather than one, though, even though the prefill and decode
+    kernels *are* additive -- because **which** kernel runs depends on the mix.
+    A pure-decode batch runs a recurrent kernel; add a prefill chunk and vLLM
+    switches to a fused-gating one instead, 4.5% apart at the same decode
+    count. A pair of 1-D tables cannot represent a kernel-identity switch.
+    Same argument that justifies the unified 4-D attention grid, and cheap
+    here: ~100 shots against attention's ~1300.
+    """
+
+    name = "linear_attention"
+    # Only the attention axes: which MLP a layer runs cannot change
+    # an attention kernel's cost, so a stack shrunk for the MLP axis
+    # is measuring the same kernel several times over.
+    stack_axes = ATTENTION_AXES
+    sink_filename = "linear_attention.csv"
+    label = "linear_attention"
 
     def compose_shots(self, arch, args, limits, tp):
-        # MoE parameters come from the live HF config via RuntimeLimits,
-        # not from the yaml. If catalog.moe.* entries exist but the
-        # live config didn't expose num_experts / top_k, fail loudly.
-        if limits.num_experts is None or limits.top_k is None:
-            raise RuntimeError(
-                "catalog.moe entries are declared but the HF config did "
-                "not expose num_experts / top_k. If this model uses a "
-                "non-standard field name, add it to MOE_NUM_EXPERTS_KEYS "
-                "/ MOE_TOP_K_KEYS in profiler/config.py."
-            )
-        num_experts = limits.num_experts
-        top_k = limits.top_k
-
-        for n_tokens in _power_of_two_grid(limits.max_num_batched_tokens):
-            # Cheap guards: n_tokens must fit context (with sampler
-            # +1 headroom) + cache.
-            if n_tokens >= limits.max_model_len:
-                continue
-            if ((n_tokens + _BLOCK_SIZE - 1) // _BLOCK_SIZE) * _BLOCK_SIZE > limits.num_cache_tokens:
-                continue
-            for activated in _power_of_two_grid(num_experts):
-                # Minimum activations per call is top_k (every token
-                # votes for top_k experts).
-                if activated < top_k:
+        pre_vals = _chunk_aware_grid(
+            limits.max_num_batched_tokens, limits.linear_attn_chunk,
+            factor=args.grid_factor,
+        )
+        dec_vals = _geometric_grid(limits.max_num_seqs, _ATTN_N_DECODE_START, args.grid_factor)
+        plan = for_category(args, limits, tp)
+        base_prefill = set(pre_vals)
+        pre_vals = sorted(base_prefill | set(plan.prefill_sizes()))
+        pure_decode = sorted(set(dec_vals) | set(plan.decode_counts(1)))
+        bs = limits.block_size
+        for pre in pre_vals:
+            counts = pure_decode if pre == 0 else dec_vals if pre in base_prefill else [0]
+            for n_dec in counts:
+                if pre == 0 and n_dec == 0:
                     continue
-                # Upper bound: each token contributes top_k distinct
-                # activations, so more than n_tokens*top_k is impossible.
-                if activated > min(num_experts, n_tokens * top_k):
+                # Same feasibility rules as the attention grid, minus the kv
+                # ones: MNBT is advisory (the shot bypasses the scheduler) but
+                # bounds the grid, while max_num_seqs is a hard cap because
+                # vLLM V1 preallocates input_batch for exactly that many.
+                if pre + n_dec > (
+                    limits.max_num_batched_tokens + limits.max_num_seqs
+                ):
                     continue
-                yield Shot.moe(
-                    total_tokens=n_tokens,
-                    activated_experts=activated,
+                n_reqs = (1 if pre > 0 else 0) + n_dec
+                if n_reqs > limits.max_num_seqs:
+                    continue
+                if pre > 0 and pre + 1 > limits.max_model_len:
+                    continue
+                hist = Shot.LINEAR_ATTN_DECODE_HISTORY
+                if n_dec > 0 and hist + 1 + 1 > limits.max_model_len:
+                    continue
+                # Block budget: every request rounds up to a whole block.
+                blocks = 0
+                if pre > 0:
+                    blocks += ((pre + bs - 1) // bs) * bs
+                blocks += n_dec * (((hist + 1 + bs - 1) // bs) * bs)
+                if blocks > limits.num_cache_tokens:
+                    continue
+                yield Shot.linear_attention(
+                    prefill_tokens=pre, n_decode=n_dec,
                 )
 
     def extract_points(self, shot, timings, arch, tp):
-        total_tokens = sum(new for new, _ in shot.requests)
-        assert shot.experts is not None
-        activated = int(shot.experts["activated"])
-        if not timings:
-            return
-        sample = timings[0]
-        yield ExpertPoint(
-            tokens=total_tokens,
-            activated_experts=activated,
-            microseconds=sample.microseconds,
-        )
+        pre, n_dec = _split_linear_attention_shot(shot)
+        for sample in timings:
+            yield LinearAttentionPoint(
+                layer=sample.layer,
+                prefill_tokens=pre,
+                n_decode=n_dec,
+                microseconds=sample.microseconds,
+            )
 
     def catalog_slice(self, arch):
-        return _entry_dict(arch.catalog.moe)
+        return _entry_dict(arch.catalog.linear_attention, arch)
 
     def shot_key(self, shot):
-        total_tokens = sum(new for new, _ in shot.requests)
-        assert shot.experts is not None
-        return (total_tokens, int(shot.experts["activated"]))
+        return _split_linear_attention_shot(shot)
+
+
+def _split_linear_attention_shot(shot: Shot) -> tuple[int, int]:
+    """Recover ``(prefill_tokens, n_decode)`` from a shot's request list.
+
+    Explicit request roles retain a one-token, zero-history prefill anchor
+    even when the backend happens to execute its decode kernel for that shape.
+    The fallback reads historical shots without role metadata.
+    """
+    if shot.n_prefill:
+        return sum(n for n, _ in shot.requests[:shot.n_prefill]), len(shot.requests)-shot.n_prefill
+    pre = 0
+    n_dec = 0
+    for new, _history in shot.requests:
+        if new > 1:
+            pre += new
+        else:
+            n_dec += 1
+    return (pre, n_dec)
 
 
 # ---------------------------------------------------------------------------
@@ -534,10 +877,7 @@ def categories_for(arch: Architecture, tp: int) -> list[Category]:
     """Return the list of categories that should run for this (arch, tp).
 
     Excludes:
-      * Any category whose catalog slice is empty (e.g., ExpertCategory
-        for a dense model).
-      * ExpertCategory for tp != 1 (MoE is profiled once at tp=1;
-        simulator scales per-expert time by ep_size).
+      * Any category whose catalog slice is empty.
       * Any category for which every matching layer is tp_stable AND
         tp != 1 (replicate_tp_stable will fill it in from tp=1).
     """
@@ -546,12 +886,11 @@ def categories_for(arch: Architecture, tp: int) -> list[Category]:
         (DenseCategory(), arch.catalog.dense),
         (SequenceCategory(), arch.catalog.per_sequence),
         (AttentionCategory(), arch.catalog.attention),
-        (ExpertCategory(), arch.catalog.moe),
+        (LinearAttentionCategory(), arch.catalog.linear_attention),
+        (MtpCategory(), arch.catalog.mtp),
     ]
     for cat, entries in registry:
         if not entries:
-            continue
-        if isinstance(cat, ExpertCategory) and tp != 1:
             continue
         if tp != 1 and all(e.tp_stable for e in entries.values()):
             continue
@@ -564,5 +903,6 @@ CATEGORY_BY_NAME: dict[str, type[Category]] = {
     DenseCategory.name: DenseCategory,
     SequenceCategory.name: SequenceCategory,
     AttentionCategory.name: AttentionCategory,
-    ExpertCategory.name: ExpertCategory,
+    LinearAttentionCategory.name: LinearAttentionCategory,
+    MtpCategory.name: MtpCategory,
 }

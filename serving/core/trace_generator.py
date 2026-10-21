@@ -1,10 +1,16 @@
+import logging
 import os
-import re
+import sys
 from .request import *
 from .utils import *
+from .utils import (
+    _load_architecture, _stack_module, get_architecture, get_layer_stack,
+    num_experts as utils_num_experts, config_weight_dtype, config_kv_cache_dtype,
+)
 import pandas as pd
 import yaml
-from .memory_model import calculate_sizes, _resolve_weight_fp, _resolve_moe_weight_fp
+from .memory_model import calculate_sizes
+from .communication import dtype_bytes, vocab_shard_size
 from .gate_function import GateRouter
 from .config_builder import get_device
 from .power_model import PowerModel, total_ring_data
@@ -12,24 +18,15 @@ from .pim_model import PIMModel
 from .logger import get_logger
 from .run_paths import input_path
 import bisect
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from profiler.core.attention_shape import prefill_key as _prefill_key
 
 # ----------------------------------------------------------------------
 # Global in-memory cache for the profiler's per-category performance DB.
 # key: (hardware, model, variant)
-# value: dict with keys {meta, architecture, catalog, sequence, tables}
+# value: dict with keys {meta, architecture, layer_stack, tables}
 # ----------------------------------------------------------------------
 _perf_db_cache = {}
-
-# Dense-layer aliases: canonical layers that are structurally identical to
-# another captured layer, which the profiler's repr-based matcher cannot tell
-# apart (identical module repr, so `repr_match` has nothing to key on). Hydrated
-# into the dense table at load time so both _layer_available() and
-# _lookup_dense() resolve them transparently, with no re-profiling.
-# DeepSeek's final RMSNorm ('model.norm', emitted as `final_layernorm`) has the
-# same repr as the per-layer `layernorm`, so it never gets its own profile row;
-# it is the same op with the same cost, so we alias it to `layernorm`.
-_DENSE_ALIASES = {"final_layernorm": "layernorm"}
 
 logger = get_logger("TraceGenerator")
 
@@ -59,31 +56,27 @@ def _short_dtype(d):
     return _DTYPE_SHORT.get(str(d), str(d))
 
 
-def resolve_variant(dtype, kv_cache_dtype, model_config=None):
-    """Compute the profiler's variant folder name from runtime dtype
-    choices. Matches ``ProfileArgs.effective_variant`` in the profiler.
+def resolve_variant(model_config):
+    """The profiler's variant folder name for a checkpoint.
+
+    A pure function of the model config, because both dtypes it is built from
+    are. Neither is a runtime choice any more: ``config_weight_dtype`` and
+    ``config_kv_cache_dtype`` read the checkpoint, so one model config names
+    exactly one folder and there is no dtype to thread through the call.
+
+    The profiler can still *write* other folders for the same model -- its
+    ``ProfileArgs.effective_variant`` honours ``--variant``, ``--dtype`` and
+    ``--kv-cache-dtype``, which is how a deliberate second precision gets
+    measured and kept beside the first. The simulator simply never asks for
+    one: it reads the folder the checkpoint names, and says so loudly when
+    that folder is missing.
     """
-    weight = dtype
-    if not weight and model_config is not None:
-        weight = model_config.get("torch_dtype")
+    weight = config_weight_dtype(model_config)
     parts = [_short_dtype(weight) if weight else "default"]
+    kv_cache_dtype = config_kv_cache_dtype(model_config)
     if kv_cache_dtype and kv_cache_dtype != "auto":
         parts.append(f"kv{_short_dtype(kv_cache_dtype)}")
     return "-".join(parts)
-
-
-def _arch_yaml_path(model_type):
-    base = os.path.dirname(os.path.abspath(__file__))
-    serving_dir = os.path.dirname(base)
-    repo_root = os.path.dirname(serving_dir)
-    candidate_paths = [
-        os.path.join(repo_root, "profiler", "models", f"{model_type}.yaml"),
-        os.path.join(serving_dir, "profiler", "models", f"{model_type}.yaml"),
-    ]
-    for path in candidate_paths:
-        if os.path.isfile(path):
-            return path
-    return candidate_paths[0]
 
 
 def _variant_root(hardware, model, variant):
@@ -102,9 +95,7 @@ class TraceCtx:
     config: dict
     perf_db: dict
     node_id: int
-    fp: int                # bytes per activation element (compute dtype)
-    weight_fp: int         # bytes per element for quantizable GEMM weights (W8A16 fp8 -> 1)
-    moe_weight_fp: int     # bytes per element for routed-MoE-expert weights (DeepSeek-V4 fp4 -> 0.5; else == weight_fp)
+    fp: int
     placement: dict
     gate: object  # GateRouter or None
     enable_attn_offloading: bool
@@ -115,17 +106,22 @@ class TraceCtx:
     kv_head: int
     head_dim: int
     is_moe: bool
+    kv_fp: int    # bytes per KV element (1 for fp8, else fp) -- P/D transfer sizing
     pd_type: str  # 'prefill', 'decode', or None
     tp_size: int       # tensor parallel degree (for ALLREDUCE on attention/FFN)
     pp_size: int       # pipeline parallel degree
     local_ep: int      # expert parallel degree within this instance
     ep_total: int      # total EP degree across DP group
+    dp_rank: int       # position within this DP group, not the instance id
     tp_dim: list       # involved_dim for TP collectives (ALLREDUCE), None = all dims
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
+    num_speculative_tokens: int  # draft length N; the drafter runs N times per
+                                 # step, so this is how many passes to emit
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
-    first_k_dense_replace: int  # DeepSeek-V3-style hybrid MoE: layers [0, first_k_dense_replace) run mlp_dense, the rest run mlp_moe. 0 disables (use is_moe flag globally).
-    sliding_window: int  # DeepSeek-V4: attention KV is bounded to the last ``sliding_window`` tokens. 0 disables (V3 / dense, unbounded KV).
-    compress_ratios: list  # DeepSeek-V4: per-layer compression factors. Layers with value 4 instantiate a DeepseekV4Indexer (use ``pre_attn_indexed`` sequence); other values skip the indexer (use ``pre_attn`` sequence). Empty list disables (non-V4 models).
+    dp_min_total_len: int  # smallest member's total_len in the DP round (0 = DP inactive). Only the EP collectives read it: they are ragged, so their cost is set by the worst-off rank, not the average one. Equals max on a padded round.
+    dp_token_counts: tuple = ()  # Authoritative padded model rows in DP-rank order.
+    component_sizes: object = None  # Explicit selected-runtime logical boundaries.
+    duration_replay_only: bool = False  # Explicitly bypasses any serving/capacity support claim.
 
 
 @dataclass
@@ -134,14 +130,32 @@ class BatchCtx:
     batch: object  # Batch
     total_len: int
     prefill_chunk: int  # sum(prefill_q_list): new prefill tokens this step
-    kv_prefill: int     # sum(prefill_k_list): existing kv history for prefill reqs
+    kv_prefill: int     # sum(prefill_k_list): total kv the prefills already
+                        # hold. A length, used for tensor sizing -- not the
+                        # attention lookup, which needs the mean below.
+    # The prefill side's key axis: the query-weighted mean over this step's
+    # prefill sequences of how far their queries look back -- the context
+    # plus half its own chunk, since causal masking means the average query
+    # in a chunk sees half of it. It replaces ``sum(prefill_k_list)``, which
+    # described one sequence and, on a step carrying several, added their
+    # contexts into a number describing none of them.
+    prefill_key: float
+    # The same, with each sequence's value first clipped to the checkpoint's
+    # key bound. Both are carried because the bound applies per **kernel**:
+    # a sparse model's attention saturates in this quantity and its indexer
+    # does not. Clipping has to happen per sequence and before the mean --
+    # mean(min(x, cap)) is not min(mean(x), cap).
+    prefill_key_capped: float
     n_decode: int       # number of decode requests
     kv_decode_mean: int # mean decode kv length (4D grid carries one value)
     kv_decode_max: int  # max decode kv length (for skew correction)
-    kv_decode_min: int  # min decode kv length (for skew_rate in skew correction)
+    kv_decode_min: int  # min decode kv length; the skew key no longer
+                        # reads it, but the DEBUG batch-shape and skew
+                        # lines print it so a shape can be re-fired
     lm_head_len: int    # number of sequences
     decode_lens: list   # per-PIM-channel decode lengths (None if no PIM)
     channel_split: int  # PIM channel split factor
+    decode_q_len: int = 1  # query tokens per decode sequence (1 + N under spec decode)
 
 
 @dataclass
@@ -172,99 +186,43 @@ class PowerAccumulator:
 #     meta.yaml                       profiler settings, effective engine kwargs
 #     tp<N>/dense.csv                 layer, tokens, time_us
 #     tp<N>/per_sequence.csv          layer, sequences, time_us
-#     tp<N>/attention.csv             prefill_chunk, kv_prefill, n_decode, kv_decode, time_us
+#     tp<N>/attention.csv             prefill_chunk, prefill_key, n_decode, kv_decode, time_us
 #     tp<N>/moe.csv                   tokens, activated_experts, time_us    (MoE only)
 #
-# Architecture structure (catalog + sequence) lives in the profiler's
-# profiler/models/<model_type>.yaml and drives which canonical
-# layers the simulator emits.
-
-
-def _load_architecture(model_type):
-    """Load catalog + sequence from profiler/models/<model_type>.yaml."""
-    path = _arch_yaml_path(model_type)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            f"Architecture yaml not found for model_type={model_type!r} at {path}. "
-            f"Add profiler/models/{model_type}.yaml describing the architecture."
-        )
-    with open(path, "r") as f:
-        arch = yaml.safe_load(f)
-    if "catalog" not in arch or "sequence" not in arch:
-        raise KeyError(
-            f"Architecture yaml {path} must define both 'catalog' and 'sequence'."
-        )
-    return arch
-
-
 def _load_meta(variant_root):
     path = os.path.join(variant_root, "meta.yaml")
     if not os.path.isfile(path):
         raise FileNotFoundError(
             f"meta.yaml missing at {path}. Re-run the profiler to produce it."
         )
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+    from profiler.core.bundle_metadata import read_bundle
+    return read_bundle(variant_root)
 
 
 def _hydrate_skew_fit_tables(meta, variant_root):
-    """Load each TP's per-bucket alpha table from CSV into the meta dict.
-
-    Newer profile runs move the (1k+ rows per TP) ``alpha_by_bucket``
-    mapping out of meta.yaml into ``tp{N}/skew_fit.csv``. This helper
-    reads those CSVs and materialises the dict in-place so
-    ``_skew_alpha`` finds it where it used to be. Older meta.yamls
-    that still inline the dict are left untouched.
-    """
+    """Load only reference-aligned tables. Disabled bundles need no migration."""
     fit = (meta or {}).get("skew_fit") if isinstance(meta, dict) else None
     if not fit or not fit.get("enabled"):
         return
+    from profiler.core.skew_calibration import SCHEMA, checksum, lookup_fingerprint, read_table
     per_tp = fit.get("per_tp")
-    if not isinstance(per_tp, dict):
-        return
+    if not isinstance(per_tp, dict) or not per_tp:
+        raise ValueError("Enabled skew requires calibrated TP tables; run profiler refit-skew")
     for tp_key, entry in per_tp.items():
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("alpha_by_bucket"):
-            continue
-        rel = entry.get("bucket_table")
-        if not rel:
-            continue
-        csv_path = os.path.join(variant_root, rel)
-        if not os.path.isfile(csv_path):
-            logger.warning(
-                "skew_fit: tp=%s bucket_table %s missing — falling back to "
-                "alpha_default", tp_key, csv_path,
-            )
-            continue
-        alphas, counts = _read_skew_fit_csv(csv_path)
-        entry["alpha_by_bucket"] = alphas
-        entry["n_by_bucket"] = counts
-
-
-def _read_skew_fit_csv(path):
-    """Return (alpha_by_bucket, n_by_bucket) keyed by the pipe-delimited
-    bucket string used by ``_skew_alpha``.
-    """
-    df = pd.read_csv(path)
-    alphas: dict = {}
-    counts: dict = {}
-    for row in df.itertuples(index=False):
-        raw = getattr(row, "raw_key", None)
-        if isinstance(raw, str) and raw:
-            key = raw
-        else:
-            key = (
-                f"pc={int(row.pc)}|{row.n_label}|{row.skew_rate_label}"
-                f"|{row.kv_big_label}|{row.kp_label}"
-            )
-        alphas[key] = float(row.alpha)
-        if hasattr(row, "n_samples"):
-            try:
-                counts[key] = int(row.n_samples)
-            except (TypeError, ValueError):
-                pass
-    return alphas, counts
+        if not isinstance(entry, dict) or entry.get("schema") != SCHEMA:
+            raise ValueError("Legacy skew fits are no longer supported; run profiler refit-skew")
+        expected = {k: meta[k] for k in ("hardware", "model", "variant")}
+        expected["tp"] = int(tp_key)
+        if entry.get("identity") != expected:
+            raise ValueError("Skew calibration profile/TP identity does not match meta.yaml")
+        reference = entry["reference"]
+        attention_path = os.path.join(variant_root, f"tp{int(tp_key)}", "attention.csv")
+        csv_path = os.path.join(variant_root, entry["bucket_table"])
+        if (checksum(attention_path) != reference["attention_sha256"]
+                or lookup_fingerprint() != reference["lookup_sha256"]
+                or checksum(csv_path) != entry["bucket_table_sha256"]):
+            raise ValueError("Stale skew calibration: run profiler refit-skew for this bundle")
+        entry["calibration"] = read_table(csv_path, entry)
 
 
 def _read_category_csv(path, key_cols):
@@ -283,65 +241,218 @@ def _read_category_csv(path, key_cols):
 
 
 def _build_1d_table(df, layer_col, key_col):
-    """Dense / per-sequence: per-layer sorted (keys, values) table."""
+    """Dense / per-sequence: per-layer sorted (keys, values) table.
+
+    Built from column lists in one pass rather than through
+    ``groupby``/``sort_values``/``drop_duplicates``. pandas spends roughly
+    37 us per row on that path, which put the attention table alone at
+    ~693 ms per ``tp<N>/`` folder; the same construction in plain Python
+    is ~9 ms and yields an identical structure.
+
+    Duplicate keys resolve last-wins. That is deterministic, where the
+    pandas path was not: ``sort_values`` defaults to an unstable
+    quicksort, so which of two rows sharing a key survived
+    ``drop_duplicates`` was unspecified. No bundle under
+    ``profiler/perf/`` currently carries a duplicate key in any category,
+    so this changes no existing lookup; for a CSV that gained rows from a
+    partial re-profile, last-wins takes the newer measurement.
+    """
+    grouped = {}
+    for layer, key, val in zip(df[layer_col].tolist(),
+                               df[key_col].astype(int).tolist(),
+                               df["latency_ns"].astype(int).tolist()):
+        grouped.setdefault(str(layer), {})[key] = val
     out = {}
-    for layer, g in df.groupby(layer_col):
-        g = g.sort_values(key_col).drop_duplicates(subset=[key_col])
-        out[str(layer)] = {
-            "keys": g[key_col].astype(int).tolist(),
-            "values": g["latency_ns"].astype(int).tolist(),
-        }
+    for layer, by_key in grouped.items():
+        keys = sorted(by_key)
+        out[layer] = {"keys": keys, "values": [by_key[k] for k in keys]}
     return out
 
 
 def _build_attention_table(df):
     """4D attention table indexed by (prefill_chunk, n_decode) slices,
-    each slice a 2D grid over (kv_prefill, kv_decode). The profiler
+    each slice a 2D grid over (prefill_key, kv_decode). The profiler
     sweeps all four axes on doubling grids, so the lookup interpolates
     in log-space on each axis (plus a zero-pinned fallback when the
     axis value is 0, which always comes from an exact sample).
     """
-    pc_vals = sorted({int(v) for v in df["prefill_chunk"].tolist()})
-    nd_vals = sorted({int(v) for v in df["n_decode"].tolist()})
+    pc_col = df["prefill_chunk"].astype(int).tolist()
+    nd_col = df["n_decode"].astype(int).tolist()
+    kd_col = df["kv_decode"].astype(int).tolist()
+    lat_col = df["latency_ns"].astype(int).tolist()
+    # The prefill key axis. A bundle swept before it existed carries
+    # ``kv_prefill``, one sequence's context, and every such shot had exactly
+    # one prefill sequence -- so the axis value is recoverable exactly:
+    # context plus half the chunk. Relabelling rather than refusing keeps
+    # every committed bundle readable, at the cost of the coverage a
+    # single-sequence sweep cannot reach (one sequence can only ever reach
+    # ``key >= chunk/2``, so "many tokens, short keys" is absent and a step
+    # carrying several prefills extrapolates there).
+    if "prefill_key" in df.columns:
+        kp_col = df["prefill_key"].astype(float).tolist()
+    else:
+        kp_col = [k + c / 2.0 for k, c in
+                  zip(df["kv_prefill"].astype(float).tolist(), pc_col)]
+
+    # (prefill_chunk, n_decode) -> prefill_key -> kv_decode -> latency_ns.
+    # One pass in plain Python; see _build_1d_table for why not groupby.
+    grouped = {}
+    for pc, nd, kp, kd, lat in zip(pc_col, nd_col, kp_col, kd_col, lat_col):
+        grouped.setdefault((pc, nd), {}).setdefault(kp, {})[kd] = lat
+
     slices = {}
-    for (pc, nd), g in df.groupby(["prefill_chunk", "n_decode"]):
-        slice_tbl = {}
-        for kp, g2 in g.groupby("kv_prefill"):
-            g2 = g2.sort_values("kv_decode").drop_duplicates(subset=["kv_decode"])
-            slice_tbl[int(kp)] = {
-                "keys": g2["kv_decode"].astype(int).tolist(),
-                "values": g2["latency_ns"].astype(int).tolist(),
-            }
-        kp_vals_s = sorted(slice_tbl.keys())
-        slices[(int(pc), int(nd))] = {
-            "kv_prefill_vals": kp_vals_s,
-            "rows": [slice_tbl[kp] for kp in kp_vals_s],
-        }
+    for key, by_kp in grouped.items():
+        kp_vals_s = sorted(by_kp)
+        rows = []
+        for kp in kp_vals_s:
+            by_kd = by_kp[kp]
+            kd_keys = sorted(by_kd)
+            rows.append({"keys": kd_keys, "values": [by_kd[k] for k in kd_keys]})
+        slices[key] = {"prefill_key_vals": kp_vals_s, "rows": rows}
+
     return {
-        "pc_vals": pc_vals, "nd_vals": nd_vals,
+        "pc_vals": sorted(set(pc_col)), "nd_vals": sorted(set(nd_col)),
         "pc_nd_pairs": sorted(slices.keys()),
         "slices": slices,
     }
 
 
+def _build_attention_tables_by_layer(df):
+    """``{layer_name: attention_table}``, one per kernel in the profile.
+
+    A bundle profiled before the attention CSV grew a ``layer`` column has
+    exactly one kernel in it, so every row belongs to ``attention`` and the
+    resulting table is identical to what ``_build_attention_table`` returned
+    for the whole frame. That is the invariant this function has to hold:
+    every committed bundle must come out byte-identical.
+
+    Newer bundles name the kernel per row, because a sparse-attention model
+    runs an indexer over the whole KV before its top-k selection. It keys on
+    the same four axes as the attention kernel and runs on the same layers,
+    but it is different work -- merging the two gave a value describing
+    neither.
+    """
+    if "layer" not in df.columns:
+        return {"attention": _build_attention_tables_by_q(df)}
+    out = {}
+    for layer in df["layer"].astype(str).unique().tolist():
+        out[layer] = _build_attention_tables_by_q(
+            df[df["layer"].astype(str) == layer])
+    return out
+
+
+def _build_attention_tables_by_q(df):
+    """``{decode_q_len: 4-D table}`` for one kernel.
+
+    The fifth axis is how many query tokens each decode sequence submits: 1 for
+    ordinary decoding, ``1 + num_speculative_tokens`` for a speculative
+    verification step. It wraps the 4-D table rather than joining it because
+    the other four axes mean the same thing at every q, and a bundle profiled
+    before the column existed is all q=1 -- so it comes back as ``{1: table}``
+    and every lookup against it is what it always was.
+    """
+    if "decode_q_len" not in df.columns:
+        return {1: _build_attention_table(df)}
+    out = {}
+    for q in df["decode_q_len"].astype(int).unique().tolist():
+        out[int(q)] = _build_attention_table(df[df["decode_q_len"].astype(int) == q])
+    return out
+
+
+def _linear_attn_regime(prefill_tokens, n_decode):
+    """Which kernel regime a batch puts a linear-attention block in.
+
+    A gated-DeltaNet block runs a *different set of kernels* for a pure
+    prefill, a pure decode and a mixed batch -- not the same kernel at
+    different sizes. That is why the catalog binds three names and why the
+    profiler measures each only where it fires.
+    """
+    if prefill_tokens > 0 and n_decode > 0:
+        return "mixed"
+    return "prefill" if prefill_tokens > 0 else "decode"
+
+
+def _build_linear_attention_tables_by_layer(df):
+    """``{layer: {regime: 2-D table}}`` from ``linear_attention.csv``.
+
+    Keyed by regime as well as by layer because a kernel that did not fire in
+    a regime has **no rows** for it, and that absence is the profile telling us
+    it does not run there -- ``gdn_decode`` has only ``prefill_tokens == 0``
+    rows, ``gdn_decode_mixed`` only rows with both. Interpolating across the
+    gap would invent a cost for a kernel that never executes.
+    """
+    out = {}
+    layers = df["layer"].astype(str).tolist()
+    pfs = df["prefill_tokens"].astype(int).tolist()
+    nds = df["n_decode"].astype(int).tolist()
+    lats = df["latency_ns"].astype(int).tolist()
+    grouped = {}
+    for layer, pf, nd, lat in zip(layers, pfs, nds, lats):
+        regime = _linear_attn_regime(pf, nd)
+        grouped.setdefault(layer, {}).setdefault(regime, {}).setdefault(nd, {})[pf] = lat
+    for layer, by_regime in grouped.items():
+        out[layer] = {}
+        for regime, by_nd in by_regime.items():
+            nd_vals = sorted(by_nd)
+            rows = []
+            for nd in nd_vals:
+                by_pf = by_nd[nd]
+                pf_keys = sorted(by_pf)
+                rows.append({"keys": pf_keys,
+                             "values": [by_pf[k] for k in pf_keys]})
+            out[layer][regime] = {"n_decode_vals": nd_vals, "rows": rows}
+    return out
+
+
 def _build_moe_table(df):
-    """MoE table: (tokens, activated_experts) → latency_ns."""
-    tokens_by_experts = {}
-    for ae, g in df.groupby("activated_experts"):
-        g = g.sort_values("tokens").drop_duplicates(subset=["tokens"])
-        tokens_by_experts[int(ae)] = {
-            "keys": g["tokens"].astype(int).tolist(),
-            "values": g["latency_ns"].astype(int).tolist(),
-        }
-    ae_vals = sorted(tokens_by_experts.keys())
-    return {"activated_experts_vals": ae_vals,
-            "rows": [tokens_by_experts[a] for a in ae_vals]}
+    """MoE tables keyed by EP degree: ``{ep: (tokens, activated) -> ns}``.
+
+    An EP rank runs a *slice* of the MoE block -- ``E/ep`` local experts, and
+    ``k/ep`` of a token's k expert assignments -- so its cost is not the whole
+    block's, and the difference is not a scale factor. It shows up hardest on
+    the ``activated_experts`` axis: profiled at ep=1 the axis floor is ``top_k``
+    (a token cannot activate fewer), while a rank routinely activates fewer
+    than that, and the lookup clamps below the floor rather than
+    extrapolating. Measured on a GLM-5 EP=2 run, 98.4% of MoE lookups asked
+    for ``activated=4`` against a floor of 8, over-charging the MoE term by
+    1.4x-3.7x depending on the per-rank token count.
+
+    A bundle written before the axis existed has no ``ep`` column; it is the
+    whole model on one rank, so it reads as ep=1 and behaves exactly as before.
+    """
+    eps = (df["ep"].astype(int).tolist() if "ep" in df.columns
+           else [1] * len(df))
+    grouped: dict[int, dict] = {}
+    for ep, ae, tok, lat in zip(eps,
+                                df["activated_experts"].astype(int).tolist(),
+                                df["tokens"].astype(int).tolist(),
+                                df["latency_ns"].astype(int).tolist()):
+        grouped.setdefault(ep, {}).setdefault(ae, {})[tok] = lat
+    out = {}
+    for ep, by_ae in grouped.items():
+        ae_vals = sorted(by_ae)
+        rows = []
+        for ae in ae_vals:
+            by_tok = by_ae[ae]
+            tok_keys = sorted(by_tok)
+            rows.append({"keys": tok_keys,
+                         "values": [by_tok[k] for k in tok_keys]})
+        out[ep] = {"activated_experts_vals": ae_vals, "rows": rows}
+    return out
 
 
-def _load_perf_db(hardware, model, variant, tp_needed, model_type):
+
+
+def _load_perf_db(hardware, model, variant, tp_needed, model_type,
+                  model_config=None):
     """Load the per-category perf DB for a (hardware, model, variant)
     tuple and cache it. ``tp_needed`` is a set of int TP degrees the
     simulator will query; each must have its own ``tp<N>/`` folder.
+
+    ``model_config`` is resolved once into a per-layer block list
+    (``layer_stack``) and cached with the rest, because it answers a
+    per-model question -- which block each decoder layer runs -- that the
+    emit path asks once per layer per iteration.
     """
     cache_key = (hardware, model, variant)
     if cache_key in _perf_db_cache:
@@ -352,67 +463,31 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
     root = _variant_root(hardware, model, variant)
     if not os.path.isdir(root):
         raise FileNotFoundError(
-            f"Profile variant folder not found: {root}. Run the profiler "
-            f"with matching --dtype / --kv-cache-dtype, or pick an existing "
-            f"variant under {os.path.dirname(root)}."
+            f"Profile variant folder not found: {root}. The variant name is "
+            f"derived from the checkpoint (weight dtype, plus a -kv<dtype> "
+            f"suffix when it declares a quantized KV cache), so the simulator "
+            f"cannot be pointed at a different one -- profile this model with "
+            f"the profiler's defaults, which name the same folder. Existing "
+            f"variants: {os.path.dirname(root)}."
         )
 
     meta = _load_meta(root)
+    calibrated = any(isinstance(entry, dict) and entry.get("schema")
+                     for entry in ((meta.get("skew_fit") or {}).get("per_tp") or {}).values())
+    if calibrated:
+        for name, expected in (("hardware", hardware), ("model", model), ("variant", variant)):
+            if meta.get(name) != expected:
+                raise ValueError(f"Profile metadata {name} does not match the requested bundle")
     _hydrate_skew_fit_tables(meta, root)
     arch = _load_architecture(model_type)
-    tables_per_tp = {}
     available_tps = []
     for entry in sorted(os.listdir(root)):
         if not entry.startswith("tp"):
             continue
         try:
-            tp = int(entry[2:])
+            available_tps.append(int(entry[2:]))
         except ValueError:
             continue
-        tp_dir = os.path.join(root, entry)
-        tables = {}
-
-        dense_df = _read_category_csv(os.path.join(tp_dir, "dense.csv"), None)
-        if dense_df is not None:
-            tables["dense"] = _build_1d_table(dense_df, "layer", "tokens")
-            # Resolve dense aliases (see _DENSE_ALIASES): if an aliased layer
-            # was not captured but its source layer was, reuse the source row.
-            for alias, src in _DENSE_ALIASES.items():
-                d = tables["dense"]
-                if alias not in d and src in d:
-                    d[alias] = d[src]
-
-        per_seq_df = _read_category_csv(os.path.join(tp_dir, "per_sequence.csv"), None)
-        if per_seq_df is not None:
-            tables["per_sequence"] = _build_1d_table(per_seq_df, "layer", "sequences")
-
-        attn_df = _read_category_csv(os.path.join(tp_dir, "attention.csv"), None)
-        if attn_df is not None:
-            tables["attention"] = _build_attention_table(attn_df)
-
-        moe_df = _read_category_csv(os.path.join(tp_dir, "moe.csv"), None)
-        if moe_df is not None:
-            tables["moe"] = _build_moe_table(moe_df)
-
-        tables_per_tp[tp] = tables
-        available_tps.append(tp)
-
-    # Per-rank-shape MoE profiles keyed by (tp, ep): ``{root}/moe/tp{T}_ep{E}.csv``,
-    # written by the per-rank profiler pass (num_experts=E/ep, moe_intermediate/=moe_tp;
-    # see MOE_PER_RANK_PROFILING.md). Present only when that pass has been run; when
-    # absent the simulator falls back to the tp1 (full-model) ``moe.csv`` — byte-identical
-    # to prior behavior. This is the clean Fix 2 (EP-on FIXED-over-local) / Fix 4 (EP-off
-    # TP-shard) path: with a per-rank table the cost is measured at the real local shape.
-    moe_by_tpep = {}
-    moe_dir = os.path.join(root, "moe")
-    if os.path.isdir(moe_dir):
-        for entry in sorted(os.listdir(moe_dir)):
-            m = re.match(r"tp(\d+)_ep(\d+)$", entry)
-            if m is None:
-                continue
-            df = _read_category_csv(os.path.join(moe_dir, entry, "moe.csv"), None)
-            if df is not None:
-                moe_by_tpep[(int(m.group(1)), int(m.group(2)))] = _build_moe_table(df)
 
     perf_db = {
         "meta": meta,
@@ -420,10 +495,50 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
         "variant": variant,
         "hardware": hardware,
         "model": model,
+        "root": root,
         "available_tps": sorted(available_tps),
-        "tables": tables_per_tp,
-        "moe_by_tpep": moe_by_tpep,
+        # Per-TP category tables, filled in by _tp_tables on first lookup.
+        "tables": {},
+        # The per-batch TP view below is a shallow copy. Allocate the lazy
+        # caches here so all views reuse validation and sequence substitutions
+        # rather than populating an ephemeral view or losing byte contracts.
+        "component_sizes": {},
+        "component_layout_choices": {},
+        "component_layout_catalogs": {},
+        "component_layout_sequences": {},
+        "component_layout_sites": {},
+        "native_moe_index_present": {},
+        "native_moe_components": {},
+        # One LayerSpec per decoder layer, from the checkpoint's own config.
+        # Empty only when the config declares no num_hidden_layers, which the
+        # simulator has already failed on by the time it gets here.
+        "layer_stack": (_stack_module().resolve_stack(model_config)
+                        if model_config else []),
+        # How many key tokens a query can attend to, when the checkpoint
+        # bounds it (``index_topk``, or M3's selected-block count times its
+        # block size). None on a dense model. Read here rather than per
+        # lookup: it is a constant of the checkpoint, and the catalog says
+        # which kernels are subject to it.
+        "key_saturation": (
+            _stack_module().probe_key_saturation(
+                _stack_module().text_config(model_config))
+            if model_config else None),
     }
+    from profiler.core import attention_lookup as lookup_contract
+    lookup_records = lookup_contract.resolve(root, model_config, arch, meta=meta)
+    perf_db["key_saturation_by_tp"] = {
+        tp: lookup_contract.cap_for(lookup_records, tp, model_config) for tp in available_tps}
+    for tp, entry in ((meta.get("skew_fit") or {}).get("per_tp") or {}).items():
+        if not isinstance(entry, dict) or not entry.get("calibration"):
+            continue
+        if int(tp) in lookup_records:
+            lookup_contract.check_skew(os.path.join(root, f'tp{int(tp)}'), lookup_records[int(tp)]['semantic_sha256'])
+        reference = entry["reference"]
+        attention = _component_layout_catalog(perf_db, int(tp), "attention")
+        saturation = {k: bool(v.get("key_saturates")) for k, v in attention.items()}
+        if (reference["key_saturation"] != perf_db["key_saturation_by_tp"].get(int(tp), perf_db["key_saturation"])
+                or reference["saturation_by_layer"] != saturation):
+            raise ValueError("Attention window/catalog changed; run profiler refit-skew")
     _perf_db_cache[cache_key] = perf_db
     _check_tp_coverage(perf_db, tp_needed, hardware, model, variant)
     return perf_db
@@ -437,6 +552,59 @@ def _check_tp_coverage(perf_db, tp_needed, hardware, model, variant):
             f"perf/{hardware}/{model}/{variant}/. Re-run the profiler with "
             f"TP_DEGREES including {','.join(str(t) for t in missing)}."
         )
+
+
+def profiled_block_size(hardware, model, variant, tp=1):
+    """KV block size the engine settled on when this bundle was profiled at
+    ``tp``.
+
+    ``None`` when the bundle predates the field or cannot be read. vLLM derives
+    the block size rather than taking it: the backend declares what it supports
+    (MiniMax-M3's sparse attention accepts only 128, one sparse block per KV
+    page) and a hybrid stack enlarges the attention block until an attention
+    page costs at least as many bytes as a mamba state page -- 784 on
+    Qwen3.8-27B against the 16 typically requested. Reading it back from the
+    profile is how the simulator gets the same answer without reimplementing
+    vLLM's backend selection, and it is model-and-backend specific, which is
+    exactly what determines it.
+    """
+    # Both the cwd-relative root (the simulator chdirs into astra-sim/ before
+    # this normally runs) and one derived from __file__. A silent miss here
+    # would hand back the fallback block size with no signal, which is the
+    # failure this function exists to prevent.
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    roots = [
+        _variant_root(hardware, model, variant),
+        os.path.join(repo_root, "profiler", "perf", hardware, model, variant),
+    ]
+    meta = None
+    for root in roots:
+        try:
+            meta = _load_meta(root)
+            break
+        except (FileNotFoundError, OSError):
+            continue
+    if meta is None:
+        return None
+    resolved = (meta or {}).get("engine_resolved") or {}
+    # Per-TP since the resolved size is a per-rank fact: both the mamba page
+    # and the attention page scale with the shard. A bundle written before the
+    # split carries one flat value, which is whichever TP ran last -- read it
+    # as a fallback rather than ignoring it, but only after the exact key.
+    per_tp = resolved.get("per_tp") or {}
+    raw = None
+    if isinstance(per_tp, dict):
+        raw = per_tp.get(tp, per_tp.get(str(tp)))
+    if isinstance(raw, dict):
+        raw = raw.get("block_size")
+    elif raw is None:
+        raw = resolved.get("block_size")
+    try:
+        bs = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return bs if bs > 0 else None
 
 
 def warn_if_runtime_exceeds_profiled(perf_db, runtime_max_num_batched_tokens,
@@ -509,17 +677,73 @@ def _lookup_1d(keys, values, query):
     return _linear_interpolate(keys[lo], values[lo], keys[hi], values[hi], query)
 
 
+def _build_tp_tables(tp_dir):
+    """Build every category table present in one ``tp<N>/`` folder."""
+    tables = {}
+    dense_df = _read_category_csv(os.path.join(tp_dir, "dense.csv"), None)
+    if dense_df is not None:
+        tables["dense"] = _build_1d_table(dense_df, "layer", "tokens")
+
+    per_seq_df = _read_category_csv(os.path.join(tp_dir, "per_sequence.csv"), None)
+    if per_seq_df is not None:
+        tables["per_sequence"] = _build_1d_table(per_seq_df, "layer", "sequences")
+
+    mtp_df = _read_category_csv(os.path.join(tp_dir, "mtp.csv"), None)
+    if mtp_df is not None:
+        tables["mtp"] = _build_1d_table(mtp_df, "layer", "sequences")
+
+    attn_df = _read_category_csv(os.path.join(tp_dir, "attention.csv"), None)
+    if attn_df is not None:
+        # A sparse-attention profile carries more than one kernel here -- the
+        # attention kernel and an indexer that scores the whole KV before the
+        # top-k selection -- keyed on the same four axes. Split by layer so
+        # they cannot contaminate each other; the plain ``attention`` entry
+        # stays exactly what it has always been.
+        # Keyed by kernel, with no pooled alias: there used to be a
+        # ``tables["attention"]`` shortcut and every lookup silently took it,
+        # so a sparse model's indexer and sparse-attention layers were both
+        # served the non-sparse kernel's latency (2.1x too high per sparse
+        # layer on MiniMax-M3). One way in, and it needs a layer name.
+        tables["attention_by_layer"] = _build_attention_tables_by_layer(attn_df)
+
+    lin_df = _read_category_csv(os.path.join(tp_dir, "linear_attention.csv"), None)
+    if lin_df is not None:
+        tables["linear_attention_by_layer"] = \
+            _build_linear_attention_tables_by_layer(lin_df)
+
+    moe_df = _read_category_csv(os.path.join(tp_dir, "moe.csv"), None)
+    if moe_df is not None:
+        tables["moe"] = _build_moe_table(moe_df)
+    return tables
+
+
 def _tp_tables(perf_db, tp):
-    """Fetch the category-table dict for a given TP degree, with a
-    clear error if the TP wasn't profiled.
+    """Fetch the category-table dict for a given TP degree, building it on
+    first use, with a clear error if the TP wasn't profiled.
+
+    Lazy because a bundle may carry many ``tp<N>/`` folders while one run
+    touches at most two of them: its own TP degree, plus tp1 for the
+    ``tp_stable`` layers and for MoE, which are profiled once at tp=1 (see
+    _effective_tp and _lookup_moe). Building every folder up front cost
+    ~700 ms per folder that the run never queried.
+
+    Every caller reaches the tables through here, so a lazily-built folder
+    is indistinguishable from an eagerly-built one. That matters for
+    _layer_available in particular: it used to read perf_db["tables"]
+    directly with a {} default, which under lazy building would have
+    reported a present layer as missing and silently skipped emitting it.
     """
     tables = perf_db["tables"].get(tp)
-    if tables is None:
+    if tables is not None:
+        return tables
+    if tp not in perf_db["available_tps"]:
         raise KeyError(
             f"No profile data for tp={tp} on {perf_db['hardware']}/"
             f"{perf_db['model']}/{perf_db['variant']}; available: "
             f"{perf_db['available_tps']}"
         )
+    tables = _build_tp_tables(os.path.join(perf_db["root"], f"tp{tp}"))
+    perf_db["tables"][tp] = tables
     return tables
 
 
@@ -565,14 +789,51 @@ def _lookup_per_sequence(perf_db, name, tp, sequences):
     return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(sequences), 1))))
 
 
-def _axis_bracket(values, query):
-    """Return (lo_idx, hi_idx, t) for log-space interpolation on
-    ``values`` (sorted, non-negative, may include 0). ``t`` is the
-    fractional position: 0 → use values[lo_idx], 1 → values[hi_idx].
+def _lookup_mtp(perf_db, name, tp, sequences):
+    """1-D lookup over the decode batch size, the drafter's only axis.
 
-    Below the min or above the max we clamp on the low side (value 0
-    is treated as an exact sample) and extrapolate log-linearly on the
-    high side using the top two samples.
+    Every drafter pass is decode-shaped at ``max_query_len = 1``
+    (``llm_base_proposer.py``), so batch cardinality is all that varies --
+    the same shape as ``per_sequence``. Measured flat to within 2% across
+    batch 1-8 on Qwen3.8-27B, which is why one axis is enough.
+    """
+    tp_eff = _effective_tp(perf_db, "mtp", name, tp)
+    tbl = _tp_tables(perf_db, tp_eff).get("mtp", {}).get(name)
+    if tbl is None:
+        raise KeyError(
+            f"Missing mtp profile for layer={name} on tp={tp_eff}. Profile it "
+            f"with `python -m profiler slice <model> --tp-refresh {tp_eff} "
+            f"--group mtp --profile-mtp <N>`."
+        )
+    return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(sequences), 1))))
+
+
+def _axis_bracket(values, query):
+    """Return (lo_idx, hi_idx, t) for linear interpolation on ``values``
+    (sorted, non-negative, may include 0). ``t`` is the fractional
+    position: 0 → use values[lo_idx], 1 → values[hi_idx].
+
+    Below the min we clamp (a 0-valued sample is pinned exact); above
+    the max we extrapolate linearly from the top two samples.
+
+    ``t`` is measured on a **linear** scale even though the profiler
+    sweeps every axis geometrically. Those are separate choices: the
+    grid spacing decides where the kernel is sampled, the blend decides
+    how two samples are combined. Local linearity is an approximation,
+    not a guarantee across dispatch or tile/wave boundaries.
+    Profiled decode attention fits ``time_us = a + b * (n_decode
+    * kv_decode)`` with R^2 = 1.0000 on the RTX 4090 Llama-3.1-8B grid,
+    at an implied 953 GB/s — 95% of the card's spec, i.e. a pure
+    KV-bandwidth read.
+
+    Blending a per-axis-linear function in log space is convex-biased
+    upward: up to +6.0% per axis on a doubling grid (worst at
+    ``query/x0 = 1/ln2 = 1.443``), compounding across axes. Leave-one-out
+    over every profiled attention row — predict a grid point from its
+    two neighbours, compare against what the GPU actually reported —
+    puts log-space at +11.6% to +14.4% mean error across all seven
+    bundles in the repo, against +2.3% to +3.7% for linear, with linear
+    ahead on all four axes (``n_decode`` worst: +18.4% log vs +4.3%).
     """
     n = len(values)
     if n == 0:
@@ -587,26 +848,24 @@ def _axis_bracket(values, query):
     x0, x1 = values[lo], values[hi]
     if x1 == x0:
         return lo, hi, 0.0
-    # log-space when both ends are positive; fall back to linear when
-    # one end is 0 (0-valued sample is pinned exact).
-    if x0 > 0 and x1 > 0:
-        import math
-        t = (math.log(max(query, 1e-9)) - math.log(x0)) / (math.log(x1) - math.log(x0))
-    else:
-        t = (query - x0) / (x1 - x0)
-    return lo, hi, t
+    return lo, hi, (query - x0) / (x1 - x0)
 
 
-def _attn_slice_lookup(tbl, pc, nd, kv_prefill, kv_decode):
-    """Bilinear (log on each axis) within a single (pc, nd) slice."""
+def _attn_slice_lookup(tbl, pc, nd, prefill_key, kv_decode):
+    """Bilinear (linear on each axis) within a single (pc, nd) slice.
+
+    ``prefill_key`` is a query-weighted mean over the prefills, so it is
+    not an integer and must not be floored: at the bottom of the axis a
+    half-token is a percent of the coordinate.
+    """
     slice_tbl = tbl["slices"].get((pc, nd))
     if slice_tbl is None:
         return None
-    kp_vals = slice_tbl["kv_prefill_vals"]
+    kp_vals = slice_tbl["prefill_key_vals"]
     rows = slice_tbl["rows"]
     if not kp_vals:
         return None
-    lo_kp, hi_kp, t_kp = _axis_bracket(kp_vals, max(int(kv_prefill), 0))
+    lo_kp, hi_kp, t_kp = _axis_bracket(kp_vals, max(float(prefill_key), 0.0))
 
     def _row_lookup(row):
         ks, vs = row["keys"], row["values"]
@@ -629,192 +888,171 @@ def _attn_slice_lookup(tbl, pc, nd, kv_prefill, kv_decode):
 # ---------------------------------------------------------------------------
 # Skew correction
 # ---------------------------------------------------------------------------
-# When the runtime batch has heterogeneous decode kv lengths, the
-# profiled 4D grid (which carries one kv_decode value per shot) can
-# only tell us the uniform-mean latency. Empirically that's faster
-# than a truly skewed batch, because FlashAttention's varlen kernel
-# suffers tile padding + SM-imbalance costs that the uniform-mean
-# measurement misses.
-#
-# The skew profile (profiler/.../tp<N>/skew.csv + the fitted
-# ``skew_fit`` block in meta.yaml, with the bucket alpha table spilled
-# to ``tp<N>/skew_fit.csv``) captures this as a 5-axis lookup table of
-# alpha values where
-#
-#     t_skew = t_mean + alpha * (t_max - t_mean)
-#
-# With alpha=0 (the pre-correction behaviour) the simulator
-# systematically under-predicts attention latency by 5-10%, which
-# compounds across every batch in a session into noticeable TTFT /
-# TPOT drift vs. vLLM.
-#
-# Lookup is resolved per-batch via ``_skew_alpha``. The bin edges and
-# labels come from ``meta.yaml::skew_fit.bucket_axes`` so the profiler
-# can widen any axis (e.g. raise ``max_num_seqs`` above 128) without a
-# coordinated code change here. The ``_DEFAULT_SKEW_AXES`` block below
-# is used as a fallback only when the meta predates that field (which
-# is why its shape still matches the original hard-coded scheme).
-_ATTN_SKEW_ALPHA_FALLBACK: float = 0.093
+# The mean history preserves total decode KV volume before flooring, but
+# does not describe its distribution. Reference-aligned calibration adjusts
+# that uniform-table estimate using the separately measured heterogeneous cost.
+# No old axes, inline coefficients or cross-TP fallback are accepted.
 
-_DEFAULT_SKEW_AXES: dict = {
-    "n_bins": (0, 2, 4, 8, 16, 32, 64, 128, 1_000_000),
-    "n_labels": (
-        "n<=2", "n<=4", "n<=8", "n<=16", "n<=32", "n<=64", "n<=128", "n>128",
-    ),
-    "kv_big_bins": (0, 1024, 4096, 16384, 1_000_000_000),
-    "kv_big_labels": ("kvB<=1k", "kvB<=4k", "kvB<=16k", "kvB>16k"),
-    "skew_rate_bins": (-0.01, 0.05, 0.15, 0.40, 0.70, 1.01),
-    "skew_rate_labels": ("sr<=5%", "sr<=15%", "sr<=40%", "sr<=70%", "sr>70%"),
-    "kp_bins": (-1, 0, 2048, 1_000_000_000),
-    "kp_labels": ("kp=0", "kp<=2k", "kp>2k"),
-}
-
-
-def _bucket_label(bins, labels, val) -> str:
-    # Bucketing is (bins[i], bins[i+1]] — inclusive on the right so
-    # the label matches its intuitive reading (``n<=8`` includes 8).
-    for i in range(len(labels)):
-        if val <= bins[i + 1]:
-            return labels[i]
-    return labels[-1]
-
-
-def _resolve_skew_axes(fit_block, tp_entry):
-    """Return the (bins, labels) axes used for key construction.
-
-    Priority: per-TP entry > block top-level > module defaults. The
-    per-TP override is primarily a transition path — the writer
-    promotes ``bucket_axes`` to the top of the block when it's
-    identical across TPs, which is the common case.
-    """
-    axes = None
-    if isinstance(tp_entry, dict):
-        axes = tp_entry.get("bucket_axes")
-    if not axes and isinstance(fit_block, dict):
-        axes = fit_block.get("bucket_axes")
-    if not axes:
-        return _DEFAULT_SKEW_AXES
-    return axes
-
-
-def _skew_alpha(
-    perf_db,
-    tp: int,
-    pc: int,
-    n: int,
-    skew_rate: float,
-    kv_big: int,
-    kp: int,
-) -> float:
-    """Resolve alpha for a specific batch from the profile's
-    ``skew_fit`` meta block.
-
-    Lookup order:
-        1. meta.yaml::skew_fit.per_tp[tp].alpha_by_bucket[bucket_key]
-           (hydrated from ``tp<N>/skew_fit.csv`` when the meta points
-           at a CSV instead of inlining the mapping). The bucket_key
-           is ``pc={pc}|{n_label}|{sr_label}|{kvb_label}|{kp_label}``,
-           built against ``skew_fit.bucket_axes`` if present — which
-           lets the profiler widen axes (more n bins, finer kp bins)
-           without a simulator-side code change.
-        2. meta.yaml::skew_fit.per_tp[tp].alpha_default (pooled WLS).
-        3. Module-level fallback constant (``_ATTN_SKEW_ALPHA_FALLBACK``).
-
-    Returns the fallback constant when the meta block is disabled or
-    missing.
-    """
-    meta = perf_db.get("meta") if isinstance(perf_db, dict) else None
-    if not meta:
-        return _ATTN_SKEW_ALPHA_FALLBACK
-    fit_block = meta.get("skew_fit")
-    if not fit_block or not fit_block.get("enabled"):
-        return _ATTN_SKEW_ALPHA_FALLBACK
-    per_tp = fit_block.get("per_tp") or {}
-    entry = per_tp.get(tp) or per_tp.get(int(tp)) or per_tp.get(str(tp))
+def _skew_alpha(perf_db, tp, pc, n, lev, layer="attention", decode_q_len=1):
+    """Pick one offline cell; missing/disabled measurements mean no correction."""
+    fit = (perf_db.get("meta") or {}).get("skew_fit") or {}
+    if not fit.get("enabled"):
+        return 0.0
+    entries = fit.get("per_tp") or {}
+    entry = entries.get(tp) or entries.get(str(tp))
     if not entry:
-        return float(fit_block.get("alpha_default", _ATTN_SKEW_ALPHA_FALLBACK))
-    axes = _resolve_skew_axes(fit_block, entry)
-    sr = max(0.0, min(1.0, float(skew_rate)))
-    n_label = _bucket_label(axes["n_bins"], axes["n_labels"], int(n))
-    sr_label = _bucket_label(
-        axes["skew_rate_bins"], axes["skew_rate_labels"], sr,
-    )
-    kvb_label = _bucket_label(
-        axes["kv_big_bins"], axes["kv_big_labels"], int(kv_big),
-    )
-    kp_label = _bucket_label(axes["kp_bins"], axes["kp_labels"], int(kp))
-    key = f"pc={int(pc)}|{n_label}|{sr_label}|{kvb_label}|{kp_label}"
-    alphas = entry.get("alpha_by_bucket") or {}
-    if key in alphas:
-        return float(alphas[key])
-    return float(entry.get("alpha_default", _ATTN_SKEW_ALPHA_FALLBACK))
+        return 0.0
+    from profiler.core.skew_calibration import SCHEMA, lookup
+    if entry.get("schema") != SCHEMA or "calibration" not in entry:
+        raise ValueError("Skew calibration was not loaded and validated; run profiler refit-skew")
+    return lookup(entry["calibration"], int(n), int(pc), float(lev), layer, decode_q_len)
+
+
+def _prefill_key_for(perf_db, bctx, layer):
+    """Which prefill-key coordinate this kernel is looked up at.
+
+    A sparse kernel's cost stops growing once a sequence's key window passes
+    the checkpoint's bound, so it reads the clipped mean; the indexer that
+    scores the whole KV to make the selection does not, and reads the raw
+    one. Both are precomputed on the batch context because the clip is per
+    sequence and has to happen before the mean.
+    """
+    if _key_saturates(perf_db, layer):
+        return bctx.prefill_key_capped
+    return bctx.prefill_key
+
+
+def _key_saturates(perf_db, layer):
+    """Whether this kernel's cost stops growing in key length.
+
+    Declared per catalog entry because it varies inside one stack: MiniMax-M3
+    is sparse from its fourth layer on, and a sparse model's indexer scores
+    the whole KV to make the selection and never saturates.
+    """
+    section = perf_db["architecture"]["catalog"].get("attention") or {}
+    return bool((section.get(layer) or {}).get("key_saturates"))
 
 
 def _lookup_attention_with_skew(
-    perf_db, tp, prefill_chunk, kv_prefill,
+    perf_db, tp, prefill_chunk, prefill_key,
     n_decode, kv_decode_mean, kv_decode_max, kv_decode_min,
-    sliding_window=0,
+    layer="attention", decode_q_len=1,
 ):
     """Attention lookup with skew correction applied.
 
-    Two 4D interpolations — at kv_decode_mean (the canonical point
-    the profiler measured) and kv_decode_max (the per-batch longest
-    decode sequence) — combined by the bucket-specific alpha resolved
-    from ``meta.yaml::skew_fit``. Skipped entirely when there's no
-    skew to correct (single decode or all decodes at the same length).
+    Looks the batch up at kv_decode_mean (the canonical point the
+    profiler measured) and, when a non-zero alpha applies, blends
+    toward a second lookup at kv_decode_max (the per-batch longest
+    decode sequence) using the bucket-specific alpha resolved from
+    ``meta.yaml::skew_fit``. Returns t_mean directly -- one lookup --
+    for a single decode, for a batch whose decodes are all the same
+    length, or when alpha resolves to 0.
 
-    Returns an integer nanosecond count. The raw bilinear interp in
+    Returns an integer nanosecond count. The interpolation in
     ``_lookup_attention`` produces a float, and the skew formula
     compounds that; the Chakra trace converter requires integer
     ``comp_time`` so we round here.
-
-    ``sliding_window`` (DeepSeek-V4): caps every kv_* axis at the
-    given window size before the 4D interpolation. Without this, V4's
-    long-context regimes would extrapolate the CSV beyond what the
-    kernel actually runs in (the kernel internally caps at the same
-    window). 0 disables (V3 / dense / pre-V4 models).
     """
-    if sliding_window > 0:
-        kv_prefill = min(kv_prefill, sliding_window)
-        kv_decode_mean = min(kv_decode_mean, sliding_window)
-        kv_decode_max = min(kv_decode_max, sliding_window)
-        kv_decode_min = min(kv_decode_min, sliding_window)
     t_mean = _lookup_attention(
-        perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode_mean,
+        perf_db, tp, prefill_chunk, prefill_key, n_decode, kv_decode_mean,
+        layer, decode_q_len,
     )
     # No skew → no correction (also saves a redundant lookup).
     if n_decode <= 1 or kv_decode_max == kv_decode_mean:
         return max(1, int(round(t_mean)))
-    # skew_rate ∈ [0, 1]; = nb / n exactly for a bimodal batch.
-    # Fallback to 0.5 (balanced) when kv_max == kv_min (shouldn't
-    # reach here due to the short-circuit above, but defensive).
-    kv_gap = kv_decode_max - kv_decode_min
-    skew_rate = (kv_decode_mean - kv_decode_min) / kv_gap if kv_gap > 0 else 0.5
+    # Both endpoints first: the bucket key's third axis is the gap between
+    # them, in units of t_mean. Resolving alpha before t_max is known was the
+    # shape the five-axis key needed; this one prices the lever it will be
+    # multiplied by, which is the whole reason it transfers.
+    t_max = _lookup_attention(
+        perf_db, tp, prefill_chunk, prefill_key, n_decode, kv_decode_max,
+        layer, decode_q_len,
+    )
+    lev = (t_max - t_mean) / t_mean if t_mean > 0 else 0.0
     alpha = _skew_alpha(
-        perf_db, tp, prefill_chunk, n_decode, skew_rate, kv_decode_max,
-        kv_prefill,
+        perf_db, tp, prefill_chunk, n_decode, lev, layer, decode_q_len,
     )
     if alpha == 0.0:
         return max(1, int(round(t_mean)))
-    t_max = _lookup_attention(
-        perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode_max,
-    )
-    # Guard against interpolation producing t_max < t_mean (can happen
-    # at the axis boundary); in that case the formula would produce a
-    # negative correction, which isn't physical.
-    if t_max <= t_mean:
+    # A negative endpoint gap means the batch's longest decode is *cheaper*
+    # than its mean one. On a dense kernel that cannot happen -- cost rises
+    # with kv -- so it is an interpolation artifact at the axis boundary and
+    # the correction is dropped. On a kernel that saturates in key length it
+    # is the shape of the thing: below its bound a sparse query walks the
+    # unfilled slots, so DeepSeek-V3.2 measures 968.8 us at no context and
+    # 139.3 at 2048. There the gap is real and the blend is just a linear
+    # interpolation between two measured points, which does not care which
+    # end is higher.
+    if t_max <= t_mean and not _key_saturates(perf_db, layer):
         return max(1, int(round(t_mean)))
+    # The skew term is the one part of an attention lookup that cannot be
+    # reconstructed from the trace: the row carries only the blended result,
+    # so a residual that is really alpha x an over-long lever looks like a
+    # grid error. Log both endpoints and the alpha that joined them.
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "skew %s: pc=%d key=%d n=%d kv %d/%d/%d -> t_mean=%.1f "
+            "t_max=%.1f alpha=%.4f out=%.1f", layer, prefill_chunk,
+            int(prefill_key), n_decode, kv_decode_min, kv_decode_mean,
+            kv_decode_max, t_mean / 1000.0, t_max / 1000.0, alpha,
+            (t_mean + alpha * (t_max - t_mean)) / 1000.0,
+        )
     return max(1, int(round(t_mean + alpha * (t_max - t_mean))))
 
 
-def _lookup_attention(perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode):
-    """4D log-linear interpolation on (prefill_chunk, kv_prefill,
-    n_decode, kv_decode). Every axis is doubled by the profiler, so we
-    bracket each axis's two nearest profiled values and blend linearly
-    in log-space.
+def _attention_q_slice(by_q, decode_q_len, layer, tp):
+    """The 4-D table for ``decode_q_len``, exactly or the nearest profiled one.
+
+    Nearest rather than interpolated: query length changes the kernel's tile
+    shape, not just its size, so a value between two profiled ones is not
+    reliably between their costs -- and unlike the other four axes there is no
+    measurement here saying it is. Profiling exactly the ``1 + N`` you intend to
+    simulate is one extra grid value; guessing between them is a claim the data
+    does not support. Warned once per (layer, q) so a mismatch is visible.
     """
-    tbl = _tp_tables(perf_db, tp).get("attention")
-    if tbl is None or not tbl["pc_nd_pairs"]:
+    q = max(1, int(decode_q_len))
+    if q in by_q:
+        return by_q[q]
+    nearest = min(by_q, key=lambda k: (abs(k - q), k))
+    key = ("attn_q", layer, q, nearest)
+    if key not in _skipped_layer_warned:
+        _skipped_layer_warned.add(key)
+        logger.warning(
+            "decode_q_len=%d was not profiled for %r at tp=%d (have %s); using "
+            "%d. A speculative-decoding step submits 1 + N queries per "
+            "sequence -- profile with --attention-decode-q-lens including %d.",
+            q, layer, tp, sorted(by_q), nearest, q,
+        )
+    return by_q[nearest]
+
+
+def _lookup_attention(perf_db, tp, prefill_chunk, prefill_key, n_decode,
+                      kv_decode, layer="attention", decode_q_len=1):
+    """4D interpolation on (prefill_chunk, prefill_key, n_decode, kv_decode).
+
+    Each axis is bracketed by its two nearest profiled values and blended
+    **linearly** -- not in log space, even though the profiler sweeps every
+    axis geometrically. Grid spacing decides where the kernel is sampled; the
+    blend decides how two samples combine; the kernel is linear in each axis.
+
+    ``layer`` selects which kernel's table to read. A sparse-attention model
+    has several in this category -- MiniMax-M3 profiles ``attention`` (the
+    non-sparse layers), ``sparse_attention`` and ``indexer``, all keyed on the
+    same four axes -- and they are not interchangeable: at a 4-decode/kv-256
+    batch the non-sparse kernel costs 16.1 us against 7.5 for either sparse
+    one, because block selection caps the work the sparse layers do. A bundle
+    profiled before the CSV grew a ``layer`` column has exactly one kernel,
+    filed under ``attention``, so the default keeps it byte-identical.
+    """
+    by_layer = _tp_tables(perf_db, tp).get("attention_by_layer") or {}
+    by_q = by_layer.get(layer)
+    if by_q is None:
+        raise KeyError(
+            f"Missing attention profile for layer={layer!r} at tp={tp}. "
+            f"Profiled kernels: {sorted(by_layer) or 'none'}."
+        )
+    tbl = _attention_q_slice(by_q, decode_q_len, layer, tp)
+    if not tbl["pc_nd_pairs"]:
         raise KeyError(f"Missing attention profile for tp={tp}.")
 
     pcq, ndq = max(int(prefill_chunk), 0), max(int(n_decode), 0)
@@ -825,13 +1063,13 @@ def _lookup_attention(perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decod
     # Grab the four corners; missing corners fall back to the closest
     # available (pc, nd) pair.
     def _corner(pc, nd):
-        v = _attn_slice_lookup(tbl, pc, nd, kv_prefill, kv_decode)
+        v = _attn_slice_lookup(tbl, pc, nd, prefill_key, kv_decode)
         if v is not None:
             return v
         nearest = min(tbl["pc_nd_pairs"],
                       key=lambda p: (p[0] - pc) ** 2 + (p[1] - nd) ** 2)
         return _attn_slice_lookup(tbl, nearest[0], nearest[1],
-                                  kv_prefill, kv_decode) or 0.0
+                                  prefill_key, kv_decode) or 0.0
 
     c00 = _corner(pc_vals[lo_pc], nd_vals[lo_nd])
     c01 = _corner(pc_vals[lo_pc], nd_vals[hi_nd])
@@ -844,47 +1082,51 @@ def _lookup_attention(perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decod
     return max(1, int(out))
 
 
-def _moe_tbl(perf_db, tp, ep):
-    """Resolve the MoE table for a runtime (tp, ep). Prefer a per-rank-shape
-    profile ``moe_by_tpep[(tp, ep)]`` (correct FIXED / expert width for the real
-    local shape → the clean Fix 2 / Fix 4); else fall back to the tp1 (full-model)
-    profile — byte-identical to the pre-per-rank behavior. Returns ``(table, is_per_rank)``.
+def _moe_ep_slice(by_ep, ep, perf_db):
+    """The table profiled for this EP degree, or the nearest one.
+
+    Not interpolated, for the same reason ``decode_q_len`` is not: ``E/ep`` has
+    to be a whole number of experts and the permute width is a staircase in it,
+    so a value between two profiled degrees is not a configuration that exists.
+    Ties go to the smaller degree, which is the wider slice and therefore the
+    conservative direction.
     """
-    per = perf_db.get("moe_by_tpep") or {}
-    key = (int(tp), int(ep))
-    if key in per:
-        return per[key], True
+    if ep in by_ep:
+        return by_ep[ep]
+    have = sorted(by_ep)
+    nearest = min(have, key=lambda e: (abs(e - ep), e))
+    key = ("moe_ep", perf_db["model"], ep, nearest)
+    if key not in _skipped_layer_warned:
+        _skipped_layer_warned.add(key)
+        logger.warning(
+            "ep_size=%d was not profiled for the MoE block (have %s); using "
+            "%d. An EP rank runs E/ep experts and k/ep of a token's expert "
+            "assignments, so the wrong slice misprices every MoE layer -- "
+            "acquire native components with --ep %d and matching --tp/--dp "
+            "(EP=TP*DP) where supported; legacy whole-block acquisition is unavailable.",
+            ep, have, nearest, ep,
+        )
+    return by_ep[nearest]
+
+
+def _lookup_moe(perf_db, ep, tokens, activated_experts):
+    """MoE is profiled at tp=1 (experts shard by EP, not TP) and per EP degree.
+
+    ``ep`` is the **total** EP degree across the group, which is what decides
+    how much of the block one rank holds.
+    """
     tp_eff = 1 if 1 in perf_db["available_tps"] else perf_db["available_tps"][0]
-    return _tp_tables(perf_db, tp_eff).get("moe"), False
-
-
-def _lookup_moe(perf_db, tokens, activated_experts, tp=1, ep=1):
-    """MoE latency lookup. Uses a per-rank-shape profile for (tp, ep) when present,
-    else the tp1 profile (see ``_moe_tbl``).
-    """
-    tbl, _is_per_rank = _moe_tbl(perf_db, tp, ep)
-    if tbl is None:
+    by_ep = _tp_tables(perf_db, tp_eff).get("moe")
+    if by_ep is None:
         raise KeyError(
             f"Missing moe profile. Check that moe.csv exists under "
-            f"perf/{perf_db['hardware']}/{perf_db['model']}/{perf_db['variant']}/tp1/ "
-            f"(or a per-rank moe/tp{int(tp)}_ep{int(ep)}.csv)."
+            f"perf/{perf_db['hardware']}/{perf_db['model']}/{perf_db['variant']}/tp{tp_eff}/."
         )
+    tbl = _moe_ep_slice(by_ep, max(1, int(ep)), perf_db)
     ae_vals = tbl["activated_experts_vals"]
     rows = tbl["rows"]
     aeq = max(int(activated_experts), 1)
     tokq = max(int(tokens), 1)
-    ae_min = ae_vals[0]
-    if aeq < ae_min:
-        # Fix B (sub-top_k floor): the profiler cannot represent activated < top_k
-        # (every profiled token fires top_k experts, so the smallest activated row
-        # is top_k). The old code let ``_lookup_bounds`` clamp aeq up to that row,
-        # charging the weight-load of ``ae_min`` experts to a rank that actually
-        # touches only ``aeq`` (e.g. an ep8 rank at batch=1 fires ~1 expert but was
-        # billed moe(tok, 8)). Instead subtract the excess experts' weight-load, the
-        # activated-axis slope: moe(tok, aeq) = moe(tok, ae_min) - (ae_min-aeq)*per_expert.
-        base = _lookup_1d(rows[0]["keys"], rows[0]["values"], tokq)
-        per_expert = _moe_per_expert_ns(perf_db, tp, ep)
-        return max(1, int(base - (ae_min - aeq) * per_expert))
     lo, hi = _lookup_bounds(ae_vals, aeq)
     val_lo = _lookup_1d(rows[lo]["keys"], rows[lo]["values"], tokq)
     if lo == hi:
@@ -894,81 +1136,34 @@ def _lookup_moe(perf_db, tokens, activated_experts, tp=1, ep=1):
     return max(1, int(out))
 
 
-def _moe_per_expert_ns(perf_db, tp=1, ep=1):
-    """MoE activated-axis slope (weight-load per expert), in ns. Cached per (tp, ep).
+def _lookup_linear_attention(perf_db, tp, layer, prefill_tokens, n_decode):
+    """2-D lookup on ``(prefill_tokens, n_decode)``, or **None**.
 
-    Evaluated at the smallest token count shared by the two smallest activated
-    rows, so it isolates the per-expert weight-load from the token-axis GEMM.
-    Shared by the sub-top_k floor (``_lookup_moe`` Fix B) and the fixed-overhead
-    fit (``_moe_fixed_ns``) so both use one consistent slope, read from the same
-    (per-rank or tp1) table the lookup uses.
+    None means this kernel does not fire in this batch's regime -- the profile
+    has no rows for it there -- and the caller must emit nothing rather than
+    substitute a number.
     """
-    cache = perf_db.setdefault("_moe_per_expert_cache", {})
-    key = (int(tp), int(ep))
-    if key in cache:
-        return cache[key]
-    tbl, _ = _moe_tbl(perf_db, tp, ep)
-    if tbl is None or len(tbl["activated_experts_vals"]) < 2:
-        cache[key] = 0.0
-        return 0.0
-    ae = tbl["activated_experts_vals"]
+    by_layer = _tp_tables(perf_db, tp).get("linear_attention_by_layer") or {}
+    by_regime = by_layer.get(layer)
+    if by_regime is None:
+        raise KeyError(
+            f"Missing linear_attention profile for layer={layer!r} at tp={tp}. "
+            f"Profiled kernels: {sorted(by_layer) or 'none'}."
+        )
+    tbl = by_regime.get(_linear_attn_regime(prefill_tokens, n_decode))
+    if tbl is None:
+        return None
+    nd_vals = tbl["n_decode_vals"]
     rows = tbl["rows"]
-    t0 = max(rows[0]["keys"][0], rows[1]["keys"][0])
-    v0 = _lookup_1d(rows[0]["keys"], rows[0]["values"], t0)
-    v1 = _lookup_1d(rows[1]["keys"], rows[1]["values"], t0)
-    per = (v1 - v0) / (ae[1] - ae[0]) if ae[1] != ae[0] else 0.0
-    cache[key] = max(0.0, per)
-    return cache[key]
-
-
-def _moe_fixed_ns(perf_db, tp=1, ep=1):
-    """Token/expert-independent MoE floor (gate over all experts + permute +
-    kernel launch), in ns. Cached on ``perf_db``.
-
-    The tp1 ``moe.csv`` measures a whole MoE layer on one GPU as a SUM of a
-    shardable mass (expert weight-load + grouped-GEMM) and this fixed overhead,
-    which is replicated on every rank and does NOT shard by TP. Splitting it off
-    is what makes a TP-sharded MoE cost derivable from the (EP-only) profile.
-    Fit from the grid: ``fixed = moe(min_tok, top_k) - top_k * per_expert``,
-    where ``per_expert`` is the activated-axis slope (weight-load per expert).
-    """
-    cache = perf_db.setdefault("_moe_fixed_cache", {})
-    key = (int(tp), int(ep))
-    if key in cache:
-        return cache[key]
-    tbl, _ = _moe_tbl(perf_db, tp, ep)
-    if tbl is None or len(tbl["activated_experts_vals"]) < 2:
-        cache[key] = 0.0
-        return 0.0
-    ae = tbl["activated_experts_vals"]
-    rows = tbl["rows"]
-    per_expert = _moe_per_expert_ns(perf_db, tp, ep)
-    fixed = max(0.0, rows[0]["values"][0] - ae[0] * per_expert)
-    cache[key] = fixed
-    return fixed
-
-
-def _lookup_moe_tp_sharded(perf_db, tokens, activated_experts, moe_tp, tp=1, ep=1):
-    """Per-rank MoE latency when experts are TP-sharded along the intermediate
-    dim by ``moe_tp`` (EP-off / partial-EP).
-
-    If a per-rank-shape profile exists for (tp, ep) it already measures the sharded
-    cost directly → use it (the clean Fix 4, no analytical shard). Otherwise
-    synthesize from the tp1 profile: the expert weight-load + grouped-GEMM shard by
-    ``moe_tp`` while the fixed gate/permute/launch overhead (``_moe_fixed_ns``) is
-    replicated per rank:
-        latency = FIXED + (moe(T, A) - FIXED) / moe_tp
-    ``moe_tp == 1`` returns the raw single-GPU lookup unchanged.
-    """
-    _tbl, is_per_rank = _moe_tbl(perf_db, tp, ep)
-    if is_per_rank:
-        return _lookup_moe(perf_db, tokens, activated_experts, tp=tp, ep=ep)
-    full = _lookup_moe(perf_db, tokens, activated_experts, tp=tp, ep=ep)
-    m = max(1, int(moe_tp))
-    if m == 1:
-        return full
-    fixed = _moe_fixed_ns(perf_db, tp=tp, ep=ep)
-    return max(1, int(fixed + (full - fixed) / m))
+    ndq = max(int(n_decode), 0)
+    pfq = max(int(prefill_tokens), 0)
+    lo, hi = _lookup_bounds(nd_vals, ndq)
+    val_lo = _lookup_1d(rows[lo]["keys"], rows[lo]["values"], pfq)
+    if lo == hi:
+        return max(1, int(val_lo))
+    val_hi = _lookup_1d(rows[hi]["keys"], rows[hi]["values"], pfq)
+    out = _linear_interpolate(nd_vals[lo], val_lo, nd_vals[hi], val_hi, ndq)
+    return max(1, int(out))
 
 
 def _catalog_has(perf_db, category, name):
@@ -980,12 +1175,32 @@ def _catalog_has(perf_db, category, name):
 # Context builders
 # ======================================================================
 
+def _require_attention_parallelism(architecture, tp_size, pp_size, local_ep, ep_total):
+    """Refuse attention-wide SP before a trace can publish partial output.
+
+    vLLM 0.28/0.31 Qwen TP+DP MoE at PP1 keeps sequence shards across
+    blocks. A wrapper-only MoE AllGather cannot represent that execution.
+    The simulator's supported expert transport is allgather_reducescatter.
+    """
+    if tp_size <= 1 or pp_size != 1 or ep_total <= max(local_ep, 1):
+        return
+    if any(entry.get("attention_sequence_parallel", False)
+           for entry in architecture["catalog"].get("moe", {}).values()):
+        raise NotImplementedError(
+            "This TP>1 + DP>1 + EP deployment uses attention-wide sequence "
+            "parallelism: attention AllGather/ReduceScatter, local norm/MoE "
+            "rows and one final AllGather. That trace contract is not yet "
+            "implemented; use TP1 for DP+EP or DP1 for TP profiling/validation.")
+
+
 def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                      placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                     tp_dim=None, ep_dim=None, dp_sum_total_len=0,
-                     weight_fp=None, moe_weight_fp=None):
+                     tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0, num_speculative_tokens=0,
+                     dp_rank=0, dp_token_counts=(), duration_replay_only=False):
+    if dp_rank < 0 or (gate is not None and (dp_rank + 1) * max(local_ep, 1) > ep_total):
+        raise ValueError("DP member's local expert ranks exceed the EP group")
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -993,7 +1208,12 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
             f"profiler/models/<model_type>.yaml"
         )
     tp_needed = {max(int(tp_size), 1)}
-    perf_db = _load_perf_db(hardware, model, variant, tp_needed, model_type)
+    perf_db = _load_perf_db(hardware, model, variant, tp_needed, model_type,
+                            model_config=config)
+    perf_db = dict(perf_db, key_saturation=perf_db["key_saturation_by_tp"][max(int(tp_size), 1)])
+    if gate is not None:
+        _require_attention_parallelism(perf_db["architecture"], tp_size, pp_size,
+                                      local_ep, ep_total)
     warn_if_runtime_exceeds_profiled(
         perf_db, runtime_max_num_batched_tokens, runtime_max_num_seqs)
 
@@ -1008,34 +1228,28 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pim_config = pim_model.get_config()
         pim_channels = int(pim_config["mem_size"] // pim_config["dimm_size"])
 
-    first_k_dense_replace = int(config.get('first_k_dense_replace', 0) or 0)
-    # DeepSeek-V4: sliding-window attention + per-layer indexer dispatch.
-    # Empty list / 0 disables both features for every other model.
-    sliding_window = int(config.get('sliding_window', 0) or 0)
-    compress_ratios = list(config.get('compress_ratios') or [])
-    # Default weight_fp to activation dtype so unquantized callers behave
-    # exactly as before (no change to weight_size in the emitted trace).
-    if weight_fp is None:
-        weight_fp = fp
-    # Default moe_weight_fp to weight_fp so models without ``expert_dtype``
-    # (everything except DeepSeek-V4 today) behave exactly as before.
-    if moe_weight_fp is None:
-        moe_weight_fp = weight_fp
-
-    return TraceCtx(
+    ctx = TraceCtx(
         hardware=hardware, model=model, config=config, perf_db=perf_db,
         node_id=node_id,
-        fp=fp, weight_fp=weight_fp, moe_weight_fp=moe_weight_fp,
-        placement=placement, gate=gate,
+        fp=fp, placement=placement, gate=gate,
         enable_attn_offloading=enable_attn_offloading,
         power_model=power_model, pim_model=pim_model, pim_channels=pim_channels,
         n_head=n_head, kv_head=kv_head, head_dim=head_dim, is_moe=is_moe,
+        kv_fp=(1 if kv_cache_dtype == 'fp8' else fp),
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
+        dp_rank=dp_rank,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
-        first_k_dense_replace=first_k_dense_replace,
-        sliding_window=sliding_window, compress_ratios=compress_ratios,
+        dp_min_total_len=dp_min_total_len,
+        dp_token_counts=tuple(dp_token_counts),
+        num_speculative_tokens=num_speculative_tokens,
+        component_sizes=_selected_component_sizes(perf_db, tp_size, config),
+        duration_replay_only=duration_replay_only,
     )
+    if ctx.component_sizes is not None:
+        from .component_sizes import validate_local_trace
+        validate_local_trace(ctx)
+    return ctx
 
 
 def _build_batch_ctx(batch, ctx):
@@ -1044,19 +1258,31 @@ def _build_batch_ctx(batch, ctx):
     # and num_computed_tokens already absorbs any prefix-cache hit, so no further
     # subtraction is needed even when prefix caching is on.
     total_len = batch.total_len
-    # DP padding (see serving.__main__._pad_batch_to_max) adds dummy decodes without
-    # touching batch.requests. vLLM keeps lm_head's output shape pinned to
-    # num_tokens_after_padding for CUDA-graph replay, so each padded decode
-    # also contributes a logit. Track it via num_prefill + num_decode.
-    lm_head_len = max(len(batch.requests), batch.num_prefill + batch.num_decode)
+    # vLLM computes logits OUTSIDE the padded model forward, selecting
+    # query_start_loc[:num_reqs + 1][1:] - 1. Graph-padding tokens are not
+    # additional requests. An idle DP _dummy_run returns hidden states without
+    # executing compute_logits or the sampler. The deferred speculative path
+    # also uses this field for DP-synchronized drafter forwards; changing its
+    # dummy-row contract without auditing those forwards can skip EP calls.
+    lm_head_len = (max(len(batch.requests), batch.num_prefill + batch.num_decode)
+                   if ctx.num_speculative_tokens > 0 else len(batch.requests))
 
-    # 4D attention keys: profiler sweeps (prefill_chunk, kv_prefill,
-    # n_decode, kv_decode). The kv_decode axis carries a single value
-    # per shot, so we collapse multi-decode requests to their mean
-    # AND capture the per-batch max/min for the skew correction below.
+    # 4D attention keys: the profiler sweeps (prefill_chunk, prefill_key,
+    # n_decode, kv_decode). The kv_decode axis carries a single value per
+    # shot, so we collapse multi-decode requests to their mean AND capture
+    # the per-batch max/min for the skew correction below. The prefill side
+    # is query-weighted, so unequal chunks retain their relative attention work.
     prefill_chunk = sum(batch.prefill_q_list)
     kv_prefill = sum(batch.prefill_k_list)
+    cap = ctx.perf_db.get("key_saturation")
+    prefills = list(zip(batch.prefill_q_list, batch.prefill_k_list))
+    prefill_key = _prefill_key(prefills)
+    prefill_key_capped = _prefill_key(prefills, cap=cap) if cap else prefill_key
     n_decode = len(batch.decode_k_list)
+    # Query tokens per decode sequence: 1 normally, 1 + N when a speculative
+    # step verifies N drafts. A fifth attention axis rather than folding into
+    # prefill_chunk, because these queries share one sequence's KV read.
+    decode_q_len = getattr(batch, "decode_q_len", 1) or 1
     kv_decode_mean = (sum(batch.decode_k_list) // n_decode) if n_decode > 0 else 0
     kv_decode_max = max(batch.decode_k_list) if n_decode > 0 else 0
     kv_decode_min = min(batch.decode_k_list) if n_decode > 0 else 0
@@ -1073,9 +1299,10 @@ def _build_batch_ctx(batch, ctx):
         kv_decode_min = 0
         total_len = max(1, total_len)  # preserve for size calcs
 
-    return BatchCtx(batch, total_len, prefill_chunk, kv_prefill, n_decode,
+    return BatchCtx(batch, total_len, prefill_chunk, kv_prefill,
+                    prefill_key, prefill_key_capped, n_decode,
                     kv_decode_mean, kv_decode_max, kv_decode_min,
-                    lm_head_len, decode_lens, channel_split)
+                    lm_head_len, decode_lens, channel_split, decode_q_len)
 
 
 # ======================================================================
@@ -1083,53 +1310,98 @@ def _build_batch_ctx(batch, ctx):
 # ======================================================================
 
 def _layer_category(perf_db, layer_name):
-    """Return which catalog category (dense/per_sequence/attention/moe)
-    a canonical layer belongs to for this architecture, or None if the
-    catalog doesn't include it.
+    """Return which catalog category a canonical layer belongs to for this
+    architecture, or None if the catalog doesn't include it.
+
+    ``linear_attention`` is in the list. It was missing, and a category the
+    dispatcher does not know reads as "not in the catalog": every
+    gated-DeltaNet recurrence -- the defining computation of the architecture --
+    was skipped out of every trace with a one-line warning.
     """
-    for cat in ("per_sequence", "attention", "moe", "dense"):
+    for cat in ("per_sequence", "attention", "linear_attention", "moe", "mtp",
+                "dense"):
         if _catalog_has(perf_db, cat, layer_name):
             return cat
     return None
 
 
 def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer_num=None,
-                comm_type='NONE', comm_size=0, input_loc='LOCAL', output_loc='LOCAL'):
+                comm_type='NONE', comm_size=0, input_loc='LOCAL', output_loc='LOCAL', source_role=None):
     """Emit a single trace layer: lookup latency, compute sizes, format, track power."""
     category = _layer_category(ctx.perf_db, layer_name)
     if category is None:
         raise KeyError(
             f"Layer {layer_name!r} is not declared in the architecture yaml "
             f"catalog for {ctx.perf_db['variant']}. Add it to "
-            f"profiler/models/<model_type>.yaml or remove it from the sequence."
+            f"profiler/models/<model_type>.yaml or remove it from the block order."
         )
 
-    if category == "per_sequence":
+    if layer_name == 'attn_res' and _is_contextual_profile(ctx):
+        source_role = source_role or ('final' if layer_num is None else None)
+        latency_ns = ctx.component_sizes.residual(bctx.total_len, source_role, layer_num)
+    elif category == "per_sequence":
         latency_ns = _lookup_per_sequence(ctx.perf_db, layer_name, ctx.tp_size, bctx.lm_head_len)
     elif category == "attention":
         latency_ns = _lookup_attention_with_skew(
             ctx.perf_db, ctx.tp_size,
-            bctx.prefill_chunk, bctx.kv_prefill,
+            bctx.prefill_chunk,
+            _prefill_key_for(ctx.perf_db, bctx, layer_name),
             bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
-            bctx.kv_decode_min,
-            sliding_window=ctx.sliding_window,
+            bctx.kv_decode_min, layer_name, bctx.decode_q_len,
         )
+    elif category == "mtp":
+        # Keyed on the pass's token count. The profiler sweeps this category on
+        # decode-shaped shots, where tokens and sequences are the same number,
+        # so one axis serves both -- but the drafter's dominant layer
+        # (``eh_proj``, two orders above the rest) is per token, so that is the
+        # reading to preserve when the two diverge. They diverge only on the
+        # drafter's first pass, which reuses the target's token layout; the
+        # loop's passes are one token per sequence by construction.
+        latency_ns = _lookup_mtp(
+            ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
+    elif category == "linear_attention":
+        latency_ns = _lookup_linear_attention(
+            ctx.perf_db, ctx.tp_size, layer_name,
+            bctx.prefill_chunk, bctx.n_decode,
+        )
+        if latency_ns is None:
+            # This kernel does not fire in this batch's regime, so the block
+            # emits nothing for it -- a gated-DeltaNet block runs a different
+            # set of kernels for a pure prefill, a pure decode and a mixed
+            # batch, and the catalog names all three.
+            return 0
     else:  # dense
         latency_ns = _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
 
     # Size calculation uses the same canonical layer names.
-    if layer_name == 'attention':
+    if _is_contextual_profile(ctx):
+        inp, wt, out = ctx.component_sizes.sizes_for(bctx, layer_name, source_role, layer_num)
+    elif layer_name == 'attention':
         kv_len_for_sizes = bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean
         inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
                                        kv_len=kv_len_for_sizes,
-                                       parallel=ctx.tp_size, fp=ctx.fp, weight_fp=ctx.weight_fp)
-    else:
+                                       parallel=ctx.tp_size, fp=ctx.fp)
+    elif (layer_name in ("indexer", "sparse_attention")
+          and get_config(ctx.model).get("model_type") == "minimax_m3_vl"):
+        # Preserve individual histories: the indexer scans each whole cache,
+        # while sparse attention caps each request before summing its reads.
+        histories = [*bctx.batch.prefill_k_list, *bctx.batch.decode_k_list]
         inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
-                                       parallel=ctx.tp_size, fp=ctx.fp, weight_fp=ctx.weight_fp)
+                                       kv_lens=histories,
+                                       parallel=ctx.tp_size, fp=ctx.fp)
+    else:
+        length = bctx.lm_head_len if category == "per_sequence" else bctx.total_len
+        inp, wt, out = calculate_sizes(ctx.model, layer_name, length,
+                                       parallel=ctx.tp_size, fp=ctx.fp,
+                                       component_sizes=ctx.component_sizes)
+
+    if layer_num is None and comm_type == 'NONE':
+        comm_type, comm_size = _shared_tp_collective(ctx, bctx, layer_name)
 
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
 
-    lines.append(formatter(layer_name, str(latency_ns), input_loc, str(inp), wt_loc, str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag))
+    lines.append((layer_name, str(latency_ns), input_loc, str(inp), wt_loc,
+                  str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag))
 
     if power_acc is not None:
         power_acc.npu_latencies_ns.append(latency_ns)
@@ -1137,15 +1409,69 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
             power_acc.dram_weight_bytes += wt
         if comm_size > 0:
             collective = comm_type.split(':', 1)[0].lower()
-            power_acc.link_data_bytes += total_ring_data(comm_size, ctx.tp_size, collective=collective)
+            if collective == 'none':
+                # Point-to-point (the P/D KV send): the bytes cross the link once,
+                # with no ring amplification.
+                power_acc.link_data_bytes += comm_size
+            else:
+                power_acc.link_data_bytes += total_ring_data(comm_size, ctx.tp_size, collective=collective)
 
     return latency_ns
+
+
+def _shared_tp_collective(ctx, bctx, name):
+    """Ordinary vocab-parallel target endpoints, once per forward.
+
+    Require the actual catalog binding and shared placement. MTP endpoints,
+    alternative heads and local-argmax sampling need their own contracts.
+    """
+    if ctx.tp_size <= 1:
+        return 'NONE', 0
+    arch = ctx.perf_db['architecture']
+    activation_fp = dtype_bytes(ctx.config.get('torch_dtype', ctx.config.get('dtype')), ctx.fp)
+    shared = arch.get('shared') or {}
+    catalog = arch['catalog']
+    if name == 'embedding' and name in shared.get('prologue', []):
+        binding = catalog.get('dense', {}).get(name, {}).get('vllm')
+        if binding == 'VocabParallelEmbedding':
+            return (_with_dim('ALLREDUCE', ctx.tp_dim),
+                    bctx.total_len * ctx.config['hidden_size'] * activation_fp)
+    if name == 'lm_head' and name in shared.get('head', []):
+        binding = catalog.get('per_sequence', {}).get(name, {}).get('vllm')
+        if binding == 'LogitsProcessor':
+            return (_with_dim('ALLGATHER', ctx.tp_dim),
+                    bctx.lm_head_len * vocab_shard_size(ctx.config, ctx.tp_size)
+                    * dtype_bytes(ctx.config.get('head_dtype'), activation_fp))
+    return 'NONE', 0
+
+
+def _pd_kv_send_bytes(ctx, bctx):
+    """Per-layer, per-rank KV bytes a prefill instance ships to its decode peer.
+
+    ``batch.pd_kv_send_tokens`` counts this iteration's computed tokens plus, on a
+    request's first step, its prefix-cache hit: the decode side needs that KV even
+    though the prefill side read it from cache instead of computing it. Using the
+    trace's ``total_len`` instead would silently drop exactly the hit.
+    """
+    tokens = getattr(bctx.batch, 'pd_kv_send_tokens', 0) or 0
+    if tokens <= 0:
+        return 0
+    kv_dim = ctx.kv_head * ctx.head_dim
+    return 2 * kv_dim * tokens * ctx.kv_fp // max(ctx.tp_size, 1)
 
 
 def _tp_comm(ctx, layer_name, total_len, collective='ALLREDUCE'):
     """Compute TP communication size. Returns (comm_size, comm_type)."""
     if ctx.tp_size <= 1:
         return 0, 'NONE'
+    entry = ctx.perf_db["architecture"]["catalog"].get("dense", {}).get(layer_name, {})
+    if entry.get("tp_output_reduction") == "all_reduce":
+        # RowParallelLinear reduces the full hidden-state output, not its
+        # sharded input. Activation precision is independent of weight dtype.
+        element_bytes = dtype_bytes(ctx.config.get('torch_dtype', ctx.config.get('dtype')), ctx.fp)
+        _, _, out = calculate_sizes(ctx.model, layer_name, total_len,
+                                    parallel=ctx.tp_size, fp=element_bytes)
+        return out, 'ALLREDUCE'
     _, _, out = calculate_sizes(ctx.model, layer_name, total_len, parallel=ctx.tp_size, fp=ctx.fp)
     return out, collective
 
@@ -1161,13 +1487,13 @@ def _with_dim(comm_type, involved_dim):
 def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
     """Emit PIM attention for decode requests across PIM channels."""
     for ch in range(ctx.pim_channels):
-        lines.append(f"PIM {ch}\n")
+        lines.append((f"PIM {ch}",))
         for L in bctx.decode_lens[ch]:
             inp, _, out = calculate_sizes(ctx.model, "attention", L, pim=True, parallel=ctx.tp_size, fp=ctx.fp)
             inp //= bctx.channel_split
             out //= bctx.channel_split
             pim_lat = int(ctx.pim_model.get_pim_latency(ctx.n_head, ctx.kv_head, ctx.head_dim, L, bctx.channel_split))
-            lines.append(formatter("attention", str(pim_lat),
+            lines.append(("attention", str(pim_lat),
                 f'REMOTE:{ctx.node_id}.{ch}', str(inp),
                 get_device(ctx.placement, layer_num, "attention", "weights"), '0',
                 f'REMOTE:{ctx.node_id}.{ch}', str(out),
@@ -1175,7 +1501,7 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
             if power_acc is not None and pim_lat > 0:
                 power_acc.pim_latencies_ns.append(pim_lat)
                 power_acc.dram_weight_bytes += inp + out
-    lines.append("PIM END\n")
+    lines.append(("PIM END",))
 
 
 def _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
@@ -1193,66 +1519,119 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     ALLTOALL is handled by ASTRA-Sim with involved_dim scoping for DP groups,
     or as a simple ALLTOALL for local EP groups.
     """
+    from .moe_execution import emit_native_components
+    if emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag):
+        return
     ep_total = ctx.ep_total
 
-    # MoE compute uses ``bctx.total_len`` (= per-rank padded count after
-    # ``_pad_batch_to_max``), matching how the real vLLM kernel runs on the
-    # full padded forward shape. Routing / ``_lookup_moe`` therefore see
-    # the same per-rank padded value as every other dense layer.
-    effective_total_len_compute = bctx.total_len
+    # AG/RS comm size and MoE compute are the **same** quantity: the gathered
+    # token count. vLLM's naive DP+EP prepare hands the expert kernel the
+    # tensors returned by ``get_ep_group().dispatch(...)`` -- i.e. post
+    # all-gather -- so every rank runs its local experts over *every* rank's
+    # tokens and ``finalize``'s reduce-scatter hands back only its own slice.
+    # Charging a rank for its own batch instead understated the MoE term on
+    # every DP round whose members had comparable work: 0.6 ms per decode step
+    # and 2.8 ms per prefill step on Qwen3-30B-A3B at ep=2 over 48 MoE layers,
+    # which is the per-step deficit that showed up as -27% TTFT on the dp+ep
+    # bench example while the same model at dp=1 sat at +5%.
+    #
+    # It is less than the ep_total factor the token count suggests because the
+    # cost saturates once ``activated`` reaches ``E/ep``: past that, loading all
+    # the local experts' weights dominates and more tokens are nearly free
+    # (moe(2T)/moe(T) is 1.01-1.12x on that grid, not 2x).
+    effective_total_len_comm = (ctx.dp_sum_total_len if ctx.dp_sum_total_len > 0
+                                else bctx.total_len)
+    effective_total_len_compute = effective_total_len_comm
     routing = ctx.gate.route_ep(layer_num, batch_id_str, effective_total_len_compute, ep_total)
-
-    # EP-OFF / partial-EP: experts are TP-sharded along their intermediate dim
-    # (moe_tp = tp//ep) rather than distributed whole. Every rank holds all
-    # tokens, so there is no dispatch all-gather; the block runs once and
-    # combines with an ALLREDUCE over the TP dim (the down_proj pattern). Only
-    # the pure TP-shard case (ep_total == 1, tp_size > 1) is emitted here; a
-    # hybrid EP+TP-shard trace is out of scope.
-    if ep_total == 1 and ctx.tp_size > 1:
-        moe_tp = ctx.tp_size
-        local_tokens = routing.local_tokens[0]              # == total_len (all tokens on the rank)
-        activated = max(routing.activated_experts[0], 1)    # cluster-activated experts
-        wt_loc = get_device(ctx.placement, layer_num, "moe", "weights")
-        lat = _lookup_moe_tp_sharded(ctx.perf_db, local_tokens, activated, moe_tp,
-                                     tp=ctx.tp_size, ep=ep_total)
-        inp, wt, out = calculate_sizes(
-            ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp,
-            weight_fp=ctx.weight_fp, moe_weight_fp=ctx.moe_weight_fp, moe_tp=moe_tp)
-        lines.append(formatter("moe", str(lat), 'LOCAL', str(inp), wt_loc, str(wt),
-                               'LOCAL', str(out), _with_dim('ALLREDUCE', ctx.tp_dim),
-                               str(out), batch_tag))
-        if power_acc is not None:
-            if lat > 0:
-                power_acc.npu_latencies_ns.append(lat)
-            if wt_loc != 'LOCAL':
-                power_acc.dram_weight_bytes += wt
-            power_acc.link_data_bytes += total_ring_data(out, ctx.tp_size, collective="allreduce")
-        return
-
-    # AG/RS comm sizes are anchored to ``dp_sum_total_len``, which
-    # ``serving/__main__.py`` sets to ``max_total_len`` (NOT ``max × dp_group_size``)
-    # for DP groups; this calibrates the AG/RS bandwidth model against the same
-    # ``link_bw`` that already matches AllReduce. Falls back to this rank's own
-    # ``total_len`` when DP is inactive.
-    effective_total_len_comm = ctx.dp_sum_total_len if ctx.dp_sum_total_len > 0 else bctx.total_len
 
     # vLLM default ``allgather_reducescatter`` backend: dispatch = AllGather
     # (hidden + router_logits), combine = ReduceScatter (hidden only).
     # ASTRA-Sim AG ``data_size`` is per-rank local chunk (sum / ep_total);
     # RS ``data_size`` is the pre-scatter total buffer.
     n_embd = ctx.config['hidden_size']
-    num_experts = ctx.config.get('num_local_experts',
-                                 ctx.config.get('num_experts',
-                                                ctx.config.get('n_routed_experts', 0)))
+    num_experts = utils_num_experts(ctx.config)
     dispatch_per_token = (n_embd + num_experts) * ctx.fp
     combine_per_token = n_embd * ctx.fp
-    ag_per_rank_tokens = max(1, effective_total_len_comm // max(ep_total, 1))
-    dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
-    combine_comm_size = effective_total_len_comm * combine_per_token
-
+    # Both EP collectives are **ragged**, and that decides what they cost.
+    # ``AgRsAll2AllManager`` passes per-rank ``sizes`` straight through, and
+    # ``pynccl.all_gatherv`` is one ``ncclBroadcast`` per rank at that rank's
+    # own size (``reduce_scatterv`` one ``ncclReduce`` per rank as root), fused
+    # in a single group. So rank *r* ships its own tokens and takes in everyone
+    # else's: its ingress is ``gathered - sizes[r]``, and the collective ends
+    # when the worst-off rank is done, i.e. at ``gathered - min(sizes)``.
+    #
+    # ASTRA-Sim's Ring charges ``(N-1) * chunk`` for AllGather and
+    # ``(N-1) * total/N`` for ReduceScatter, so the chunk that reproduces that
+    # bound is ``(gathered - min) / (N - 1)`` and the pre-scatter total is that
+    # chunk times N. A uniform round has ``min == gathered/N``, which gives
+    # back ``gathered/N`` and ``gathered`` exactly -- so this only moves the
+    # rounds vLLM leaves unpadded.
+    #
+    # Dividing the gathered total by ``ep_total`` instead charges the
+    # *average* rank. Every decode round is padded, so the two agree there and
+    # TPOT is untouched; a prefill chunk is outside the CUDA-graph capture
+    # range and never padded, so a (2048, 1) round was charged at 1024 where
+    # NCCL pays 2048. Measured on the dp+ep bench example: 0.659x of the real
+    # collective on prefill rounds, a mean 9.8 ms per round over 48 MoE layers
+    # and 25.4 ms on a full chunk -- landing on TTFT alone, which is the shape
+    # of the residual it was found by (TTFT -18.4%, TPOT -1.3%).
+    min_rank_tokens = (ctx.dp_min_total_len // max(ctx.tp_size, 1)
+                       if ctx.dp_min_total_len > 0
+                       else effective_total_len_comm // max(ep_total, 1))
     if ep_total > 1:
+        ag_per_rank_tokens = max(
+            1, (effective_total_len_comm - min_rank_tokens) // (ep_total - 1))
+    else:
+        ag_per_rank_tokens = max(1, effective_total_len_comm)
+    dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
+    combine_comm_size = ag_per_rank_tokens * max(ep_total, 1) * combine_per_token
+
+    # Which collective the MoE block rides on depends on whether the *tokens*
+    # are partitioned, not on whether the experts are. Verified against vLLM
+    # 0.28:
+    #
+    #   DP > 1  -- tokens live on different ranks, so they have to move.
+    #     ``use_all2all_kernels`` is on and ``AgRsAll2AllManager`` all-gathers
+    #     then reduce-scatters. The group is the DP group at ``tp == 1`` and the
+    #     whole EP group above it, because ``use_sequence_parallel_moe``
+    #     (``enable_expert_parallel and tp > 1 and dp > 1``) shards the MoE
+    #     input across TP as well and ``_get_comm_group`` then returns
+    #     ``get_ep_group()``. Either way the ring is ``ep_total``, which is what
+    #     ``ep_dim`` already scopes. The reduce-scatter completes the
+    #     expert-sum, so ``_maybe_reduce_final_output`` adds nothing (it is a
+    #     no-op on a size-1 TP group, and explicitly skipped under
+    #     sequence-parallel).
+    #
+    #   DP == 1 -- the MoE input is *replicated* across the EP ranks (TP
+    #     all-reduces after ``o_proj``, and EP sets
+    #     ``moe_parallel_config.tp_size = 1``), so nothing needs dispatching:
+    #     ``use_all2all_kernels = use_ep and (dp_size > 1 or pcp_size > 1 or
+    #     is_sequence_parallel)`` is False and ``maybe_make_prepare_finalize``
+    #     returns None. What is left is one **AllReduce** over the TP group,
+    #     fired by ``_maybe_reduce_final_output``'s ``(tp_size > 1 or ep_size >
+    #     1)`` -- satisfied by ``ep_size``, since EP zeroed the MoE's own
+    #     tp_size. That reduction is not the dense hidden-dim one: it sums a
+    #     token's ``k`` expert contributions, which are split across ranks
+    #     because the experts are.
+    #
+    # ``dp_sum_total_len > 0`` is the same DP-active test the token counts
+    # above use.
+    dp_active = ctx.dp_sum_total_len > 0
+    # ``use_sequence_parallel_moe`` (allgather_reducescatter + expert parallel
+    # + tp > 1 + dp > 1) shards the MoE input across TP as well, which is why
+    # the dispatch/combine group widens from the DP group to the whole EP
+    # group. It also adds a trailing AllGather -- see below.
+    sp_moe = ep_total > 1 and dp_active and ctx.tp_size > 1
+    if ep_total > 1 and dp_active:
         dispatch_comm_type = _with_dim('ALLGATHER', ctx.ep_dim)
         combine_comm_type = _with_dim('REDUCESCATTER', ctx.ep_dim)
+    elif ep_total > 1 and ctx.tp_size > 1:
+        dispatch_comm_type = 'NONE'
+        dispatch_comm_size = 0
+        combine_comm_type = _with_dim('ALLREDUCE', ctx.tp_dim)
+        # vLLM all-reduces the block's own output, ``[num_tokens, hidden]``.
+        # ASTRA-Sim wants the full tensor for an ALLREDUCE, as on o_proj.
+        combine_comm_size = bctx.total_len * combine_per_token
     else:
         dispatch_comm_type = 'NONE'
         combine_comm_type = 'NONE'
@@ -1273,25 +1652,53 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
 
     for i in range(emit_ep):
         if i == 0:
-            lines.append(f"EXPERT {i} {dispatch_comm_type} {dispatch_comm_size}\n")
+            lines.append((f"EXPERT {i} {dispatch_comm_type} {dispatch_comm_size}",))
         else:
-            lines.append(f"EXPERT {i} NONE 0\n")
+            lines.append((f"EXPERT {i} NONE 0",))
 
         # ``local_tokens`` here is the per-rank workload after dispatch
         # — already scaled to this rank's real tokens (no DP-padding sum).
         # We feed it straight into the MoE profile lookup.
-        local_tokens = routing.local_tokens[i]
-        activated_experts = routing.activated_experts[i]
+        # **Every** rank's token count is the gathered/replicated total, not a
+        # dispatched share. vLLM's default ``allgather_reducescatter`` backend
+        # hands each rank the full post-all-gather tensor
+        # (``NaiveDpEpPrepareAndFinalize.prepare`` returns what
+        # ``dispatch_router_logits`` gathered), and the expert kernel permutes
+        # out the ``(token, expert)`` pairs whose expert is local -- it does not
+        # receive a subset of tokens. With no all-gather at all (DP=1, where
+        # ``use_all2all_kernels`` is False) the input is simply replicated
+        # across the EP ranks, so it is the whole batch there too.
+        #
+        # ``routing.local_tokens`` answers a different question -- how many
+        # tokens a *dispatching* backend would send to this rank, which is
+        # ``gathered * P(at least one of the token's k experts is local)``. That
+        # is what DeepEP does, and the simulator does not emit it. Using it here
+        # understated the per-rank work by 1 - p_hit: 0.3% at ep=2 (p_hit
+        # 0.9969 on Qwen3-30B-A3B), but 9% at ep=4, 33% at ep=8 and 59% at
+        # ep=16. The profiled slice matches the gathered reading: the profiler
+        # cuts both ``E/ep`` and ``k/ep``, so a shot at ``tokens = T`` measures
+        # ``T * k/ep`` expert-token pairs, which is exactly what a rank computes
+        # over the gathered set.
+        local_tokens = effective_total_len_compute
+        # EXPERT markers stay local; routing vectors cover the entire DP group.
+        global_rank = ctx.dp_rank * ctx.local_ep + i
+        activated_experts = routing.activated_experts[global_rank]
 
         if local_tokens > 0:
-            rank_latency_ns = _lookup_moe(ctx.perf_db, local_tokens, max(activated_experts, 1),
-                                          tp=ctx.tp_size, ep=ep_total)
-            rank_inp, rank_wt, rank_out = calculate_sizes(
-                ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp,
-                weight_fp=ctx.weight_fp, moe_weight_fp=ctx.moe_weight_fp)
+            # The **total** EP degree, not this instance's share: what a rank
+            # holds is E/ep_total, and that is what the profiled slice is.
+            rank_latency_ns = _lookup_moe(
+                ctx.perf_db, ep_total, local_tokens,
+                max(activated_experts, 1))
+            if _is_contextual_profile(ctx):
+                rank_inp, rank_wt, rank_out = ctx.component_sizes.sizes_for(bctx, 'moe')
+            else:
+                rank_inp, rank_wt, rank_out = calculate_sizes(
+                    ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp,
+                    component_sizes=ctx.component_sizes)
             max_rank_latency_ns = max(max_rank_latency_ns, rank_latency_ns)
 
-            lines.append(formatter("expert", str(rank_latency_ns), 'LOCAL', str(rank_inp),
+            lines.append(("expert", str(rank_latency_ns), 'LOCAL', str(rank_inp),
                 wt_loc, str(rank_wt), 'LOCAL', str(rank_out), 'NONE', '0', batch_tag))
 
             if power_acc is not None and wt_loc != 'LOCAL':
@@ -1301,7 +1708,33 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     if power_acc is not None and max_rank_latency_ns > 0:
         power_acc.npu_latencies_ns.append(max_rank_latency_ns)
 
-    lines.append(f"EXPERT END {combine_comm_type} {combine_comm_size}\n")
+    lines.append((f"EXPERT END {combine_comm_type} {combine_comm_size}",))
+
+    # Sequence-parallel MoE closes with one more collective, and it is not the
+    # expert sum -- the reduce-scatter above already did that over the whole EP
+    # group. ``Qwen3MoeSparseMoeBlock.forward`` slices the block's input to
+    # this TP rank's chunk (``sequence_parallel_chunk``, a local narrow, no
+    # collective), runs the experts, then reassembles the sequence with
+    # ``tensor_model_parallel_all_gather`` over the TP group -- otherwise the
+    # rest of the block would see only 1/tp of the tokens. Two collectives on
+    # two different groups, so one pair cannot describe them; it is ~17% of
+    # this configuration's MoE collective traffic.
+    #
+    # Keep restoration on the same boundary as combine. The converter chains
+    # both collectives, then exposes their final dependency to the next block
+    # or pipeline transfer. A regular compute row must not replace this marker:
+    # pipeline boundary handling uses the marker to locate the next block.
+    #
+    # ASTRA-Sim wants the per-rank chunk for an ALLGATHER, and vLLM pads the
+    # sequence up to a multiple of ``tp_size`` before slicing.
+    if sp_moe:
+        chunk_bytes = (-(-bctx.total_len // ctx.tp_size)) * combine_per_token
+        end_line = (f"EXPERT END {combine_comm_type} {combine_comm_size} "
+                    f"{_with_dim('ALLGATHER', ctx.tp_dim)} {chunk_bytes}")
+        lines[-1] = (end_line,)
+        if power_acc is not None:
+            power_acc.link_data_bytes += total_ring_data(
+                chunk_bytes, ctx.tp_size, collective="allgather")
 
     # Post-expert ReduceScatter power (combine)
     if power_acc is not None and ep_total > 1:
@@ -1312,13 +1745,73 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
 # Block builders (split for interleaving)
 # ======================================================================
 
-def _sequence(perf_db, section):
-    """Fetch a sequence list from the architecture yaml, defaulting to
-    an empty list when the section is absent (e.g. mlp_moe for dense
-    architectures).
+def _shared_layers(perf_db, section):
+    """``shared.prologue`` or ``shared.head`` -- the layers outside every block.
+
+    Once per iteration, not once per decoder layer, which is the whole reason
+    they live outside ``blocks``.
     """
-    seq = perf_db["architecture"].get("sequence") or {}
-    return list(seq.get(section) or [])
+    shared = perf_db["architecture"].get("shared") or {}
+    return list(shared.get(section) or [])
+
+
+def _layer_spec(perf_db, layer_num):
+    """The block composition of one decoder layer, from the checkpoint.
+
+    Which block a layer runs is a property of the *checkpoint*, never of the
+    yaml: ``layer_types`` decides the attention, ``first_k_dense_replace`` /
+    ``decoder_sparse_step`` / ``moe_layer_freq`` the MLP, and
+    ``sparse_attention_freq`` / ``index_topk_pattern`` the sparse flag. See
+    ``profiler/core/stack.py``, which the profiler reads for the same answer.
+    """
+    stack = perf_db.get("layer_stack") or []
+    if not stack:
+        mod = _stack_module()
+        return mod.LayerSpec(attn=mod.FULL_ATTENTION, mlp=mod.MLP_DENSE)
+    return stack[int(layer_num or 0) % len(stack)]
+
+
+def _block_layers(perf_db, layer_num, part):
+    """The canonical layer names decoder layer ``layer_num`` emits for ``part``
+    (``pre_attn`` / ``post_attn`` / ``mlp``)."""
+    return _spec_block_layers(perf_db, _layer_spec(perf_db, layer_num), part,
+                              f"layer {layer_num}")
+
+
+def _spec_block_layers(perf_db, spec, part, where):
+    """The layer names a block of composition ``spec`` emits for ``part``.
+
+    ``where`` names the caller in the error message -- a decoder layer index,
+    or the drafter, which has a spec but no index in the target's stack.
+
+    This is where a heterogeneous stack stops being uniform. ``blocks`` is
+    keyed by **axis** -- ``attn.<layer_types value>``, ``mlp.dense|moe``, and
+    ``sparse_attn.<layer_types value>`` as an overlay when the layer's sparse
+    flag is set -- because a layer's identity is a tuple and naming every
+    combination explodes: Qwen3.5 varies the attention, DeepSeek and GLM the
+    MLP, MiniMax-M3 both plus sparsity.
+
+    ``sparse_attn`` is consulted first and falls through to ``attn`` when it
+    has no entry for this attention type, which is what DeepSeek and GLM
+    need: every one of their layers is sparse, so there is nothing to tell
+    apart and one ``attn`` block serves them all.
+    """
+    path = _spec_block_site(perf_db, spec, part, where)
+    value = perf_db["architecture"]
+    for key in path[:-1]:
+        value = value[key]
+    return list(value.get(path[-1]) or [])
+
+
+def _spec_block_site(perf_db, spec, part, where):
+    """Share the pure site rule used by live invocation-count expectations."""
+    from profiler.core.component_layouts import spec_block_site
+    if part not in ("pre_attn", "post_attn", "mlp"):
+        raise ValueError(f"Unknown decoder part: {part}")
+    try:
+        return spec_block_site(perf_db["architecture"], spec, part)
+    except ValueError as exc:
+        raise KeyError(f"Architecture {perf_db['variant']}, {where} of {perf_db['model']}: {exc}") from exc
 
 
 _skipped_layer_warned = set()
@@ -1333,16 +1826,134 @@ def _layer_available(perf_db, tp, layer_name):
     if category is None:
         return False
     tp_eff = _effective_tp(perf_db, category, layer_name, tp)
-    tables = perf_db["tables"].get(tp_eff, {})
+    tables = _tp_tables(perf_db, tp_eff)
     if category == "dense":
         return layer_name in tables.get("dense", {})
     if category == "per_sequence":
         return layer_name in tables.get("per_sequence", {})
     if category == "attention":
-        return bool(tables.get("attention"))
+        # Ask for the requested kernel, not just "is there attention data".
+        # The group can hold more than one now -- a sparse-attention profile
+        # carries an indexer beside the attention kernel -- and answering yes
+        # for a layer the profile has no rows for would emit a trace node
+        # backed by nothing. For a bundle profiled before the CSV gained a
+        # layer column, ``attention_by_layer`` is ``{"attention": ...}``, so a
+        # catalog declaring ``attention`` still answers exactly as before.
+        return layer_name in (tables.get("attention_by_layer") or {})
+    if category == "linear_attention":
+        return layer_name in (tables.get("linear_attention_by_layer") or {})
     if category == "moe":
         return bool(tables.get("moe"))
+    if category == "mtp":
+        return layer_name in (tables.get("mtp") or {})
     return False
+
+
+def _component_layout_choices(perf_db, tp):
+    """Read and verify each TP's recorded layout once, not once per layer."""
+    from profiler.core.component_layouts import read_for_trace
+    choices = perf_db.setdefault("component_layout_choices", {})
+    if tp not in choices:
+        choices[tp] = read_for_trace(
+            os.path.join(perf_db["root"], f"tp{tp}"),
+            perf_db["architecture"])
+    return choices[tp]
+
+
+def _selected_component_sizes(perf_db, tp, config):
+    """Resolve once from validated recorded coverage, never a model-name alias."""
+    cache = perf_db.setdefault('component_sizes', {})
+    if tp in cache:
+        if cache[tp] is not None:
+            cache[tp].validate_config(config)
+        return cache[tp]
+    from profiler.core.component_layouts import metadata_records, selected_runtime_contract
+    architecture = perf_db['architecture']
+    if architecture.get('native_profile') is not None:
+        if tp != 1:
+            raise NotImplementedError('Local native category profiles support TP1 only')
+        from .component_sizes import ContextualProfileBundle
+        from .utils import get_source_config
+        selected = ContextualProfileBundle(os.path.join(perf_db['root'], 'tp1'), architecture,
+                                           get_source_config(perf_db['model']))
+        selected.validate_config(config)
+        cache[tp] = selected
+        return selected
+    if not architecture.get('component_layouts'):
+        cache[tp] = None
+        return None
+    choices = _component_layout_choices(perf_db, tp)
+    schema = selected_runtime_contract(architecture, choices)
+    if schema is None:
+        cache[tp] = None
+        return None
+    from .component_sizes import NATIVE_DSA, NativeDSASizes
+    if schema != NATIVE_DSA:
+        raise NotImplementedError(f'No trace tensor contract for {schema!r}')
+    block = metadata_records(perf_db['root'], architecture)
+    cache[tp] = NativeDSASizes.from_record(config, block['per_tp'][tp])
+    return cache[tp]
+
+
+def _component_layout_catalog(perf_db, tp, category):
+    """Select the same recorded components for lookup and trace composition.
+
+    A catalog may declare inactive alternatives. They must not alter an old
+    calibration's saturation map or make an inactive table appear measured.
+    This projection changes no coordinate, interpolation or stored timing.
+    """
+    architecture = perf_db["architecture"]
+    entries = architecture["catalog"].get(category) or {}
+    if not architecture.get("component_layouts"):
+        return entries
+    from profiler.core.component_layouts import selected_catalog_for_tp
+    cache = perf_db.setdefault("component_layout_catalogs", {})
+    key = (tp, category)
+    if key not in cache:
+        choices, selected = selected_catalog_for_tp(
+            os.path.join(perf_db["root"], f"tp{tp}"), architecture, category)
+        recorded = perf_db.setdefault("component_layout_choices", {})
+        if tp in recorded and recorded[tp] != choices:
+            raise ValueError("Component-layout selection changed after lookup initialization")
+        recorded[tp] = choices
+        cache[key] = selected
+    return cache[key]
+
+
+def _component_layout_sequence(perf_db, tp, layers):
+    """Cache an immutable expansion by TP and the original sequence."""
+    from profiler.core.component_layouts import expand_sequence
+    key = (tp, tuple(layers))
+    cache = perf_db.setdefault("component_layout_sequences", {})
+    if key not in cache:
+        cache[key] = tuple(expand_sequence(perf_db["architecture"],
+                                          _component_layout_choices(perf_db, tp), layers))
+    return cache[key]
+
+
+def _component_site_sequence(perf_db, tp, path, *, role, layer_index=None):
+    """Resolve a named site with explicit target/shared/drafter ownership."""
+    architecture = perf_db["architecture"]
+    if not architecture.get("component_layouts"):
+        value = architecture
+        for key in path:
+            value = value.get(key, {}) if isinstance(value, dict) else None
+        return tuple(value or ())
+    from profiler.core.component_layouts import resolve_sequence_site
+    key = (tp, tuple(path), role, layer_index)
+    cache = perf_db.setdefault("component_layout_sites", {})
+    if key not in cache:
+        cache[key] = resolve_sequence_site(
+            architecture, _component_layout_choices(perf_db, tp), path,
+            role=role, layer_index=layer_index)
+    return cache[key]
+
+
+def _resolved_block_sequence(ctx, layer_num, part):
+    path = _spec_block_site(ctx.perf_db, _layer_spec(ctx.perf_db, layer_num),
+                            part, f"layer {layer_num}")
+    return _component_site_sequence(ctx.perf_db, ctx.tp_size, path,
+                                    role="target", layer_index=layer_num)
 
 
 def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
@@ -1350,11 +1961,27 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
     yaml, emitting each. ``attention`` triggers PIM attention before the
     NPU kernel when attn offloading is enabled; layers in
     ``_TP_ALLREDUCE_AFTER`` get an ALLREDUCE attached. When a layer is
-    declared in the sequence but the profile CSV lacks data for it
+    declared in a block but the profile CSV lacks data for it
     (e.g., an older profile run that predates a yaml addition), the
     emission is skipped with a single warning per (variant, layer).
     """
+    if ctx.perf_db["architecture"].get("component_layouts"):
+        layers = _component_layout_sequence(ctx.perf_db, ctx.tp_size, layers)
+    _emit_resolved_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag)
+
+
+def _is_contextual_profile(ctx):
+    from .component_sizes import CONTEXTUAL_PROFILE
+    return getattr(ctx.component_sizes, 'schema', None) == CONTEXTUAL_PROFILE
+
+
+def _emit_resolved_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag, source_role=None):
+    """Emit an already resolved sequence without applying substitutions twice."""
     for layer_name in layers:
+        if layer_name == 'attn_res' and _is_contextual_profile(ctx):
+            _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
+                        source_role=source_role)
+            continue
         if layer_name == "attention":
             if ctx.enable_attn_offloading:
                 _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
@@ -1367,54 +1994,91 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
             if key not in _skipped_layer_warned:
                 _skipped_layer_warned.add(key)
                 logger.warning(
-                    "Layer %r is in the architecture yaml sequence but missing from "
+                    "Layer %r is in the architecture yaml block order but missing from "
                     "the profile CSVs for %s/%s/%s — skipping. Re-profile to include it.",
                     layer_name, ctx.perf_db["hardware"],
                     ctx.perf_db["model"], ctx.perf_db["variant"],
                 )
             continue
-        if layer_name in _TP_ALLREDUCE_AFTER:
+        reduction = ctx.perf_db["architecture"]["catalog"].get("dense", {}).get(layer_name, {}).get("tp_output_reduction")
+        if layer_name in _TP_ALLREDUCE_AFTER or reduction == "all_reduce":
             comm_size, comm_type = _tp_comm(ctx, layer_name, bctx.total_len)
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
                         comm_type=_with_dim(comm_type, ctx.tp_dim), comm_size=comm_size)
+        elif layer_name == 'qkv_proj' and ctx.pd_type == 'prefill':
+            # P/D disaggregation: this layer's KV has to reach the paired decode
+            # instance. The Chakra converter's PREFILL path emits a point-to-point
+            # send after every *v_proj layer and takes the byte count from the
+            # trace's comm_size column, so put the KV size there.
+            #
+            # Deliberately not the layer's output_size, which the converter used
+            # to read: that is the whole QKV activation, so it shipped Q as well
+            # and overstated the transfer by (q_dim + 2*kv_dim) / (2*kv_dim) --
+            # 3x for Llama-3.1-8B, 1.5x for MHA, more at wider GQA ratios -- and
+            # it ignored kv_cache_dtype. comm_type stays NONE: the converter
+            # builds a SEND/RECV pair, for which ASTRA-Sim reads comm_size,
+            # comm_src, comm_dst and comm_tag.
+            _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
+                        comm_size=_pd_kv_send_bytes(ctx, bctx))
         else:
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num)
 
 
+def _block_copy_key(ctx, block_mode_on, *layer_nums):
+    """Cache key for a built transformer block, or None if it must be rebuilt.
+
+    A block's rows carry no layer index -- ``_emit_layer`` writes the canonical
+    name and the writer numbers the lines -- so two layers can share one built
+    block whenever they are the *same* block. That is what makes trace
+    generation O(1) in depth instead of O(num_hidden_layers).
+
+    Two things break the equivalence. ``block_mode_on`` emits each layer
+    separately by definition, and a MoE router that is not deterministic
+    carries per-layer variance (``gate.block_copy`` opts into swallowing it).
+    Beyond those, the key is the layers' own :class:`LayerSpec`s: a
+    heterogeneous stack has genuinely different blocks, and replaying layer 0's
+    would emit gated DeltaNet for all 64 of Qwen3.8's layers, or a dense MLP
+    for all 61 of DeepSeek-V3.2's. Several layer numbers for the interleaved
+    path, whose block straddles a boundary.
+    """
+    if block_mode_on or _is_contextual_profile(ctx):
+        return None
+    if ctx.is_moe and not ctx.gate.block_copy:
+        return None
+    groups = ctx.perf_db["architecture"].get("component_layouts") or {}
+    if any(group.get("sites") for group in groups.values()):
+        # A fused prologue may consume only the first decoder's input norm.
+        # Later equivalent layers still share their cache entry, but must not
+        # replay that shorter first-layer sequence, including interleaving.
+        return tuple((_layer_spec(ctx.perf_db, n),
+                      tuple(_resolved_block_sequence(ctx, n, part)
+                            for part in ("pre_attn", "post_attn", "mlp")))
+                     for n in layer_nums)
+    return tuple(_layer_spec(ctx.perf_db, n) for n in layer_nums)
+
+
 def _emit_pre_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_tag='NONE'):
-    # DeepSeek-V4 dispatch: layers with ``compress_ratios[layer_num] == 4``
-    # instantiate a DeepseekV4Indexer overlay and need the longer
-    # ``pre_attn_indexed`` sequence; other layers run plain MLA via
-    # ``pre_attn``. Falls back to ``pre_attn`` for every non-V4 model
-    # (their config has no compress_ratios -> empty list -> never indexed).
-    use_indexer = (
-        ctx.compress_ratios
-        and layer_num < len(ctx.compress_ratios)
-        and ctx.compress_ratios[layer_num] == 4
-    )
-    seq_name = "pre_attn_indexed" if use_indexer else "pre_attn"
-    _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, seq_name),
-                   lines, power_acc, batch_tag)
+    _emit_resolved_sequence(ctx, bctx, layer_num,
+                           _resolved_block_sequence(ctx, layer_num, "pre_attn"),
+                           lines, power_acc, batch_tag, source_role='pre_attn')
 
 
 def _emit_post_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_id_str, batch_tag='NONE'):
-    # Attention post-processing common to dense and MoE.
-    _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, "post_attn"),
-                   lines, power_acc, batch_tag)
-    # MLP: either the dense FFN stack or a single MoE block. Hybrid
-    # models (DeepSeek-V3) keep the first ``first_k_dense_replace``
-    # layers dense and only run the MoE block from that index onward.
-    use_moe = ctx.is_moe and layer_num >= ctx.first_k_dense_replace
-    if use_moe:
-        moe_seq = _sequence(ctx.perf_db, "mlp_moe")
-        for layer_name in moe_seq:
-            if layer_name == "moe":
-                _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag)
-            else:
-                _emit_sequence(ctx, bctx, layer_num, [layer_name], lines, power_acc, batch_tag)
-    else:
-        _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, "mlp_dense"),
-                       lines, power_acc, batch_tag)
+    # Attention post-processing, from this layer's own block.
+    _emit_resolved_sequence(ctx, bctx, layer_num,
+                           _resolved_block_sequence(ctx, layer_num, "post_attn"),
+                           lines, power_acc, batch_tag, source_role='post_attn')
+    # MLP: whichever this layer runs. Resolved per layer, not per model --
+    # DeepSeek-V3.2 and GLM-5 run a dense MLP for their first
+    # ``first_k_dense_replace`` layers and MoE for the rest, and a model-level
+    # flag emitted MoE for all of them.
+    for layer_name in _resolved_block_sequence(ctx, layer_num, "mlp"):
+        if layer_name == "moe":
+            _emit_moe_block(ctx, bctx, lines, power_acc, layer_num,
+                            batch_id_str, batch_tag)
+        else:
+            _emit_resolved_sequence(ctx, bctx, layer_num, [layer_name],
+                                    lines, power_acc, batch_tag)
 
 
 def _build_transformer_block(ctx, bctx, layer_num, batch_tag, batch_id_str):
@@ -1440,33 +2104,216 @@ def _layer_latency_for_power(ctx, bctx, layer_name):
     if category == "attention":
         return _lookup_attention_with_skew(
             ctx.perf_db, ctx.tp_size,
-            bctx.prefill_chunk, bctx.kv_prefill,
+            bctx.prefill_chunk,
+            _prefill_key_for(ctx.perf_db, bctx, layer_name),
             bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
-            bctx.kv_decode_min,
-            sliding_window=ctx.sliding_window,
+            bctx.kv_decode_min, layer_name, bctx.decode_q_len,
         )
+    if category == "linear_attention":
+        return _lookup_linear_attention(
+            ctx.perf_db, ctx.tp_size, layer_name,
+            bctx.prefill_chunk, bctx.n_decode,
+        ) or 0
     return _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
 
 
-def _emit_final_layers(ctx, bctx, f, batch_tag='NONE'):
+def _drafter_spec(perf_db):
+    """The composition of the decoder block one drafter pass wraps.
+
+    Declared in the catalog's ``mtp.decoder_block`` rather than resolved from
+    the checkpoint, because vLLM's MTP modules **force** it per family and the
+    forcing lives in each family's ``*_mtp.py``: DeepSeek/GLM build the block
+    at layer index ``num_hidden_layers`` (past ``first_k_dense_replace``,
+    inheriting ``index_topk``), Qwen3.5 passes ``layer_type="full_attention"``
+    explicitly, MiniMax-M3 passes ``force_sparse_attn=True, force_moe=True``.
+    Indexing the resolved stack gets all three wrong -- it has exactly
+    ``num_hidden_layers`` entries, so the drafter's index wraps to layer 0.
+
+    An axis the catalog leaves unset is inherited from the target's stack, and
+    only when the stack agrees on it: with no single value there is nothing to
+    inherit, so the catalog has to name one.
+    """
+    mod = _stack_module()
+    declared = (perf_db["architecture"].get("mtp") or {}).get("decoder_block")
+    if declared is None:
+        return None
+    stack = perf_db.get("layer_stack") or []
+    resolved = {}
+    for axis, default in (("attn", mod.FULL_ATTENTION),
+                          ("mlp", mod.MLP_DENSE), ("sparse", False)):
+        value = declared.get(axis)
+        if value is not None:
+            resolved[axis] = value
+            continue
+        seen = {getattr(spec, axis) for spec in stack}
+        if len(seen) > 1:
+            raise KeyError(
+                f"{perf_db['model']}'s catalog leaves mtp.decoder_block.{axis} "
+                f"unset, but its stack is not uniform on that axis "
+                f"({sorted(map(str, seen))}), so there is no value to inherit. "
+                f"Name the drafter's own in profiler/models/*.yaml -- vLLM's "
+                f"MTP module forces it, so reading it off the checkpoint would "
+                f"be a guess."
+            )
+        resolved[axis] = seen.pop() if seen else default
+    return mod.LayerSpec(attn=resolved["attn"], mlp=resolved["mlp"],
+                         sparse=bool(resolved["sparse"]))
+
+
+def _drafter_loop_bctx(bctx):
+    """The batch shape of drafter passes 1..N-1: one query token per sequence.
+
+    vLLM's first drafter pass reuses the target's own token layout (minus
+    rejected tokens), then the loop pins ``max_query_len = 1`` and
+    ``num_actual_tokens = batch_size`` (``llm_base_proposer.py``), so every
+    later pass is a pure decode over the batch's sequences however the target
+    step was shaped. Reusing the target's shape for all N charges a prefill
+    chunk N times over.
+    """
+    n = bctx.lm_head_len
+    # Sequences still prefilling draft too, and their kv is the history the
+    # target just read plus this step's chunk. With no decode requests at all
+    # that is the only kv figure available.
+    if bctx.n_decode > 0:
+        kv_mean, kv_max, kv_min = (bctx.kv_decode_mean, bctx.kv_decode_max,
+                                   bctx.kv_decode_min)
+    else:
+        per_seq = (bctx.kv_prefill + bctx.prefill_chunk) // max(n, 1)
+        kv_mean = kv_max = kv_min = per_seq
+    return replace(
+        bctx, total_len=n, prefill_chunk=0, kv_prefill=0,
+        prefill_key=0.0, prefill_key_capped=0.0, n_decode=n,
+        kv_decode_mean=kv_mean, kv_decode_max=kv_max, kv_decode_min=kv_min,
+        lm_head_len=n, decode_q_len=1,
+    )
+
+
+def _emit_drafter(ctx, bctx, rows, batch_id_str, batch_tag='NONE'):
+    """Emit the drafter's passes, after the target's head.
+
+    vLLM runs the drafter **N times per step** -- once, then
+    ``num_speculative_tokens - 1`` more inside ``llm_base_proposer.py``'s loop.
+    It runs from ``sample_tokens()``, i.e. after the target has sampled, which
+    is why this comes after the head rather than inside the block walk.
+
+    One pass is ``mtp.prologue`` (the norms and the 2h->h combine), then a
+    **whole decoder block**, then ``mtp.head``. The block is not in the
+    prologue list because it is the *same class* as a target decoder layer, so
+    its cost is the target's own block replayed -- and it is the dominant term:
+    charging only the wrapper reads a drafter pass at a few percent of its real
+    cost, which is the speedup-from-nowhere the refusal in ``__main__`` exists
+    to prevent.
+
+    Emits nothing when speculative decoding is off, or when the architecture
+    declares no ``mtp:`` section, or when no sequence sampled this step: with
+    nothing to draft *for*, vLLM does not call the drafter either.
+    """
+    n = int(ctx.num_speculative_tokens or 0)
+    if n <= 0 or bctx.lm_head_len <= 0:
+        return
+    mtp = ctx.perf_db["architecture"].get("mtp") or {}
+    prologue = list(mtp.get("prologue") or [])
+    head = list(mtp.get("head") or [])
+    spec = _drafter_spec(ctx.perf_db)
+    if not prologue and not head and spec is None:
+        return
+
+    # Pass 0 runs over the target's own token layout; the loop's passes are
+    # pure decode at one query per sequence.
+    loop_bctx = _drafter_loop_bctx(bctx)
+    emitted_before = len(rows)
+    for pass_idx in range(n):
+        pass_bctx = bctx if pass_idx == 0 else loop_bctx
+        power_acc = PowerAccumulator([], [], 0, 0)
+        _emit_sequence(ctx, pass_bctx, 0, prologue, rows, power_acc, batch_tag)
+        if spec is not None:
+            _emit_drafter_block(ctx, pass_bctx, spec, rows, power_acc,
+                                batch_tag, f"{batch_id_str}.mtp{pass_idx}")
+        _emit_sequence(ctx, pass_bctx, 0, head, rows, power_acc, batch_tag)
+        power_acc.flush(ctx, ctx.enable_attn_offloading)
+
+    # The drafter now holds the trace's last row, and the Chakra converter
+    # takes its MEM_STORE node from *that* row's output location -- so it has
+    # to route to REMOTE or the store lands on LOCAL, which crashes ASTRA-Sim
+    # unless local_mem is configured. It is also what happens: the draft token
+    # ids go back to the host, the same way the sampler's do.
+    # ``_emit_final_layers`` already marked the head's last row, and a
+    # mid-trace REMOTE output is fine -- only the last row's is read.
+    #
+    # It also has to be a **layer** row. A drafter whose block ends in MoE
+    # closes with an ``EXPERT END`` marker, and the converter reads the last
+    # entry's attributes unconditionally -- MiniMax-M3 hit that as
+    # ``'Layer' object has no attribute 'output_memory_loc'`` from inside the
+    # converter. So the catalog has to name something for ``mtp.head``, and
+    # both families whose block ends in MoE have one to name: their wrapper's
+    # norms are a single merged profile node spanning **both** sides of the
+    # block, so charging it after is as accurate as charging it before.
+    if len(rows) > emitted_before and len(rows[-1]) != _TRACE_ROW_FIELDS:
+        raise ValueError(
+            f"{ctx.model}'s drafter emission ends on a marker row "
+            f"({rows[-1]!r}), not a layer. The Chakra converter takes the "
+            f"trace's MEM_STORE node from the last entry's output location, so "
+            f"the last row has to be a layer routing to REMOTE. Name a layer "
+            f"in the catalog's 'mtp.head' -- the wrapper's post-block norm is "
+            f"the one every family has."
+        )
+    if len(rows) > emitted_before:
+        row = list(rows[-1])
+        row[6] = f'REMOTE:{ctx.node_id}'
+        rows[-1] = tuple(row)
+
+
+def _emit_drafter_block(ctx, bctx, spec, rows, power_acc, batch_tag,
+                        batch_id_str):
+    """One drafter decoder block: the target's own block, at ``spec``."""
+    for part in ("pre_attn", "post_attn"):
+        _emit_sequence(ctx, bctx, 0,
+                       _spec_block_layers(ctx.perf_db, spec, part,
+                                          "the drafter's block"),
+                       rows, power_acc, batch_tag)
+    for layer_name in _spec_block_layers(ctx.perf_db, spec, "mlp",
+                                         "the drafter's block"):
+        if layer_name == "moe":
+            _emit_moe_block(ctx, bctx, rows, power_acc, 0, batch_id_str,
+                            batch_tag)
+        else:
+            _emit_sequence(ctx, bctx, 0, [layer_name], rows, power_acc,
+                           batch_tag)
+
+
+def _emit_final_layers(ctx, bctx, rows, batch_tag='NONE'):
     """Emit the architecture's head layers (final_layernorm, lm_head,
     sampler — ordered per the yaml) and feed them into the power model.
     The last emitted layer routes its output to REMOTE so the Chakra
     converter places a MEM_STORE node back to CPU.
     """
-    head_layers = _sequence(ctx.perf_db, "head")
-    lines = []
+    head_layers = _component_site_sequence(ctx.perf_db, ctx.tp_size,
+                                           ("shared", "head"), role="shared")
+    idle = bctx.lm_head_len == 0
+    if idle:
+        # The dummy forward still runs its final norm, but no logits/sampling.
+        head_layers = [name for name in head_layers
+                       if _layer_category(ctx.perf_db, name) != "per_sequence"]
     for i, layer_name in enumerate(head_layers):
         output_loc = f'REMOTE:{ctx.node_id}' if i == len(head_layers) - 1 else 'LOCAL'
-        _emit_layer(ctx, bctx, layer_name, lines, None, batch_tag, output_loc=output_loc)
-    f.writelines(lines)
+        _emit_layer(ctx, bctx, layer_name, rows, None, batch_tag, output_loc=output_loc)
+    if idle and rows:
+        # Retain a normal final trace row for the converter, with no token IDs
+        # sent back to the host. Its compute and TP dependencies are unchanged.
+        last = list(rows[-1])
+        last[6:8] = [f'REMOTE:{ctx.node_id}', '0']
+        rows[-1] = tuple(last)
 
     if ctx.power_model is not None:
         for layer_name in head_layers:
             lat = _layer_latency_for_power(ctx, bctx, layer_name)
             ctx.power_model.add_npu_active_energy_consumption(ctx.hardware, ctx.node_id, lat, num_npus=ctx.tp_size)
+            comm, size = _shared_tp_collective(ctx, bctx, layer_name)
+            if size:
+                ctx.power_model.add_link_energy_consumption(ctx.node_id, total_ring_data(
+                    size, ctx.tp_size, collective=comm.split(':')[0].lower()))
             if get_device(ctx.placement, None, layer_name, "weights") != 'LOCAL':
-                _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, parallel=ctx.tp_size, fp=ctx.fp, weight_fp=ctx.weight_fp)
+                _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, parallel=ctx.tp_size, fp=ctx.fp)
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
 
 
@@ -1487,44 +2334,57 @@ def _emit_pp_pd_power(ctx, bctx):
 # _synthesize_trace (non-interleaved)
 # ======================================================================
 
-def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
+def _emit_prologue(ctx, bctx, rows, batch_tag='NONE'):
     """Emit prologue layers (typically just embedding). The first layer's
     input is routed from REMOTE to match the Chakra converter's
     MEM_LOAD node placement.
     """
-    prologue_layers = _sequence(ctx.perf_db, "prologue")
+    prologue_layers = _component_site_sequence(ctx.perf_db, ctx.tp_size,
+                                               ("shared", "prologue"), role="shared")
     if not prologue_layers:
-        return
-    lines = []
+        return 0
+    before = len(rows)
     for i, layer_name in enumerate(prologue_layers):
         input_loc = f'REMOTE:{ctx.node_id}' if i == 0 else 'LOCAL'
-        _emit_layer(ctx, bctx, layer_name, lines, None, batch_tag, input_loc=input_loc)
-    f.writelines(lines)
+        _emit_layer(ctx, bctx, layer_name, rows, None, batch_tag, input_loc=input_loc)
     if ctx.power_model:
         for layer_name in prologue_layers:
             lat = _layer_latency_for_power(ctx, bctx, layer_name)
             ctx.power_model.add_npu_active_energy_consumption(
                 ctx.hardware, ctx.node_id, lat, num_npus=ctx.tp_size)
+            comm, size = _shared_tp_collective(ctx, bctx, layer_name)
+            if size:
+                ctx.power_model.add_link_energy_consumption(ctx.node_id, total_ring_data(
+                    size, ctx.tp_size, collective=comm.split(':')[0].lower()))
             if get_device(ctx.placement, None, layer_name, "weights") != 'LOCAL':
-                _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len, fp=ctx.fp, weight_fp=ctx.weight_fp)
+                _, wt, _ = calculate_sizes(ctx.model, layer_name, bctx.total_len,
+                                           parallel=ctx.tp_size, fp=ctx.fp)
                 ctx.power_model.add_dram_energy_consumption(ctx.node_id, wt)
+    return len(rows) - before
 
 
 def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
-                      batch, max_len, output_path, placement, block_mode_on, gate,
+                      batch, max_len, placement, block_mode_on, gate,
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
-                      weight_fp=None, moe_weight_fp=None):
+                      tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0,
+                      num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), duration_replay_only=False):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
-                           weight_fp=weight_fp, moe_weight_fp=moe_weight_fp)
+                           dp_min_total_len=dp_min_total_len,
+                           num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
+                           dp_token_counts=dp_token_counts,
+                           duration_replay_only=duration_replay_only)
     bctx = _build_batch_ctx(batch, ctx)
+
+    if ctx.component_sizes is not None:
+        from .component_sizes import validate_actual_batch
+        validate_actual_batch(ctx, bctx)
 
     logger.info(
         "Batch #%d: model=%s num_reqs=%d total_len=%d req_ids=%s",
@@ -1532,58 +2392,71 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
         [r.id for r in batch.requests],
         extra={"node_id": node_id, "instance_id": instance_id},
     )
+    # The shape, for matching a step against a real run's own per-step record
+    # (vLLM logs `num_tokens, n_reqs, n_prefill, prefill_tokens`). At DEBUG
+    # because it is diagnostic: `total_len` alone mixes a prefill chunk with
+    # the decodes riding alongside it, and that distinction is what localises
+    # a per-shape error -- but nothing in a normal run needs it.
+    logger.debug(
+        "Batch #%d shape: total_len=%d prefill_chunk=%d n_decode=%d "
+        "n_prefill=%d prefill_key=%d kv_mean=%d kv_max=%d kv_min=%d "
+        "q_len=%d", batch.batch_id, batch.total_len, bctx.prefill_chunk,
+        bctx.n_decode, len(batch.requests) - bctx.n_decode,
+        round(bctx.prefill_key), bctx.kv_decode_mean, bctx.kv_decode_max,
+        bctx.kv_decode_min, bctx.decode_q_len,
+        extra={"node_id": node_id, "instance_id": instance_id},
+    )
 
-    with open(output_path, 'w') as f:
-        _emit_prologue(ctx, bctx, f)
-
-        # Transformer blocks
-        num_layers = config['num_hidden_layers']
-        # Hybrid FFN models (DeepSeek-V3) must iterate every layer so
-        # the dense/MoE dispatch in _emit_post_attn_layers actually
-        # produces both block kinds — block_copy is unsafe here.
-        # DeepSeek-V4 hybrid attention: ``pre_attn`` vs ``pre_attn_indexed``
-        # dispatch in _emit_pre_attn_layers needs every layer to be
-        # emitted so the right sequence runs per compress_ratios entry.
-        # ``hybrid_attn`` true only when the compress_ratios array mixes
-        # 4 and non-4 values (V4's actual pattern); a uniform array
-        # would still allow block_copy.
-        hybrid_ffn = ctx.first_k_dense_replace > 0
-        hybrid_attn = (
-            bool(ctx.compress_ratios)
-            and any(r == 4 for r in ctx.compress_ratios)
-            and any(r != 4 for r in ctx.compress_ratios)
+    # The batch's exact composition, so a shape the simulator got wrong can be
+    # re-fired at the profiler verbatim rather than approximated by the grid
+    # coordinate it was looked up at. Guarded on the level so the list -- up to
+    # max_num_seqs entries -- costs nothing in a normal run.
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Batch #%d compose: decode_k=%s prefill=%s", batch.batch_id,
+            ",".join(str(k) for k in batch.decode_k_list),
+            ",".join(f"{c}:{k}" for c, k in zip(
+                batch.prefill_q_list,
+                batch.prefill_k_list)),
+            extra={"node_id": node_id, "instance_id": instance_id},
         )
-        iter_count, copy_count = (num_layers, 1) if (block_mode_on or hybrid_ffn or hybrid_attn) else (1, num_layers)
 
-        for layer_num in range(iter_count):
-            block_lines, block_power = _build_transformer_block(ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
+    # Line index at which each transformer block starts, used to cut
+    # pipeline stages on block boundaries (see _pp_stage_boundaries).
+    block_starts = []
 
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed). Hybrid models
-            # (DeepSeek-V3 with first_k_dense_replace>0, DeepSeek-V4
-            # with alternating compress_ratios) have a different
-            # pre/post sequence on some layers, so block-copying the
-            # first block to all layers is structurally wrong —
-            # disable it.
-            can_copy = (
-                (not ctx.is_moe or ctx.gate.block_copy)
-                and not block_mode_on
-                and ctx.first_k_dense_replace == 0
-                and not hybrid_attn
-            )
-            if can_copy:
-                for _ in range(copy_count):
-                    f.writelines(block_lines)
-                    block_power.flush(ctx, enable_attn_offloading)
-            else:
-                f.writelines(block_lines)
-                block_power.flush(ctx, enable_attn_offloading)
+    rows = []
+    written = _emit_prologue(ctx, bctx, rows)
 
-        # Final layers
-        _emit_final_layers(ctx, bctx, f)
-        _emit_pp_pd_power(ctx, bctx)
+    # Transformer blocks
+    num_layers = config['num_hidden_layers']
+
+    # Build one block per distinct block *shape* and replay it for every layer
+    # that shares it. A uniform stack builds once and replays N times, exactly
+    # as before; a heterogeneous one builds once per shape, which is what makes
+    # the replay correct rather than merely fast.
+    built = {}
+    for layer_num in range(num_layers):
+        key = _block_copy_key(ctx, block_mode_on, layer_num)
+        cached = built.get(key) if key is not None else None
+        if cached is None:
+            cached = _build_transformer_block(
+                ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
+            if key is not None:
+                built[key] = cached
+        block_lines, block_power = cached
+        block_starts.append(written)
+        rows.extend(block_lines)
+        written += len(block_lines)
+        block_power.flush(ctx, enable_attn_offloading)
+
+    # Final layers
+    _emit_final_layers(ctx, bctx, rows)
+    _emit_drafter(ctx, bctx, rows, str(batch.batch_id))
+    _emit_pp_pd_power(ctx, bctx)
+
+
+    return rows, block_starts
 
 
 # ======================================================================
@@ -1591,19 +2464,24 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
 # ======================================================================
 
 def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
-                                  batches, max_len, output_path, placement, block_mode_on, gate,
+                                  batches, max_len, placement, block_mode_on, gate,
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0,
-                                  weight_fp=None, moe_weight_fp=None):
+                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0,
+                                  num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), duration_replay_only=False):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
                            tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
-                           weight_fp=weight_fp, moe_weight_fp=moe_weight_fp)
+                           dp_min_total_len=dp_min_total_len,
+                           num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
+                           dp_token_counts=dp_token_counts,
+                           duration_replay_only=duration_replay_only)
+    if ctx.component_sizes is not None:
+        raise NotImplementedError('Native DSA interleaved trace execution is not yet admitted')
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1622,36 +2500,32 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 
     num_layers = config['num_hidden_layers']
 
-    with open(output_path, 'w') as f:
-        # PROLOGUE: Batch1 prologue + first pre-attn
-        _emit_prologue(ctx, bctx1, f, 'BATCH_1')
+    rows = []
 
-        pre_attn1_lines = []
-        pre_attn1_power = PowerAccumulator([], [], 0, 0)
-        _emit_pre_attn_layers(ctx, bctx1, 0, pre_attn1_lines, pre_attn1_power, 'BATCH_1')
-        f.writelines(pre_attn1_lines)
-        pre_attn1_power.flush(ctx, enable_attn_offloading)
+    # PROLOGUE: Batch1 prologue + first pre-attn
+    _emit_prologue(ctx, bctx1, rows, 'BATCH_1')
 
-        # Batch2 prologue + first pre-attn
-        _emit_prologue(ctx, bctx2, f, 'BATCH_2')
+    pre_attn1_power = PowerAccumulator([], [], 0, 0)
+    _emit_pre_attn_layers(ctx, bctx1, 0, rows, pre_attn1_power, 'BATCH_1')
+    pre_attn1_power.flush(ctx, enable_attn_offloading)
 
-        pre_attn2_lines = []
-        pre_attn2_power = PowerAccumulator([], [], 0, 0)
-        _emit_pre_attn_layers(ctx, bctx2, 0, pre_attn2_lines, pre_attn2_power, 'BATCH_2')
-        f.writelines(pre_attn2_lines)
-        pre_attn2_power.flush(ctx, enable_attn_offloading)
+    # Batch2 prologue + first pre-attn
+    _emit_prologue(ctx, bctx2, rows, 'BATCH_2')
 
-        # MIDDLE LAYERS: interleaved post_attn + pre_attn
-        middle_layers = num_layers - 1
-        hybrid_ffn = ctx.first_k_dense_replace > 0
-        hybrid_attn = (
-            bool(ctx.compress_ratios)
-            and any(r == 4 for r in ctx.compress_ratios)
-            and any(r != 4 for r in ctx.compress_ratios)
-        )
-        iter_count, copy_count = (middle_layers, 1) if (block_mode_on or hybrid_ffn or hybrid_attn) else (1, middle_layers)
+    pre_attn2_power = PowerAccumulator([], [], 0, 0)
+    _emit_pre_attn_layers(ctx, bctx2, 0, rows, pre_attn2_power, 'BATCH_2')
+    pre_attn2_power.flush(ctx, enable_attn_offloading)
 
-        for layer_num in range(iter_count):
+    # MIDDLE LAYERS: interleaved post_attn + pre_attn
+    middle_layers = num_layers - 1
+    # Each interleaved block straddles a layer boundary -- this layer's
+    # post_attn followed by the next layer's pre_attn -- so its shape depends
+    # on both layers, and the cache key carries both.
+    built = {}
+    for layer_num in range(middle_layers):
+        key = _block_copy_key(ctx, block_mode_on, layer_num, layer_num + 1)
+        cached = built.get(key) if key is not None else None
+        if cached is None:
             block_lines = []
             block_power = PowerAccumulator([], [], 0, 0)
 
@@ -1663,44 +2537,77 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
             _emit_post_attn_layers(ctx, bctx2, layer_num, block_lines, block_power, f"{batches[1].batch_id}.1", 'BATCH_2')
             _emit_pre_attn_layers(ctx, bctx2, layer_num + 1, block_lines, block_power, 'BATCH_2')
 
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed). Hybrid models
-            # (DeepSeek-V3 with first_k_dense_replace>0; DeepSeek-V4
-            # with alternating compress_ratios) disable block_copy
-            # because some layers run a different MLP / pre_attn
-            # sequence than the layer used as the template.
-            can_copy = (
-                (not ctx.is_moe or ctx.gate.block_copy)
-                and not block_mode_on
-                and ctx.first_k_dense_replace == 0
-                and not hybrid_attn
-            )
-            if can_copy:
-                for _ in range(copy_count):
-                    f.writelines(block_lines)
-                    block_power.flush(ctx, enable_attn_offloading)
-            else:
-                f.writelines(block_lines)
-                block_power.flush(ctx, enable_attn_offloading)
+            cached = (block_lines, block_power)
+            if key is not None:
+                built[key] = cached
+        block_lines, block_power = cached
+        rows.extend(block_lines)
+        block_power.flush(ctx, enable_attn_offloading)
 
-        # EPILOGUE: last layer post_attn + final layers
-        last_lines = []
-        last_power = PowerAccumulator([], [], 0, 0)
-        _emit_post_attn_layers(ctx, bctx1, num_layers - 1, last_lines, last_power, f"{batches[0].batch_id}.0", 'BATCH_1')
-        f.writelines(last_lines)
-        last_power.flush(ctx, enable_attn_offloading)
-        _emit_final_layers(ctx, bctx1, f, 'BATCH_1')
+    # EPILOGUE: last layer post_attn + final layers
+    last_power = PowerAccumulator([], [], 0, 0)
+    _emit_post_attn_layers(ctx, bctx1, num_layers - 1, rows, last_power, f"{batches[0].batch_id}.0", 'BATCH_1')
+    last_power.flush(ctx, enable_attn_offloading)
+    _emit_final_layers(ctx, bctx1, rows, 'BATCH_1')
+    _emit_drafter(ctx, bctx1, rows, f"{batches[0].batch_id}.0", 'BATCH_1')
 
-        last_lines2 = []
-        last_power2 = PowerAccumulator([], [], 0, 0)
-        _emit_post_attn_layers(ctx, bctx2, num_layers - 1, last_lines2, last_power2, f"{batches[1].batch_id}.1", 'BATCH_2')
-        f.writelines(last_lines2)
-        last_power2.flush(ctx, enable_attn_offloading)
-        _emit_final_layers(ctx, bctx2, f, 'BATCH_2')
+    last_power2 = PowerAccumulator([], [], 0, 0)
+    _emit_post_attn_layers(ctx, bctx2, num_layers - 1, rows, last_power2, f"{batches[1].batch_id}.1", 'BATCH_2')
+    last_power2.flush(ctx, enable_attn_offloading)
+    _emit_final_layers(ctx, bctx2, rows, 'BATCH_2')
+    _emit_drafter(ctx, bctx2, rows, f"{batches[1].batch_id}.1", 'BATCH_2')
 
-        _emit_pp_pd_power(ctx, bctx1)
+    _emit_pp_pd_power(ctx, bctx1)
+
+
+    # Sub-batch interleaving leaves both sub-batches mid-block at every
+    # group edge, so there is no single tensor to hand to the next stage.
+    # generate_trace refuses the combination before we get here.
+    return rows, []
+
+
+# ======================================================================
+# Pipeline-stage partitioning
+# ======================================================================
+
+def _pp_stage_boundaries(block_starts, pp_size):
+    """Trace-line indices at which each pipeline stage after the first begins.
+
+    Mirrors vLLM's ``get_pp_indices``: the transformer blocks are split
+    evenly and any remainder goes to the stages *before* the last one,
+    which also carries ``final_layernorm`` / ``lm_head`` / ``sampler``.
+
+    Cutting only on block boundaries is load-bearing, not cosmetic. The
+    Chakra converter sizes the stage-to-stage SEND from the last layer's
+    ``output_size`` and the RECV from the first layer's ``input_size``,
+    and ASTRA-Sim's callback tracker keys on chunk size — so the two must
+    agree or the receiving NPU waits forever. A block boundary is the only
+    place where they do: a block starts at ``layernorm`` and ends at
+    ``down_proj`` / ``moe``, both of which carry the hidden state
+    (``total_len * hidden_size * fp``). Inside a block they diverge, e.g.
+    ``qkv_proj`` emits Q+K+V while ``rotary_emb`` declares only Q+K.
+
+    Indices are relative to the list the converter partitions, i.e. after
+    any leading ``kv_load`` / ``kv_evict`` lines have been stripped.
+    """
+    if pp_size <= 1:
+        return []
+    n_blocks = len(block_starts)
+    if pp_size > n_blocks:
+        raise ValueError(
+            f"pp_size ({pp_size}) exceeds the model's transformer block count "
+            f"({n_blocks}); a pipeline stage cannot be empty"
+        )
+    per_stage = n_blocks // pp_size
+    partitions = [per_stage] * pp_size
+    for i in range(2, n_blocks % pp_size + 2):
+        partitions[-i] += 1
+    boundaries = []
+    acc = 0
+    for count in partitions[:-1]:
+        acc += count
+        boundaries.append(block_starts[acc])
+    return boundaries
 
 
 # ======================================================================
@@ -1708,20 +2615,28 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 # ======================================================================
 
 # Wrapper function that creates trace for an instance
+
+
+
 def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_type=None, node_id=0, instance_id=0,
                    max_num_batched_tokens=2048, max_num_seqs=None,
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, quantization=None, inputs_root=None):
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0, enable_block_copy=True, inputs_root=None,
+                   num_speculative_tokens=0, gate_stats_path=None, dp_rank=0, dp_token_counts=(),
+                   *, duration_replay_only=False):
+
+    if type(duration_replay_only) is not bool:
+        raise ValueError('duration_replay_only must be an explicit boolean')
+    if duration_replay_only and enable_prefix_caching:
+        raise NotImplementedError('Duration replay has no prefix-cache admission contract')
 
     model = batch.model
     config = get_config(model)
     fp = fp // 8  # bit -> byte of floating point
-    weight_fp = _resolve_weight_fp(fp, quantization, config)
-    moe_weight_fp = _resolve_moe_weight_fp(fp, weight_fp, config)
     max_len = min(max_num_batched_tokens, config['max_position_embeddings'])
-    variant = resolve_variant(dtype, kv_cache_dtype, config)
+    variant = resolve_variant(config)
 
     # vllm: add load or eviction in the txt file
     load_size = batch.load
@@ -1733,23 +2648,30 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
         inputs_root, "trace", hardware, batch.model,
         f"instance{instance_id}_batch{batch.batch_id}.txt",
     )
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # make trace — accept the Mistral-style ``num_local_experts`` key, the
-    # HF/Qwen3 ``num_experts`` key, or the DeepSeek ``n_routed_experts`` key
-    # so all three family's configs resolve to a live GateRouter. (Same
-    # 3-key fallback memory_model.py already uses.)
-    num_experts_cfg = config.get(
-        "num_local_experts",
-        config.get("num_experts", config.get("n_routed_experts")),
-    )
+    # make trace — ``utils.num_experts`` knows every spelling the families
+    # use, so a MoE checkpoint resolves to a live GateRouter whichever key it
+    # declares. DeepSeek and GLM write ``n_routed_experts``, which this site
+    # used to miss, leaving ctx.gate None and the MoE block unemittable.
+    num_experts_cfg = utils_num_experts(config)
     if num_experts_cfg:
         gate = GateRouter(
             node_id, instance_id, num_experts_cfg,
-            num_experts_per_tok=config.get('num_experts_per_tok', 1),
+            num_experts_per_tok=_stack_module().expert_top_k(config),
             routing_policy=expert_routing_policy,
             seed=42,
             block_copy=enable_block_copy,
+            # Group-limited routing, read straight off the checkpoint the way
+            # ``deepseek_v2.py`` does (``num_expert_group=config.n_group``,
+            # ``topk_group=config.topk_group``, both defaulting to 1). Only
+            # DeepSeek-V3.2 actually restricts here -- GLM-5 ships
+            # ``n_group: 1``, which is the unrestricted case spelled out.
+            n_group=config.get('n_group', 1),
+            topk_group=config.get('topk_group', 1),
+            # Only read under ``CUSTOM``; a missing or mismatched file leaves
+            # the closed form in place, which is the documented fallback.
+            gate_stats=gate_stats_path,
+            model_name=model,
         )
     else:
         gate = None
@@ -1771,23 +2693,28 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
                         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
-                        weight_fp=weight_fp, moe_weight_fp=moe_weight_fp)
+                        dp_min_total_len=dp_min_total_len,
+                        num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
+                        dp_token_counts=tuple(dp_token_counts),
+                        duration_replay_only=duration_replay_only)
     if not enable_sub_batch_interleaving:
-        _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
+        rows, block_starts = _synthesize_trace(*synth_args, batch, max_len, **synth_kwargs)
     else:
         batches = _make_sub_batch(batch)
         if len(batches) < 2 or len(batches[0].requests) == 0 or len(batches[1].requests) == 0:
-            _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
+            rows, block_starts = _synthesize_trace(*synth_args, batch, max_len, **synth_kwargs)
         else:
-            _synthesize_interleaved_trace(*synth_args, batches, max_len, output_path, **synth_kwargs)
+            if pp_size > 1:
+                raise ValueError(
+                    "--enable-sub-batch-interleaving is not supported with pp_size > 1: "
+                    "an interleaved trace leaves both sub-batches mid-block at every "
+                    "group edge, so a pipeline stage has no single hidden state to pass on"
+                )
+            rows, block_starts = _synthesize_interleaved_trace(*synth_args, batches, max_len, **synth_kwargs)
 
-    with open(output_path, 'r') as f:
-        dic = []
-        for line in f.readlines():
-            split = re.findall(r'\S+', line)
-            dic.append(split)
+    stage_boundaries = _pp_stage_boundaries(block_starts, pp_size)
 
-    # vllm: open output txt file and add load, evict mem
+    # vllm: prepend the load / evict rows
     mem = []
     if load_size != 0:
         load = ["kv_load", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
@@ -1803,31 +2730,162 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     if power_model is not None:
         power_model.print_log(node_id)
 
-    result = mem + dic
+    # instance type
+    if pd_type == None:
+        instance_type = 'COLOCATED'
+    elif pd_type == 'prefill':
+        instance_type = 'PREFILL'
+    elif pd_type == 'decode':
+        instance_type = 'DECODE'
+    else:
+        raise ValueError(f"Unknown instance type {pd_type}.")
+
+    header_line = f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}"
+    if stage_boundaries:
+        header_line += "\t\tpp_stage_boundaries: " + ",".join(str(b) for b in stage_boundaries)
+
+    # The rows go to generate_graph rather than to disk. It hashes them for
+    # the converted-graph cache, and only a cache miss needs the text file at
+    # all -- so on a hit nothing is formatted and nothing is written. Writing
+    # it here unconditionally cost 0.616 ms per batch, 8,810 times on the
+    # swe-bench MoE DP+EP example, for a file that was then read straight
+    # back in the same process.
+    # The context builder already verified this immutable per-TP selection.
+    selected_sizes = _perf_db_cache[(hardware, model, variant)]['component_sizes'][tp_size]
+    return TraceData(header_line=header_line, rows=mem + rows, path=output_path,
+                     byte_contract=selected_sizes.schema if selected_sizes else None)
+
+
+# ======================================================================
+# Trace file writer
+# ======================================================================
+
+@dataclass
+class TraceData:
+    """A synthesized trace, before it is turned into text.
+
+    ``rows`` are field tuples straight from the emitters: eleven fields for a
+    layer, one for an EXPERT/PIM marker. ``path`` is where the ``.txt`` goes
+    if anything asks for it.
+    """
+    header_line: str
+    rows: list
+    path: str
+    byte_contract: str = None
+
+
+_TRACE_ROW_FIELDS = 11
+
+# One-shot guard, see _write_trace.
+_row_format_checked = False
+
+
+def indexed_cols(rows):
+    """The field lists the Chakra converter sees after parsing the trace text.
+
+    Mirrors _write_trace's two cases. A layer row gets its final row index
+    appended to the name and keeps its ten other fields. A marker row becomes
+    the tokens of its text -- which is how it comes back today, once the
+    formatter has padded it into the name column and the reader has split the
+    line on whitespace.
+
+    Kept beside _write_trace because the two have to agree exactly: the index
+    is positional and depends on the kv_load/kv_evict rows already sitting at
+    the front. Their agreement is not assumed -- the graphs built from each
+    path are byte-compared.
+    """
+    out = []
+    for i, row in enumerate(rows):
+        if len(row) == _TRACE_ROW_FIELDS:
+            out.append([f'{row[0]}_{i}', *row[1:]])
+        elif len(row) == 1:
+            out.append(row[0].split())
+        else:
+            raise ValueError(
+                f"trace row {i} has {len(row)} fields; expected "
+                f"{_TRACE_ROW_FIELDS} for a layer row or 1 for a marker. "
+                f"Row: {row!r}"
+            )
+    return out
+
+
+def write_trace(trace):
+    """Materialise a TraceData as text, for inspection.
+
+    Nothing in the pipeline reads it any more -- the converter takes the rows
+    -- so this only runs when --save-trace-text asks for it. Creates the
+    directory because it is now the only thing that writes there.
+    """
+    os.makedirs(os.path.dirname(trace.path), exist_ok=True)
+    _write_trace(trace.path, trace.header_line, trace.rows)
+
+
+def _write_trace(output_path, header_line, rows):
+    """Write the trace file in a single pass.
+
+    Rows arrive as field tuples straight from the emitters: eleven fields
+    for a layer, one for an ``EXPERT``/``PIM`` marker whose text occupies
+    the name column with the rest blank. Layer names get their final row
+    index appended here, and here only, because that index depends on how
+    many ``kv_load``/``kv_evict`` rows were prepended -- which is not known
+    until every row exists.
+
+    This replaces a write -> read back -> ``re.findall`` per line -> rewrite
+    round trip. The round trip existed purely to renumber, and it cost a
+    regex split per row on top of writing the file, reading it, and writing
+    it again. A 145-iteration run spent 42,341 ``re.findall`` calls on it.
+
+    Marker rows are told apart by field count rather than by the old
+    ``"EXPERT" not in name and "PIM" not in name`` substring test, which
+    would have mislabelled any future layer whose canonical name contained
+    either word.
+    """
+    global _row_format_checked
+
+    lines = []
+    for i, row in enumerate(rows):
+        if len(row) == _TRACE_ROW_FIELDS:
+            lines.append(formatter(f'{row[0]}_{i}', *row[1:]))
+        elif len(row) == 1:
+            lines.append(formatter(row[0], *([''] * 10)))
+        else:
+            raise ValueError(
+                f"trace row {i} has {len(row)} fields; expected "
+                f"{_TRACE_ROW_FIELDS} for a layer row or 1 for a marker. "
+                f"Row: {row!r}"
+            )
+
+    # Dropping the read-back also drops the place where a formatted row
+    # that had swallowed its own column separator used to surface -- as a
+    # short field list, which then raised a TypeError on the rewrite. That
+    # is how the 15-character ``ALLREDUCE:1,0,0`` case was caught. The
+    # explicit separators in utils._FMT now make a merge unrepresentable,
+    # so this is a regression guard on _FMT rather than the primary
+    # defence, and it runs on the *formatted* text because the field tuple
+    # is never the thing at fault: a correct 11-element row is exactly what
+    # formatting merged. Checking every row of every trace would cost a
+    # split per row and give back the speed this change bought, so it
+    # validates the first trace written in the process, which is enough to
+    # fail immediately on any run.
+    if not _row_format_checked:
+        _row_format_checked = True
+        for i, (row, line) in enumerate(zip(rows, lines)):
+            if len(row) != _TRACE_ROW_FIELDS:
+                continue
+            got = len(line.split())
+            if got != _TRACE_ROW_FIELDS:
+                raise ValueError(
+                    f"trace row {i} formatted to {got} whitespace-separated "
+                    f"fields instead of {_TRACE_ROW_FIELDS}: a value filled "
+                    f"its column and merged with the next. Widen the column "
+                    f"in utils._FMT. Row: {row!r}"
+                )
 
     with open(output_path, 'w') as f:
-        # instance type
-        if pd_type == None:
-            instance_type = 'COLOCATED'
-        elif pd_type == 'prefill':
-            instance_type = 'PREFILL'
-        elif pd_type == 'decode':
-            instance_type = 'DECODE'
-        else:
-            raise ValueError(f"Unknown instance type {pd_type}.")
-
-        f.write(f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}\n")
-        f.write(str(len(result))+'\n')
+        f.write(header_line + "\n")
+        f.write(str(len(rows)) + '\n')
         f.write(header())
-
-        # add layer_number at the end of the layer_name
-        for i in range(0, len(result)):
-            if "EXPERT" not in result[i][0] and "PIM" not in result[i][0]:
-                new_string = f'{result[i][0]}_{i}'
-                f.write(formatter(new_string, *result[i][1:]))
-            else:
-                f.write(formatter(' '.join(result[i]),'','','','','','','','','',''))
-    return
+        f.writelines(lines)
 
 
 # ======================================================================
@@ -1837,34 +2895,26 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
 
 # generate event for first request arrival
 def generate_event(alarm, inputs_root=None):
+    """The one-layer trace that idles every NPU until ``alarm``.
 
-    # make inputs for text file
-    result = []
-    fp = 2
-    layer_name = f'event_{alarm}ns'
-    comp_time = alarm
-    input_loc = 'REMOTE'
-    input_size = 0
-    weight_loc = 'LOCAL'
-    weight_size = 0
-    output_loc = 'REMOTE'
-    output_size = 0
-    comm_type = 'NONE'
-    comm_size = 0
-    misc = 'NONE'
-    result.append([layer_name, comp_time, input_loc, input_size, weight_loc, weight_size, output_loc, output_size, comm_type, comm_size, misc])
+    Returns a TraceData like generate_trace, so generate_graph converts it
+    from rows like any other batch. It used to write its file directly, and
+    being the one trace that still arrived as text kept a whole second path
+    alive in generate_graph -- file hashing, ``convert()``, and a per-batch
+    unlink -- for a call that happens once per run.
 
-    # write to the text file
+    Fields are strings for the same reason the emitters produce strings: the
+    row digest joins them, and the text writer formats them.
+    """
     if inputs_root is None:
         inputs_root = os.path.join(os.getcwd(), "inputs")
-    output_path = input_path(inputs_root, "trace", "event_handler.txt")
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w') as f:
-        f.write(f"EVENT\n")
-        f.write(f'{len(result)}'+'\n') # length of the text is 1
-        f.write(header())
-        for i in result:
-            f.write(formatter(*i))
+    row = (f'event_{alarm}ns', str(alarm), 'REMOTE', '0', 'LOCAL', '0',
+           'REMOTE', '0', 'NONE', '0', 'NONE')
+    return TraceData(
+        header_line="EVENT",
+        rows=[row],
+        path=input_path(inputs_root, "trace", "event_handler.txt"),
+    )
 
 
 # ======================================================================
@@ -1905,16 +2955,18 @@ def _make_sub_batch(batch):
     if len(batch.requests) == 1:
         return [batch]
 
-    # scheduler attaches per-request chunk sizes; honor them so chunked-prefill
-    # later chunks (is_init=False but still is_prefill()) and prefix-cached
-    # tokens are accounted for correctly (chunk_size already excludes hits via
-    # num_computed_tokens).
-    sched = getattr(batch, 'scheduled_tokens', {}) or {}
+    # Read the split off the parent batch rather than off the request objects.
+    # The scheduler advances num_computed_tokens when it forms the batch (as vLLM
+    # does), so a request's own counter already reflects the state *after* this
+    # iteration; q_list / k_list carry the values this iteration actually ran
+    # with, aligned with batch.requests.
+    per_req = {
+        req.id: (q, k)
+        for req, q, k in zip(batch.requests, batch.q_list, batch.k_list)
+    }
 
     def compute_tokens(req):
-        if req.is_prefill():
-            return sched.get(req.id, max(1, req.original_input - req.num_computed_tokens))
-        return 1
+        return per_req[req.id][0]
 
     # Greedy split: longest per-iteration compute first, assign to lighter side.
     reqs = sorted(batch.requests, key=compute_tokens, reverse=True)
@@ -1940,21 +2992,21 @@ def _make_sub_batch(batch):
         decode_k_list = []
 
         for req in sub_reqs:
-            if req.is_prefill():
-                chunk = compute_tokens(req)
-                total_len += chunk
-                q_list.append(chunk)
+            chunk, kv_before = per_req[req.id]
+            total_len += chunk
+            q_list.append(chunk)
+            k_list.append(kv_before)
+            # More than one token is a prefill chunk, exactly one is a decode --
+            # the same classification the parent batch used, and the one the
+            # attention profile axes expect.
+            if chunk > 1:
                 prefill_q_list.append(chunk)
-                # KV already in cache from prior chunks plus any prefix-cache hit.
-                prefill_k_list.append(req.num_computed_tokens)
+                prefill_k_list.append(kv_before)
                 num_prefill += 1
             else:
-                total_len += 1
-                q_list.append(1)
-                kv_len += req.num_computed_tokens
-                decode_k_list.append(req.num_computed_tokens)
+                kv_len += kv_before
+                decode_k_list.append(kv_before)
                 num_decode += 1
-            k_list.append(req.num_computed_tokens)
 
         # evict/load are counted once for the original batch; attach to sub-batch 0 only.
         evict, load = (batch.evict, batch.load) if i == 0 else (0, 0)

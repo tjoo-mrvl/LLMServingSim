@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PYTHON="${PYTHON:-python3}"
 
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
+BLOCK_SIZE="${BLOCK_SIZE:-}"
 LOG_LEVEL="${LOG_LEVEL:-WARNING}"
 NETWORK_BACKEND="${NETWORK_BACKEND:-analytical}"
 TERM="${TERM:-xterm-256color}"
@@ -15,16 +15,20 @@ FORCE_COLOR="${FORCE_COLOR:-1}"
 
 export TERM LANG FORCE_COLOR
 
-DEFAULT_EXAMPLES=(
-    "Llama-3.1-8B"
-    "Qwen3-32B"
-    "Qwen3-30B-A3B-Instruct-2507"
-)
+# Examples are keyed by <hardware>/<model>, matching the directory layout
+# under this folder. Each one carries its own config.json, so nothing has
+# to be kept in sync with a parallel configs/ tree.
+DEFAULT_EXAMPLES=()
+for config in "$SCRIPT_DIR"/*/*/config.json; do
+    [[ -f "$config" ]] || continue
+    example=${config#"$SCRIPT_DIR/"}
+    DEFAULT_EXAMPLES+=("${example%/config.json}")
+done
 
 json_get() {
     local json_path="$1"
     local key_path="$2"
-    "$PYTHON" - "$json_path" "$key_path" <<'PY'
+    "$PYTHON" - "$json_path" "$key_path" "${3:-required}" <<'PY'
 import json
 import sys
 
@@ -35,6 +39,8 @@ with open(path, encoding="utf-8") as f:
     obj = json.load(f)
 
 for part in key.split("."):
+    if sys.argv[3] == "optional" and (not isinstance(obj, dict) or part not in obj):
+        sys.exit(0)
     obj = obj[part]
 
 if obj is None:
@@ -73,9 +79,9 @@ repo_relative_path() {
 }
 
 run_example() {
-    local model_dir="$1"
+    local model_dir="$1"   # <hardware>/<model>
     local meta="$SCRIPT_DIR/$model_dir/vllm/meta.json"
-    local config="$SCRIPT_DIR/configs/$model_dir.json"
+    local config="$SCRIPT_DIR/$model_dir/config.json"
     local config_rel
     local output_dir="$SCRIPT_DIR/$model_dir/outputs"
     local output_dir_rel
@@ -87,19 +93,23 @@ run_example() {
     local dataset_cli
     local dataset
     local num_reqs
-    local dtype
-    local kv_cache_dtype
     local max_num_seqs
     local max_num_batched_tokens
+    local block_size
 
     dataset_rel="$(json_get "$meta" "dataset_path")"
     dataset_cli="$(repo_relative_path "$dataset_rel")"
     dataset="$(resolve_repo_path "$dataset_rel")"
     num_reqs="$(json_get "$meta" "num_requests")"
-    dtype="$(json_get "$meta" "engine_kwargs.dtype")"
-    kv_cache_dtype="$(json_get "$meta" "engine_kwargs.kv_cache_dtype")"
+    # dtype and kv_cache_dtype are deliberately not read back: the simulator
+    # derives both from the model config now, so passing vLLM's recorded
+    # values would be an input it no longer has. They agree on every bundled
+    # example (bfloat16 / auto).
     max_num_seqs="$(json_get "$meta" "engine_kwargs.max_num_seqs")"
     max_num_batched_tokens="$(json_get "$meta" "engine_kwargs.max_num_batched_tokens")"
+    # Match the recorded engine, not a dense-only global default. Sparse
+    # backends may resolve a different page size (64 for the shrunk DSA run).
+    block_size="${BLOCK_SIZE:-$(json_get "$meta" "kv_cache.block_size" optional)}"
     config_rel="$(repo_relative_path "$config")"
     output_dir_rel="$(repo_relative_path "$output_dir")"
 
@@ -112,14 +122,17 @@ run_example() {
         --dataset "$dataset_cli"
         --output "$output_dir_rel/sim.csv"
         --num-reqs "$num_reqs"
-        --dtype "$dtype"
-        --kv-cache-dtype "$kv_cache_dtype"
-        --block-size "$BLOCK_SIZE"
         --max-num-seqs "$max_num_seqs"
         --max-num-batched-tokens "$max_num_batched_tokens"
         --log-level "$LOG_LEVEL"
         --network-backend "$NETWORK_BACKEND"
     )
+
+    [[ -n "$block_size" ]] && cmd+=(--block-size "$block_size")
+
+    if [[ -n "${NPU_MEMORY_UTILIZATION:-}" ]]; then
+        cmd+=(--npu-memory-utilization "$NPU_MEMORY_UTILIZATION")
+    fi
 
     echo "============================================================"
     echo "Example: $model_dir"
@@ -139,14 +152,11 @@ if [[ $# -eq 0 ]]; then
 fi
 
 for example in "$@"; do
-    case "$example" in
-        Qwen3-32B|Qwen3-30B-A3B-Instruct-2507|Llama-3.1-8B)
-            run_example "$example"
-            ;;
-        *)
-            echo "Unknown example: $example" >&2
-            echo "Known examples: ${DEFAULT_EXAMPLES[*]}" >&2
-            exit 2
-            ;;
-    esac
+    if [[ -d "$SCRIPT_DIR/$example" && -f "$SCRIPT_DIR/$example/config.json" ]]; then
+        run_example "$example"
+    else
+        echo "Unknown example: $example" >&2
+        echo "Known examples: ${DEFAULT_EXAMPLES[*]}" >&2
+        exit 2
+    fi
 done
