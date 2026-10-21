@@ -334,3 +334,18 @@ TP because only `tp1` is profiled for those three — see
 | `single_node_sparse_mla_instance.json` | DeepSeek-V3.2-Exp at PP=16 — MLA plus the DSA indexer, a stack whose first three layers are dense, and the only checkpoint with group-limited expert routing (`n_group 8`, `topk_group 4`) |
 | `single_node_sparse_mla_dp_ep_instance.json` | GLM-5, two PP=32 instances in one DP group over EP=2. Same catalog and vLLM path as DeepSeek-V3.2, but `n_group 1` — the unrestricted routing case spelled out |
 | `single_node_sparse_gqa_instance.json` | MiniMax-M3 at PP=16 — the other sparse shape: top-16 blocks of 128 over GQA, against DeepSeek's top-2048 tokens over MLA |
+| `deepseek_r1_single_instance.json` | DeepSeek-R1 on 8×H200 at TP=8 with EP=8 |
+| `deepseek_r1_tp8_ep1_single_instance.json` | DeepSeek-R1 at TP=8 with expert parallelism off: every rank holds every expert at 1/8 width, and the MoE block closes with a TP all-reduce |
+| `deepseek_r1_tp1_pp8_single_instance.json` | DeepSeek-R1 at TP=1 × PP=8 |
+| `deepseek_r1_dp_ep.json` | DeepSeek-R1 on two 8×H200 nodes, two TP=8 instances in one DP group over EP=16 |
+| `deepseek_r1_pd_p5en_2node.json` | DeepSeek-R1 P/D disaggregation across two 8×H200 nodes, TP=8 with EP=8 on each side |
+
+The DeepSeek-R1 configs read `hardware: H200`, so they run once an H200 profile
+of the checkpoint exists (`profiler/profile-deepseek-h200.sh`, vLLM 0.31). The
+vLLM 0.20.2 profile they were first validated with is kept, with the simulator
+that read it, on branch `legacy/vllm-0.20.2`. Their links are hand-set, not
+measured: `link_bw` 450 on the NVLink dimension (the per-direction ring bus
+bandwidth, 900 bidirectional / 2) and 50 on the inter-node one (an EFAv3
+node's 400 shared by its 8 GPUs), with `link_latency` 1000 / 5000 ns. Those
+are decimal GB/s figures in a binary-GiB/s field, about 7% optimistic; replace
+them with `profiler hardware` measurements once an H200 node is profiled.
