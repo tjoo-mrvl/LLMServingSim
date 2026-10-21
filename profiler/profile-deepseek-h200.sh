@@ -2,25 +2,36 @@
 # =============================================================================
 # profile-deepseek-h200.sh — DeepSeek-R1 / V4-Flash layerwise profiler driver
 # -----------------------------------------------------------------------------
-# Run INSIDE the vLLM/profiler container (PODMAN_SETUP.md §2), from the repo
-# root. Profiling uses ONE GPU + dummy weights (load_format=dummy) — it reads
-# the vendored configs/model/deepseek-ai/*.json and downloads NO weights.
+# Run INSIDE the vLLM/profiler container (scripts/docker-vllm.sh, vLLM 0.31),
+# from the repo root. Profiling uses ONE GPU + dummy weights (load_format=dummy)
+# — it reads the vendored configs/model/deepseek-ai/*.json and downloads NO
+# weights. R1 output lands in profiler/perf/H200/deepseek-ai/DeepSeek-R1/fp8/:
+# the variant follows the checkpoint's FP8 quantization, which is the folder the
+# simulator reads. (The earlier vLLM 0.20.2 profile is kept on branch legacy/vllm-0.20.2.)
 #
 #   TARGET=r1      ./profiler/profile-deepseek-h200.sh     # DeepSeek-R1        (default)
-#   TARGET=v4flash ./profiler/profile-deepseek-h200.sh     # DeepSeek-V4-Flash  (needs DeepGEMM)
+#   TARGET=v4flash ./profiler/profile-deepseek-h200.sh     # DeepSeek-V4-Flash  (needs DeepGEMM; untested, see feat/deepseek_v4)
 #
 # R1 staging (recommended for a bounded H200 window):
+#   STAGE=coverage ./profiler/profile-deepseek-h200.sh  # 0) check the catalog binds every kernel on this vLLM (no CSVs)
 #   SMOKE=1 ./profiler/profile-deepseek-h200.sh      # fast tp=1 pipeline check (tiny grid); verify BEFORE the full run
 #   STAGE=fast ./profiler/profile-deepseek-h200.sh   # 1) complete, SIMULATABLE profile (skew skipped) + meta.yaml
 #   STAGE=skew ./profiler/profile-deepseek-h200.sh   # 2) add the skew sweep (resume-safe; the long pole)
 #   STAGE=full ./profiler/profile-deepseek-h200.sh   # everything in one shot (default)
 #
-# WHY STAGE matters (from runner.py): meta.yaml is written and tp_stable layers
-# are replicated into tp8/ only AFTER every TP finishes, and skew runs per-TP
-# (so for --tp 1,8 it runs TWICE). A STAGE=full run interrupted before it
-# completes leaves no meta.yaml (the simulator can't load the profile) and no
-# tp8 data. STAGE=fast reaches a usable, simulatable milestone first; STAGE=skew
+# WHY STAGE matters: skew runs per TP (so for --tp 1,8 it runs TWICE) and is the
+# long pole. The profiler checkpoints completed shots and resumes an interrupted
+# run, but STAGE=fast still reaches a usable, simulatable profile first; STAGE=skew
 # then adds accuracy and can be re-run to resume where it left off.
+#
+# MoE: R1's MoE is quantized and has a shared expert, which the profiler's live
+# native components measure at TP1/DP1/EP1 only, so the run is pinned to --ep 1
+# and the simulator prices EP>1 ranks from that table. On Hopper, vLLM 0.31's
+# automatic FP8 MoE backend is Triton at EP=1 but FlashInfer CUTLASS at EP>1
+# (fused_moe/oracle/fp8.py), and the profiler cannot pin moe_backend, so this
+# profile times Triton while a TP8/EP8 bench runs FlashInfer CUTLASS. Measure the
+# gap against an EP=8 bench before trusting MoE-bound results. (vLLM 0.31 has no
+# VLLM_USE_FLASHINFER_MOE_FP8; the backend is KernelConfig.moe_backend.)
 #
 # =============================================================================
 # WHY THESE PARAMS (not the profiler defaults)
@@ -33,9 +44,9 @@
 #
 #   Knob                    | default | here (R1) | why
 #   ------------------------|---------|-----------|-------------------------------
-#   ATTENTION_MAX_KV        | 16384   | 32768     | covers the measured SWE-bench
-#                           |         |           | envelope (max ~21.7K ctx) with
-#                           |         |           | headroom. Below the cap the sim
+#   ATTENTION_MAX_KV        | model   | 32768     | covers the measured SWE-bench
+#                           | context |           | envelope (max ~21.7K ctx) with
+#                           | (164K)  |           | headroom. Below the cap the sim
 #                           |         |           | measures; above it it extrapolates.
 #                           |         |           | Bump to 65536 if R1 --use-vllm /
 #                           |         |           | long-output traces grow past it.
@@ -79,10 +90,12 @@
 set -euo pipefail
 
 TARGET="${TARGET:-r1}"          # r1 | v4flash
-STAGE="${STAGE:-full}"          # full | fast | skew   (R1 only; V4 is always skip-skew)
+STAGE="${STAGE:-full}"          # full | fast | skew | coverage   (R1 only; V4 is always skip-skew)
 HARDWARE="${HARDWARE:-H200}"
-DTYPE="${DTYPE:-bfloat16}"      # bf16 activations; vLLM auto-applies the fp8 weights from quantization_config
-FLASHINFER_MOE_FP8="${FLASHINFER_MOE_FP8:-1}"   # 1 => export VLLM_USE_FLASHINFER_MOE_FP8=1 for R1 (match the vLLM recipe/bench); 0 to disable
+# Leave DTYPE unset: R1 resolves to bf16 activations from its checkpoint, and an
+# explicit engine dtype adds an activation suffix to the variant folder (e.g.
+# fp8-actbf16) that the simulator never reads.
+DTYPE="${DTYPE:-}"
 FORCE="${FORCE:-}"             # FORCE=1 -> wipe + re-profile from scratch (default: resume)
 VERBOSITY="${VERBOSITY:-}"     # e.g. VERBOSITY=--verbose  (DEBUG + vLLM stdout)
 
@@ -90,24 +103,24 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # script lives in
 cd "$REPO_ROOT"
 
 # -----------------------------------------------------------------------------
-# run_profile <model> <variant|""> <hf_overrides_json|""> [extra flags...]
+# run_profile <subcommand> <model> <variant|""> [extra flags...]
 # Reads the ATTENTION_* / MAX_* / MEASUREMENT_ITERATIONS globals set per target.
+# Model-config overrides go in the extra flags as --hf-override KEY=VALUE.
 # -----------------------------------------------------------------------------
 run_profile() {
+  local subcommand="$1"; shift
   local model="$1"; shift
   local variant="$1"; shift
-  local hf_overrides="$1"; shift
-  local cmd=(python3 -m profiler profile "$model"
+  local cmd=(python3 -m profiler "$subcommand" "$model"
              --hardware "$HARDWARE"
              --tp "$TP_DEGREES"
-             --dtype "$DTYPE"
              --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
              --max-num-seqs "$MAX_NUM_SEQS"
              --attention-max-kv "$ATTENTION_MAX_KV"
              --attention-chunk-factor "$ATTENTION_CHUNK_FACTOR"
              --attention-kv-factor "$ATTENTION_KV_FACTOR"
              --measurement-iterations "$MEASUREMENT_ITERATIONS")
-  [[ -n "$hf_overrides" ]]   && cmd+=(--hf-overrides "$hf_overrides")
+  [[ -n "$DTYPE" ]]          && cmd+=(--dtype "$DTYPE")
   [[ -n "$variant" ]]        && cmd+=(--variant "$variant")
   [[ -n "${FORCE:-}" ]]      && cmd+=(--force)
   [[ -n "${VERBOSITY:-}" ]]  && cmd+=($VERBOSITY)
@@ -121,17 +134,15 @@ case "$TARGET" in
   r1)
     MODEL="deepseek-ai/DeepSeek-R1"
     # tp=1 is MANDATORY (the CLI rejects a --tp list without it): it supplies
-    # the MoE profile (profiled only at tp=1) and every tp_stable layer, which
-    # get replicated into tp8/. tp=8 is the deployment sharding.
-    # 2-layer override so ONE run materialises a dense (layer 0) AND an MoE
-    # (layer 1) block; default num_hidden_layers=1 + R1's first_k_dense_replace=3
-    # would give no MoE layer -> the MoE hook raises "got 0".
-    HF_OVERRIDES='{"num_hidden_layers": 2, "first_k_dense_replace": 1}'
+    # the MoE profile and every tp_stable layer, which get replicated into tp8/.
+    # tp=8 is the deployment sharding. No layer-count override is needed: the
+    # profiler reads first_k_dense_replace and boots the 4 layers (3 dense + 1
+    # MoE) that cover both MLP kinds.
 
     # ---- params (all overridable via env; SMOKE=1 = fast pipeline check) ----
     if [[ "${SMOKE:-}" == "1" ]]; then
       # Tiny 4D grid, tp=1, no skew, 1 iter -> a few minutes. Verifies the whole
-      # path (CSVs written, repr_match, FlashInfer MoE) — NOT real timing numbers.
+      # path (CSVs written, MLA layers bound) — NOT real timing numbers.
       TP_DEGREES="${TP_DEGREES:-1}"; STAGE="fast"
       ATTENTION_MAX_KV="${ATTENTION_MAX_KV:-2048}"
       ATTENTION_CHUNK_FACTOR="${ATTENTION_CHUNK_FACTOR:-2.0}"
@@ -166,29 +177,23 @@ case "$TARGET" in
                        --skew-kvs-factor "$SKEW_KVS_FACTOR")
 
     case "$STAGE" in
+      coverage)
+        # Structural check at tp=1: does the catalog bind every kernel this vLLM
+        # launches? Writes no CSVs. Run it first after any vLLM upgrade.
+        echo ">>> Catalog coverage for DeepSeek-R1 on $HARDWARE"
+        python3 -m profiler coverage "$MODEL" --hardware "$HARDWARE"
+        exit 0 ;;
       fast) stage_flags=(--skip-skew) ;;
       skew) stage_flags=(--only-skew "${skew_factor_flags[@]}") ;;
       full) stage_flags=("${skew_factor_flags[@]}") ;;
-      *)    echo "ERROR: unknown STAGE='$STAGE' (use full|fast|skew)" >&2; exit 2 ;;
+      *)    echo "ERROR: unknown STAGE='$STAGE' (use full|fast|skew|coverage)" >&2; exit 2 ;;
     esac
 
-    # Match the official vLLM R1 recipe's MoE kernel so profiled MoE timings line
-    # up with `bench`. Without it vLLM defaults to the (untuned) Triton FP8 MoE.
-    # Verify the vLLM log then says "Using FLASHINFER_... Fp8 MoE backend" (on some
-    # GPUs the flag is a no-op and stays on TRITON).
-    # GOTCHA: the MoE shot key is (tokens, activated_experts) — the backend is NOT
-    # part of it — so switching this on an existing profile needs FORCE=1 to
-    # actually re-measure MoE.
-    if [[ "$FLASHINFER_MOE_FP8" == "1" ]]; then
-      export VLLM_USE_FLASHINFER_MOE_FP8=1
-      echo ">>> VLLM_USE_FLASHINFER_MOE_FP8=1 (matching the vLLM R1 recipe)"
-    fi
-
     echo ">>> Profiling DeepSeek-R1 on $HARDWARE  (tp=$TP_DEGREES, STAGE=$STAGE)"
-    run_profile "$MODEL" "" "$HF_OVERRIDES" "${stage_flags[@]}"
-    echo ">>> Done. Output: profiler/perf/${HARDWARE}/${MODEL}/bf16/tp{1,8}/"
-    echo ">>> Smoke-check the MLA layers were captured (repr_match):"
-    echo "    cut -d, -f1 profiler/perf/${HARDWARE}/${MODEL}/bf16/tp1/dense.csv | sort -u | grep -E 'q_a_layernorm|kv_a_layernorm|q_b_proj|kv_b_proj'"
+    run_profile profile "$MODEL" "" --ep 1 "${stage_flags[@]}"
+    echo ">>> Done. Output: profiler/perf/${HARDWARE}/${MODEL}/fp8/tp{1,8}/"
+    echo ">>> Smoke-check the MLA layers were captured:"
+    echo "    cut -d, -f1 profiler/perf/${HARDWARE}/${MODEL}/fp8/tp1/dense.csv | sort -u | grep -E 'mla_qkv_a_proj|mla_a_layernorm|mla_b_proj'"
     ;;
 
   # ---------------------------------------------------------------------------
@@ -221,8 +226,10 @@ case "$TARGET" in
     # doesn't crash — MLA replicates its latent KV rather than sharding it, so
     # per-rank KV stays 1 and the timing is unaffected.
     echo ">>> Profiling DeepSeek-V4-Flash on $HARDWARE  (tp=$TP_DEGREES, two-pass indexer, skew skipped)"
-    run_profile "$MODEL" "bf16-m128" '{"num_hidden_layers":1,"compress_ratios":[128],"num_key_value_heads":8}' --skip-skew
-    run_profile "$MODEL" "bf16-m4"   '{"num_hidden_layers":1,"compress_ratios":[4],"num_key_value_heads":8}'   --skip-skew
+    run_profile profile "$MODEL" "bf16-m128" --hf-override num_hidden_layers=1 \
+      --hf-override 'compress_ratios=[128]' --hf-override num_key_value_heads=8 --skip-skew
+    run_profile profile "$MODEL" "bf16-m4" --hf-override num_hidden_layers=1 \
+      --hf-override 'compress_ratios=[4]' --hf-override num_key_value_heads=8 --skip-skew
     echo ">>> Done. Output: profiler/perf/${HARDWARE}/${MODEL}/{bf16-m128,bf16-m4}/tp{1,8}/"
     ;;
 
