@@ -67,6 +67,9 @@ def register_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tensor-parallel-size", type=int, default=1,
                    dest="tensor_parallel_size",
                    help="vLLM tensor_parallel_size.")
+    p.add_argument("--pipeline-parallel-size", type=int, default=1,
+                   dest="pipeline_parallel_size",
+                   help="vLLM pipeline_parallel_size (PP stages within an engine).")
     p.add_argument("--data-parallel-size", type=int, default=1,
                    dest="data_parallel_size",
                    help="vLLM data_parallel_size (DP across engines).")
@@ -268,6 +271,7 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
     engine_args = AsyncEngineArgs(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
         data_parallel_size=args.data_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
         disable_custom_all_reduce=args.disable_custom_all_reduce,
@@ -492,7 +496,7 @@ def _record_from_metrics(idx: int, req: dict, metrics) -> dict:
 
 def _engine_kwargs_for_meta(engine_args) -> dict:
     fields = (
-        "model", "tensor_parallel_size", "data_parallel_size",
+        "model", "tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size",
         "enable_expert_parallel", "max_num_seqs", "max_num_batched_tokens",
         "disable_custom_all_reduce",
         "max_model_len", "dtype", "kv_cache_dtype", "kv_cache_memory_bytes", "seed", "load_format",

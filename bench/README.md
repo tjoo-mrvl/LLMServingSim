@@ -119,6 +119,7 @@ Run options (also available through `python -m bench run --help`):
 | `--dataset` | required | LLMServingSim-format JSONL |
 | `--output-dir` | required | run output root |
 | `--tensor-parallel-size` | `1` | vLLM `tensor_parallel_size` |
+| `--pipeline-parallel-size` | `1` | vLLM `pipeline_parallel_size` |
 | `--data-parallel-size` | `1` | vLLM `data_parallel_size` |
 | `--enable-expert-parallel` | off | vLLM `enable_expert_parallel`, MoE only |
 | `--disable-custom-all-reduce` | off | Explicitly disable custom all-reduce; does not enforce NCCL-only |
