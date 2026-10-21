@@ -456,8 +456,12 @@ class MemoryModel():
         ``calculate_sizes`` documents.
         """
         parallel = self.ep_size if name == "moe" else self.tp_size
+        # Expert parallelism off (ep 1 under tp > 1): vLLM shards every expert's
+        # intermediate width over TP instead of distributing whole experts.
+        moe_tp = self.tp_size if name == "moe" and self.ep_size == 1 else 1
         _, weight, _ = calculate_sizes(
             self.model, name, 1, kv_len=1, parallel=parallel, fp=self.fp,
+            moe_tp=moe_tp,
         )
         return weight
 
@@ -952,12 +956,15 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
 
 # calculate the per-rank input, weight, output size of each layer
 def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2,
-                    kv_lens=None, *, component_sizes=None):
+                    kv_lens=None, *, component_sizes=None, moe_tp=1):
     """Calculate input, weight, and output tensor sizes for a given layer.
 
     Args:
         parallel: parallelism degree for weight/activation sharding.
             For dense layers this is TP; for MoE experts this is EP.
+        moe_tp: tensor-parallel split of each expert's intermediate width,
+            for an MoE run with expert parallelism off (every rank holds every
+            expert at ``1/tp`` width). 1 otherwise.
         kv_lens: exact per-request cached histories for MiniMax-M3's
             indexer and sparse_attention only; a list or tuple of nonnegative
             integers, mutually exclusive with kv_len. Sparse attention caps
@@ -1480,11 +1487,13 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # routed experts, and the shared expert(s). A shared expert runs on
         # every token beside the routed ones and is replicated, not sharded
         # (DeepSeek and GLM ship one; families without the field ship none).
+        # With expert parallelism off the experts are tensor-parallel instead,
+        # and so is the shared expert: both keep 1/moe_tp of their width.
         experts_per_rank = num_local_experts // p
         input_size = length * n_embd * fp
         weight_size = (n_embd * num_local_experts * fp  # gate (replicated)
-                     + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp
-                     + num_shared_experts * 3 * n_embd * shared_ffn_dim * fp)
+                     + experts_per_rank * 3 * n_embd * (moe_ffn_dim // moe_tp) * fp
+                     + num_shared_experts * 3 * n_embd * (shared_ffn_dim // moe_tp) * fp)
         output_size = length * n_embd * fp
 
     # ----------------- LM Head -----------------
