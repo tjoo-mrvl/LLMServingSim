@@ -26,6 +26,7 @@ class Request:
         self.input_hash_ids = input_hash_ids
         self.output_hash_ids = output_hash_ids
         self.prefix_cache_hit = 0
+        self.final_prefix_hit = 0  # snapshot of prefix_cache_hit at prefill-complete (survives erase; for CSV)
         self.npu_cache_hit = 0
         self.storage_cache_hit = 0
         self.npu_last_node = None

@@ -720,6 +720,7 @@ class Scheduler:
                     req.is_init = False
                     # Include prefix cache hit tokens in prompt throughput
                     prompt_t += chunk_len + req.prefix_cache_hit
+                    req.final_prefix_hit = req.prefix_cache_hit  # snapshot before erase (for CSV)
                     req.set_ttft(finish)
                     
                     if self.pd_type == "prefill":
@@ -769,6 +770,7 @@ class Scheduler:
                     req.set_ttft(finish)
                     # Full prefix hit: count all cached tokens as prompt throughput
                     prompt_t += req.prefix_cache_hit
+                    req.final_prefix_hit = req.prefix_cache_hit  # snapshot before erase (for CSV)
                 gen_t += 1
                 req.add_itl(finish)
                 req.num_computed_tokens += 1
@@ -932,9 +934,9 @@ class Scheduler:
             
             # Write the column headers
             if not is_append:
-                writer.writerow(['instance id', 'request id', 'model', 'input', 'output', 
-                                'arrival', 'end_time', 'latency', 
-                                'queuing_delay', 'TTFT', 'TPOT', 'ITL'])
+                writer.writerow(['instance id', 'request id', 'model', 'input', 'output',
+                                'arrival', 'end_time', 'latency',
+                                'queuing_delay', 'TTFT', 'TPOT', 'prefix_cache_hit', 'ITL'])
             
             # Write each request's information
             for req in self.done:
@@ -950,6 +952,7 @@ class Scheduler:
                     req.queuing_delay,
                     req.ttft,
                     req.tpot,
+                    req.final_prefix_hit,
                     req.itl
                 ])
 
