@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "model": "/data/DeepSeek-R1",
+  "vllm_version": "0.20.2",
+  "engine_kwargs": {
+    "model": "/data/DeepSeek-R1",
+    "tensor_parallel_size": 8,
+    "pipeline_parallel_size": 1,
+    "data_parallel_size": 1,
+    "enable_expert_parallel": false,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 4096,
+    "max_model_len": null,
+    "dtype": "bfloat16",
+    "kv_cache_dtype": "auto",
+    "load_format": "fastsafetensors",
+    "seed": 42
+  },
+  "dataset_path": "workloads/fixed-8192-4096-b64.jsonl",
+  "dataset_hash": "44081cf39129b0b380d1822575e10bbc570b1f57c156289b07402e5ecd673ff8",
+  "num_requests": 72,
+  "started_at": "2026-07-20T07:00:01.595506Z",
+  "finished_at": "2026-07-20T07:04:29.772028Z",
+  "tick_seconds": 1.0
+}
