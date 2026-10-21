@@ -188,7 +188,6 @@ class MemoryModel():
         self.cxl_mem = cxl_mem * GB_TO_BYTE
         self.block_size = block_size
         self.fp = fp // 8 # bit -> byte of floating point
-        self.kv_fp = 1 if kv_cache_dtype == 'fp8' else self.fp  # KV cache bytes per element
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
@@ -196,6 +195,7 @@ class MemoryModel():
         self.num_speculative_tokens = int(num_speculative_tokens or 0)
 
         self.config = get_config(model)
+        self.kv_fp = kv_element_bytes(self.config, self.fp, kv_cache_dtype)  # KV cache bytes per element
         self.n_embd = self.config['hidden_size']
         self.n_layer = self.config['num_hidden_layers']
         self.n_head = self.config['num_attention_heads']
@@ -911,16 +911,39 @@ def full_cluster_state_bytes_per_sequence(model, fp):
     return sum(state_bytes_per_sequence(config, fp_bytes, spec) for spec in stack)
 
 
+def kv_element_bytes(config, fp, kv_cache_dtype='auto'):
+    """Bytes per element of the main KV cache.
+
+    ``fp`` is the weight dtype in bytes. A declared KV scheme
+    (``kv_cache_dtype='fp8'``) is one byte. Otherwise vLLM's ``auto`` resolves
+    to the *model* dtype (vLLM 0.31 ``platforms/interface.py``:
+    ``kv_cache_dtype = model_config.dtype``), and on a weight-only quantized
+    checkpoint that is the activation dtype, not the weight dtype: DeepSeek-R1
+    ships FP8 weights with ``torch_dtype: bfloat16`` and serves a bf16 cache.
+
+    The exception is the DeepSeek-V3.2 sparse-indexer family (``index_topk``),
+    which vLLM defaults to an fp8 cache (``config/cache.py``); it keeps the
+    weight-dtype reading. Unquantized checkpoints are unchanged either way,
+    since their weight and activation dtypes agree.
+    """
+    if kv_cache_dtype == 'fp8':
+        return 1
+    quant = config.get('quantization_config')
+    if isinstance(quant, dict) and quant.get('quant_method') and 'index_topk' not in config:
+        from .communication import dtype_bytes
+        return dtype_bytes(config.get('torch_dtype', config.get('dtype')), fp)
+    return fp
+
+
 def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     """Bytes of KV cache per token aggregated over the full TP cluster.
 
     Mirrors MemoryModel.get_kv(1) * num_npus but computes directly, avoiding
     the per-rank floor-division roundoff. ``fp`` is the model weight dtype
-    in bits (16, 32, ...). ``kv_cache_dtype='fp8'`` forces 1 byte per element
-    for the KV cache regardless of weight dtype.
+    in bits (16, 32, ...); the element size is ``kv_element_bytes``.
     """
     config = get_config(model)
-    kv_fp = 1 if kv_cache_dtype == 'fp8' else fp // 8
+    kv_fp = kv_element_bytes(config, fp // 8, kv_cache_dtype)
     stack = get_layer_stack(model) or [None] * config['num_hidden_layers']
     return sum(
         sum(kv_bytes_per_token_per_layer(config, kv_fp, spec)) for spec in stack
