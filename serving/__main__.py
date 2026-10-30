@@ -350,6 +350,12 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             elif reason:
                 get_logger('CUDAGraph').warning('%s: %s; deriving graph settings',
                                                instance['model_name'], reason)
+        # The scheduler's async rule follows a declared or observed model
+        # runner; the graph override below does not change which runner it is.
+        runner = (options or {}).get("runner")
+        if runner not in (None, "v1", "v2"):
+            raise ValueError("cudagraph.runner must be 'v1' or 'v2'")
+        cfg["model_runner"] = runner
         # Attention offloading/sub-batch interleaving is a simulator extension,
         # not the vLLM GPU forward whose graph keys this resolver describes.
         if enable_attn_offloading:
@@ -822,6 +828,7 @@ def main():
             async_scheduling=inst_cfg["async_scheduling"],
             acceptance_model=_build_acceptance_model(
                 instance["model_name"], inst_cfg, instance["node_id"], instance_id),
+            model_runner=inst_cfg["model_runner"],
         ))
 
     # The derived KV capacity, not the utilization fraction, is what decides

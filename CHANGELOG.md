@@ -29,6 +29,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   moves; the DeepSeek-V3.2-Exp-16L64E example's KV pool shrinks from 48,802 to
   45,496 blocks without saturating. See
   [KV cache & memory → Model weights](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory#1-model-weights-per-gpu).
+- Follow the instance's declared or observed `cudagraph.runner` in the
+  scheduler's async-scheduling rule at `pp_size > 1`. vLLM 0.31 runs Model
+  Runner V2 for every model unless an unsupported feature forces V1, but the
+  scheduler applied vLLM 0.28's rule (V2 only for non-MoE, non-hybrid stacks)
+  even when a MoE or hybrid instance declared `runner: "v2"`. Without a
+  declared or observed runner the 0.28 rule still applies, so no regression
+  clock moves. See
+  [Continuous batching](https://llmservingsim.ai/docs/simulator/scheduling/continuous-batching).
 
 ## [v1.3.0] - 2026-10-19
 

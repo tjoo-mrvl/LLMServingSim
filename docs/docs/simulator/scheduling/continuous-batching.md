@@ -51,9 +51,11 @@ the lagged pass admitted nothing.
 
 At `pp_size > 1`, the scheduler applies this additional lag only when its
 `_uses_v2_model_runner` classification is true; the modeled V1 pipeline
-already supplies its in-flight window. This classification currently treats
-non-MoE, non-hybrid stacks as V2 and is separate from the `cudagraph.runner`
-setting used for graph dispatch. The TTFT effect depends on workload and
+already supplies its in-flight window. The classification follows the
+instance's declared or observed `cudagraph.runner`, since vLLM 0.31 runs Model
+Runner V2 for every model unless an unsupported feature forces V1. Without
+one it keeps vLLM 0.28's rule, which treats non-MoE, non-hybrid stacks as V2.
+The TTFT effect depends on workload and
 batch composition, not a fixed fraction of a step. Turn it off with
 `--no-async-scheduling` to model an engine with async scheduling disabled.
 

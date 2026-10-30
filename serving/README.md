@@ -170,7 +170,8 @@ The per-instance `cudagraph` object describes target execution, independently
 of the profiler's eager engine. Explicit settings take priority; otherwise a
 matching `meta.yaml.serving_execution` observation supplies the runner and grid.
 Without a matching observation, the resolver retains its MRV1 default and reports
-incompatible saved settings. Select `runner: "v2"` for MRV2 dispatch semantics.
+incompatible saved settings. Select `runner: "v2"` for MRV2 dispatch semantics;
+the scheduler's async admission rule at `pp_size > 1` follows the same runner.
 Local graph padding applies with or without DP;
 DP then synchronizes the selected modes and forward sizes. Real attention
 queries, KV history and head rows are not expanded into dummy requests.

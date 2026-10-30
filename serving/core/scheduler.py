@@ -37,7 +37,7 @@ class Scheduler:
                  enable_chunked_prefill=False,
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
                  npu_memory_utilization=1.0, reserve_full_isl=True,
-                 acceptance_model=None, async_scheduling=True):
+                 acceptance_model=None, async_scheduling=True, model_runner=None):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -64,16 +64,24 @@ class Scheduler:
         _stack = get_layer_stack(model) or []
         _is_hybrid = any(spec.attn == 'linear_attention' for spec in _stack)
         _is_moe = any(getattr(spec, 'mlp', None) == 'moe' for spec in _stack)
-        # vLLM's ``VllmConfig.use_v2_model_runner`` via
-        # ``_is_default_v2_model_runner_model``: V2 is the default for anything
-        # that is not MoE, except that a hybrid stack stays on V1 unless its
-        # architecture is explicitly a default-V2 one. vLLM also forces V2 for a
-        # short list of architectures
+        # vLLM's ``VllmConfig.use_v2_model_runner``. vLLM 0.31 runs Model Runner
+        # V2 for every model unless a feature V2 does not support forces V1
+        # (``config/vllm.py``), so the instance's declared or observed
+        # ``cudagraph.runner`` decides when there is one. Without one this keeps
+        # vLLM 0.28's ``_is_default_v2_model_runner_model``: V2 is the default
+        # for anything that is not MoE, except that a hybrid stack stays on V1
+        # unless its architecture is explicitly a default-V2 one. vLLM 0.28 also
+        # forced V2 for a short list of architectures
         # (``config/vllm.py::default_v2_model_runner_architectures``); no config
         # under ``configs/model/`` is on it, and a snapshot of a list that moves
         # every release would drift silently, so adding one from that list means
         # revisiting this. It matters only for ``_async_adds_a_batch``.
-        self._uses_v2_model_runner = (not _is_moe) and (not _is_hybrid)
+        if model_runner not in (None, 'v1', 'v2'):
+            raise ValueError(f"model_runner must be 'v1', 'v2' or None; got {model_runner!r}")
+        if model_runner is not None:
+            self._uses_v2_model_runner = model_runner == 'v2'
+        else:
+            self._uses_v2_model_runner = (not _is_moe) and (not _is_hybrid)
         self._needs_mamba_aligned_split = bool(enable_prefix_caching) and _is_hybrid
         if self._needs_mamba_aligned_split and not enable_chunked_prefill:
             # vLLM asserts this, in the same block that picks "align"

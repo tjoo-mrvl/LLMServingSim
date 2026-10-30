@@ -1807,8 +1807,10 @@ arrival time to avoid busy-looping.
   forever and the run would answer "pass" at a clock that never moves.
   At `pp_size > 1`, this additional lag applies only when the scheduler's
   `_uses_v2_model_runner` classification is true; the modeled V1 pipeline
-  already supplies its in-flight window. The classification currently treats
-  non-MoE, non-hybrid stacks as V2 and is separate from `cudagraph.runner`.
+  already supplies its in-flight window. The classification follows the
+  instance's declared or observed `cudagraph.runner`: vLLM 0.31 runs Model
+  Runner V2 for every model unless an unsupported feature forces V1. Without
+  one it keeps vLLM 0.28's rule, which treats non-MoE, non-hybrid stacks as V2.
   Admission and TTFT effects depend on workload and batch composition.
 - Token budget controlled by `--max-num-batched-tokens` (default 2048) and `--max-num-seqs` (default 128)
 - `--long-prefill-token-threshold` caps per-request tokens per step for chunked prefill

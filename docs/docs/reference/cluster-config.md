@@ -375,7 +375,7 @@ compatible with each member's scheduler limits.
 
 | Field | Meaning |
 | --- | --- |
-| `runner` | `v1` (historical default) or `v2`; selects the model runner's dispatch and DP synchronization rules |
+| `runner` | `v1` (historical default) or `v2`; selects the model runner's dispatch and DP synchronization rules and, at `pp_size > 1`, whether [async scheduling](/docs/simulator/scheduling/continuous-batching) adds a batch to the pipeline. Without a declared or observed runner the scheduler uses vLLM 0.28's rule (non-MoE, non-hybrid stacks run V2) |
 | `mode` | Effective graph mode: `NONE`, `PIECEWISE`, `FULL`, `FULL_DECODE_ONLY`, or `FULL_AND_PIECEWISE` (default assumption) |
 | `capture_sizes` | Optional positive token counts; deduplicated, sorted and filtered by the token budget and compiler-SP divisibility |
 | `max_capture_size` | Optional positive cap for automatic grid generation. If supplied with `capture_sizes`, it must equal the largest retained size before speculative rounding |
