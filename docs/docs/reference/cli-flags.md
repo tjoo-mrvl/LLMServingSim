@@ -68,7 +68,11 @@ Activations follow the floating dtype as well, whatever the weights are stored
 in. DeepSeek-R1 runs W8A8 FP8 GEMMs, converting each layer's input to FP8 inside
 the layer, but every tensor between layers is bf16: a layer's input and output
 sizes, TP collectives, pipeline-stage transfers and MoE dispatch payloads are all
-sized at 2 bytes per element, while weights keep the weight dtype.
+sized at 2 bytes per element, while quantized weights keep the weight dtype.
+The layers vLLM never quantizes — embeddings, the LM head, norms and the MoE
+router gate — are stored at the floating dtype too, and so is the per-GPU
+weight that bounds the KV cache (see
+[KV cache and memory](../simulator/scheduling/kv-cache-and-memory.md#1-model-weights-per-gpu)).
 
 A dtype is a property of the checkpoint, and once a model carries five of
 them a flag per dtype is both unusable and unfaithful — it describes a model

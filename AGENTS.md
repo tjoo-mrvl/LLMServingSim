@@ -2118,6 +2118,17 @@ built weight per distinct block shape. It used to sum a hardcoded
 window of layers, since the first window is the light one on a stack whose
 leading layers are dense.
 
+Weights are sized as vLLM stores them, not at one width for the whole
+checkpoint. On a quantized checkpoint the layers vLLM never quantizes —
+embeddings, the LM head, norms and the MoE router gate (`Fp8Config` quantizes
+linear layers and routed experts only) — keep the floating dtype
+(`activation_element_bytes`). A shared expert is a TP-sharded MLP whatever the
+expert parallelism, so it is divided by TP; only sequence-parallel MoE
+(TP > 1 in a DP > 1 group whose catalog declares it) replicates it. An MLA
+`attention` layer holds the `W_UK` / `W_UV` copies
+`MLAAttention.process_weights_after_loading` derives from `kv_b_proj` at the
+activation dtype. DeepSeek-R1 at TP8/EP8 comes to 79.51 GiB per GPU.
+
 `kv_bytes_per_token_per_layer()` is the one place that knows the KV shapes, and
 they are not interchangeable:
 
@@ -2141,10 +2152,12 @@ Sizing DeepSeek-V3.2 as GQA read 1,748,992 bytes/token where MLA caches 78,324.
 
 **Verify a new family's shapes against its published parameter count.** It is
 the one number that catches a wrong shape anywhere in the stack, and it is
-public. Summing `calculate_sizes`' weights over the catalog and the resolved
-stack: DeepSeek-V3.2-Exp comes to 671.878B, and minus
+public. Counting the parameters in `calculate_sizes`' weight formulas over the
+catalog and the resolved stack: DeepSeek-V3.2-Exp comes to 671.878B, and minus
 the DSA indexer (0.852B) that is 671.026B — V3's published 671B, with the
-difference being exactly what V3.2 adds.
+difference being exactly what V3.2 adds. Count parameters, not the stored bytes
+`calculate_sizes` returns: those size the unquantized layers at the floating
+dtype and add MLA's derived copies, which are not parameters.
 
 ### Model configs
 Model configs live in `configs/model/{org}/{model}.json` and must retain the

@@ -62,20 +62,31 @@ Two big consumers, in this order of priority:
 
 Computed at scheduler init via
 `MemoryModel.get_weight()`. The size is the model's full parameter
-count divided by `tp_size` (and for MoE: experts further divided by
-`ep_size`), times the dtype byte size:
+count divided by `tp_size` (and for MoE: routed experts further divided by
+`ep_size`), times each tensor's stored byte size:
 
 ```
-weight_bytes_per_gpu = (
+weight_bytes_per_gpu ≈ (
     dense_params / tp_size
     + moe_params / ep_size  # if MoE
 ) * fp
 ```
 
 `fp` is 2 bytes for `bfloat16` / `float16`, 4 for `float32`,
-1 for `int8` and `fp8`.
+1 for `int8` and `fp8`. The width follows how vLLM stores each tensor:
 
-`get_weight()` gets the parameter count by **walking the architecture yaml's
+- On a quantized checkpoint, the layers vLLM never quantizes — embeddings,
+  the LM head, norms and the MoE router gate — keep the floating dtype
+  (`torch_dtype`): DeepSeek-R1's fp8 checkpoint stores them in bf16.
+- A shared expert is a TP-sharded MLP whatever the expert parallelism, so it
+  is divided by `tp_size`; only sequence-parallel MoE replicates it.
+- An MLA layer also holds the `W_UK` / `W_UV` copies vLLM derives from
+  `kv_b_proj` at the floating dtype for the absorbed decode path, beside
+  `kv_b_proj` itself.
+
+DeepSeek-R1 at TP8/EP8 comes to 79.51 GiB per GPU this way.
+
+`get_weight()` gets this total by **walking the architecture yaml's
 blocks and the checkpoint's own per-layer composition**, summing
 `calculate_sizes()` over every canonical layer each decoder layer emits. So a
 heterogeneous stack is weighed layer by layer: DeepSeek-V3.2's first three
@@ -90,10 +101,12 @@ from a fixed list of six layer names.
 
 :::tip[Check a new family against its published parameter count]
 It is the one number that catches a wrong tensor shape anywhere in the stack,
-and it is public. Summing the size formulas over DeepSeek-V3.2-Exp's layer
-composition gives 671.878B; subtracting the sparse indexer's 0.852B leaves
-671.026B, which is DeepSeek-V3's published 671B — and the difference is exactly
-what V3.2 adds over V3.
+and it is public. Counting the parameters in the size formulas over
+DeepSeek-V3.2-Exp's layer composition gives 671.878B; subtracting the sparse
+indexer's 0.852B leaves 671.026B, which is DeepSeek-V3's published 671B — and
+the difference is exactly what V3.2 adds over V3. Count parameters, not the
+stored bytes `get_weight()` returns: those size the unquantized layers at two
+bytes and add MLA's derived decode copies, which are not parameters.
 :::
 
 This bytes amount is reserved on every NPU at startup and never

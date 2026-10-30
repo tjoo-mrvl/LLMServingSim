@@ -459,11 +459,24 @@ class MemoryModel():
         # Expert parallelism off (ep 1 under tp > 1): vLLM shards every expert's
         # intermediate width over TP instead of distributing whole experts.
         moe_tp = self.tp_size if name == "moe" and self.ep_size == 1 else 1
+        # The shared expert is TP-sharded whatever the expert parallelism,
+        # except under sequence-parallel MoE, where vLLM replicates it.
+        shared_tp = 1 if self._sequence_parallel_moe() else self.tp_size
         _, weight, _ = calculate_sizes(
             self.model, name, 1, kv_len=1, parallel=parallel, fp=self.fp,
-            moe_tp=moe_tp,
+            moe_tp=moe_tp, shared_tp=shared_tp,
         )
         return weight
+
+    def _sequence_parallel_moe(self):
+        """vLLM's sequence-parallel MoE: TP > 1 inside a DP > 1 group whose
+        catalog declares it, the rule ``moe_execution`` applies to the native
+        tables. ``ep_size`` is the whole group's EP degree, TP times DP."""
+        dp = self.ep_size // self.tp_size if self.ep_size > self.tp_size else 1
+        if self.tp_size <= 1 or dp <= 1:
+            return False
+        entries = (get_architecture(self.model).get("catalog") or {}).get("moe") or {}
+        return any(bool((entry or {}).get("sequence_parallel")) for entry in entries.values())
 
     # -------------------- KV sizing math --------------------
 
@@ -971,7 +984,7 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
 
 # calculate the per-rank input, weight, output size of each layer
 def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2,
-                    kv_lens=None, *, component_sizes=None, moe_tp=1):
+                    kv_lens=None, *, component_sizes=None, moe_tp=1, shared_tp=None):
     """Calculate input, weight, and output tensor sizes for a given layer.
 
     Args:
@@ -980,6 +993,10 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         moe_tp: tensor-parallel split of each expert's intermediate width,
             for an MoE run with expert parallelism off (every rank holds every
             expert at ``1/tp`` width). 1 otherwise.
+        shared_tp: tensor-parallel split of the shared expert's width. vLLM
+            builds it as a TP-sharded MLP whatever the expert parallelism,
+            replicated only under sequence-parallel MoE. Defaults to
+            ``moe_tp``.
         kv_lens: exact per-request cached histories for MiniMax-M3's
             indexer and sparse_attention only; a list or tuple of nonnegative
             integers, mutually exclusive with kv_len. Sparse attention caps
@@ -993,7 +1010,11 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     # Activations (layer inputs and outputs) take the checkpoint's floating
     # dtype; weights keep ``fp``, the weight dtype. The two differ only on a
     # quantized checkpoint (``activation_element_bytes``). Cache reads (KV,
-    # recurrent state) keep their existing sizing.
+    # recurrent state) keep their existing sizing. Weights vLLM's FP8 path
+    # never quantizes -- embeddings, the LM head, norms and the MoE router
+    # gate (``Fp8Config.get_quant_method`` covers linear layers and routed
+    # experts only; DeepSeek builds its gate without a quant config) -- stay
+    # at the floating dtype too, so they are sized at ``afp``.
     afp = activation_element_bytes(config, fp)
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
@@ -1116,17 +1137,17 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
             local_vocab = vocab_shard_size(config, p)
         else:
             local_vocab = vocab_size // p
-        weight_size = local_vocab * n_embd * fp
+        weight_size = local_vocab * n_embd * afp
         output_size = length * n_embd * afp
 
     elif layer_name in ["input_layernorm", "post_layernorm", "final_layernorm", "layernorm"]:
         input_size = length * n_embd * afp
-        weight_size = 1 * n_embd * fp  # scale only
+        weight_size = 1 * n_embd * afp  # scale only
         output_size = length * n_embd * afp
 
     elif layer_name == "qk_norm":
         input_size = length * (q_dim + kv_dim) // p * afp
-        weight_size = 2 * head_dim * fp
+        weight_size = 2 * head_dim * afp
         output_size = length * (q_dim + kv_dim) // p * afp
 
     # ----------------- RoPE & Attention Core -----------------
@@ -1155,7 +1176,11 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
                 (n_head // p) * length * qk_head_dim * afp
                 + (kv_len or 0) * latent * fp
             )
-            weight_size = 0
+            # vLLM keeps copies of the K/V up-projection for the absorbed
+            # decode path: ``MLAAttention.process_weights_after_loading``
+            # builds ``W_UK_T`` and ``W_UV`` at the activation dtype beside
+            # kv_b_proj itself, so they are this layer's resident weight.
+            weight_size = (n_head // p) * kv_lora_rank * (qk_nope_dim + v_head_dim) * afp
             output_size = (n_head // p) * length * v_head_dim * afp
         elif not pim:
             input_size = (
@@ -1223,7 +1248,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # bias) inside ``DeepseekV2MLAAttention``, so the profiler reports them
         # as one merged node and this entry carries their **sum**.
         input_size = length * (q_lora_rank + kv_lora_rank) * afp
-        weight_size = (q_lora_rank + kv_lora_rank) * fp
+        weight_size = (q_lora_rank + kv_lora_rank) * afp
         output_size = length * (q_lora_rank + kv_lora_rank) * afp
 
     elif layer_name == "mla_b_proj":
@@ -1328,7 +1353,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # their parameters live -- ``head_dim`` each. The gate has none: it is
         # fused into the Q half of ``qkv_proj``.
         input_size = length * ((q_out_dim + 2 * kv_dim) // p) * afp
-        weight_size = 2 * head_dim * fp
+        weight_size = 2 * head_dim * afp
         output_size = input_size
 
     elif layer_name == "sparse_qkv_proj":
@@ -1355,7 +1380,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
                  + (kv_head // p) * m3_idx_dim
                  + m3_idx_dim)
         input_size = length * fused * afp
-        weight_size = (2 * head_dim + 2 * m3_idx_dim) * fp
+        weight_size = (2 * head_dim + 2 * m3_idx_dim) * afp
         output_size = input_size
 
     elif layer_name == "sparse_o_proj":
@@ -1454,7 +1479,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # ``RMSNormGated(head_v_dim)`` -- one scale shared across value heads,
         # applied to the recurrence output.
         input_size = length * (gdn_value_dim // p) * afp
-        weight_size = gdn_v_dim * fp
+        weight_size = gdn_v_dim * afp
         output_size = length * (gdn_value_dim // p) * afp
 
     elif layer_name == "gdn_out_proj":
@@ -1503,16 +1528,19 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
 
     elif layer_name == "moe":
         # The whole block, matching what the catalog binds: gate, this rank's
-        # routed experts, and the shared expert(s). A shared expert runs on
-        # every token beside the routed ones and is replicated, not sharded
-        # (DeepSeek and GLM ship one; families without the field ship none).
-        # With expert parallelism off the experts are tensor-parallel instead,
-        # and so is the shared expert: both keep 1/moe_tp of their width.
+        # routed experts, and the shared expert(s). The gate is replicated and
+        # unquantized. A shared expert runs on every token beside the routed
+        # ones and is a TP-sharded MLP like a dense one, replicated only under
+        # sequence-parallel MoE, so it keeps 1/shared_tp of its width (DeepSeek
+        # and GLM ship one; families without the field ship none). With expert
+        # parallelism off the routed experts are tensor-parallel instead and
+        # keep 1/moe_tp of their width.
+        shared_split = moe_tp if shared_tp is None else shared_tp
         experts_per_rank = num_local_experts // p
         input_size = length * n_embd * afp
-        weight_size = (n_embd * num_local_experts * fp  # gate (replicated)
+        weight_size = (n_embd * num_local_experts * afp  # gate (replicated, unquantized)
                      + experts_per_rank * 3 * n_embd * (moe_ffn_dim // moe_tp) * fp
-                     + num_shared_experts * 3 * n_embd * (shared_ffn_dim // moe_tp) * fp)
+                     + num_shared_experts * 3 * n_embd * (shared_ffn_dim // shared_split) * fp)
         output_size = length * n_embd * afp
 
     # ----------------- LM Head -----------------
@@ -1520,7 +1548,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         from .communication import dtype_bytes, vocab_shard_size
         local_vocab = vocab_shard_size(config, p)
         input_size = length * n_embd * afp
-        weight_size = n_embd * local_vocab * fp
+        weight_size = n_embd * local_vocab * afp
         output_size = length * local_vocab * dtype_bytes(config.get("head_dtype"), afp)
 
     # ----------------- MTP (the model's own drafter) -----------------
@@ -1545,14 +1573,14 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # matters, but it is the honest shape.
         count = 2 if layer_name == "mtp_enorm_hnorm" else 3
         input_size = length * n_embd * afp
-        weight_size = count * n_embd * fp
+        weight_size = count * n_embd * afp
         output_size = length * n_embd * afp
 
     elif layer_name == "mtp_shared_head":
         # DeepSeek/GLM's SharedHead: a norm plus the LM head. Reported under
         # the wrapper, so its size is the pair's.
         input_size = length * n_embd * afp
-        weight_size = (n_embd + n_embd * (vocab_size // p)) * fp
+        weight_size = (n_embd + n_embd * (vocab_size // p)) * afp
         output_size = length * (vocab_size // p) * afp
 
     elif layer_name == "mtp_glue":

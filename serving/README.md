@@ -383,7 +383,9 @@ has no modeled drafter time and warns that speedup is an upper bound. See the
 Static sizing math plus a byte-level view over the block pools. Contains
 `calculate_sizes(parallel=)` and `get_weight` for per-layer tensor size computation — the
 `parallel` parameter is TP degree for dense layers and EP degree for MoE experts, and MoE
-expert weights are sharded by `ep_size`. Modify these when adding a new model architecture.
+expert weights are sharded by `ep_size` (a shared expert by `tp_size`). Weights are sized as
+vLLM stores them: layers it never quantizes stay at the floating dtype on a quantized
+checkpoint. Modify these when adding a new model architecture.
 Sizes the NPU KV cache the way vLLM does: `npu_mem.mem_size * npu_mem.mem_util - weight`, then
 divided into blocks. `npu_used` / `cpu_used` are properties derived from the pools, so there
 is exactly one ledger per tier.

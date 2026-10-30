@@ -21,6 +21,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   because DeepSeek-V3.2's FP8 pipeline-stage transfers double; the
   DeepSeek-V3.2-Exp-16L64E example moves by at most 3.4 µs per request. See
   [CLI flags → Precision](https://llmservingsim.ai/docs/reference/cli-flags#precision).
+- Size per-GPU weights as vLLM stores them. On a quantized checkpoint the
+  layers vLLM never quantizes — embeddings, the LM head, norms and the MoE
+  router gate — keep the floating dtype; a shared expert is TP-sharded under
+  expert parallelism too (replicated only under sequence-parallel MoE) instead
+  of held whole on every rank; and an MLA layer also holds the `W_UK` / `W_UV`
+  copies vLLM derives from `kv_b_proj`. DeepSeek-R1 at TP8/EP8 comes to
+  79.51 GiB per GPU instead of 81.04 GiB. Unquantized checkpoints without MLA
+  or a shared expert are unchanged. No regression clock or example output
+  moves; the DeepSeek-V3.2-Exp-16L64E example's KV pool shrinks from 48,802 to
+  45,496 blocks without saturating. See
+  [KV cache & memory → Model weights](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory#1-model-weights-per-gpu).
 
 ## [v1.3.0] - 2026-10-19
 

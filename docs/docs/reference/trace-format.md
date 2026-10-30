@@ -90,7 +90,7 @@ contain a space.
 | `input_loc` | enum | Where the input tensor lives (see [memory locations](#memory-locations)) |
 | `input_size` | int | Input tensor size in bytes, at the checkpoint's floating (activation) dtype even when its weights are quantized |
 | `weight_loc` | enum | Where the layer's weights live |
-| `weight_size` | int | Weight size in bytes, at the weight dtype |
+| `weight_size` | int | Weight size in bytes, as vLLM stores it: quantized layers at the weight dtype; embeddings, the LM head, norms and the MoE router gate at the floating dtype; an MLA `attention` row holds the `W_UK` / `W_UV` copies derived from `kv_b_proj` |
 | `output_loc` | enum | Where the output tensor will be written |
 | `output_size` | int | Output tensor size in bytes, at the activation dtype |
 | `comm_type` | enum | Collective type after this layer (see [communication](#communication-types)) |
