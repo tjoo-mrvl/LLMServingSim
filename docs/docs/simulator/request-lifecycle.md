@@ -224,7 +224,9 @@ wave-synchronizing them.
 For prefill instances (`pd_type="prefill"`), finished requests are
 **transferred** to a decode instance via
 `router.transfer_prefill_request`. The KV cache transfer cost is
-modeled as inter-link bandwidth based on KV size.
+modeled as inter-link bandwidth based on KV size: each prefill layer
+sends its per-rank KV to the paired decode GPU, sized from that layer's
+cache shape, so an MLA layer ships its whole latent.
 
 ## Stage 10, Output
 

@@ -94,7 +94,7 @@ contain a space.
 | `output_loc` | enum | Where the output tensor will be written |
 | `output_size` | int | Output tensor size in bytes, at the activation dtype |
 | `comm_type` | enum | Collective type after this layer (see [communication](#communication-types)) |
-| `comm_size` | int | Collective message size in bytes. Usually `0` when `comm_type` is `NONE`, but **not always**: on a `PREFILL` trace, `qkv_proj` carries the per-layer P/D KV transfer here while keeping `comm_type` at `NONE` (see [below](#comm_size-without-a-collective)) |
+| `comm_size` | int | Collective message size in bytes. Usually `0` when `comm_type` is `NONE`, but **not always**: on a `PREFILL` trace, one row per block carries the per-layer P/D KV transfer here while keeping `comm_type` at `NONE` (see [below](#comm_size-without-a-collective)) |
 | `misc` | string | Misc tag (sub-batch interleaving, etc.; usually `NONE`) |
 
 ### Native DSA logical bytes
@@ -247,20 +247,31 @@ on the named dimensions.
 
 ## `comm_size` without a collective
 
-On a `PREFILL` trace, every `qkv_proj` row carries a non-zero
+On a `PREFILL` trace, one row of every decoder block carries a non-zero
 `comm_size` while its `comm_type` stays `NONE`. This is not an
 inconsistency: the converter's prefill path emits a point-to-point
-SEND after each layer's KV projection rather than a collective, and a
-SEND needs only a size, a source, a destination, and a tag — there is
-no collective type to name.
+SEND to the paired decode NPU after that row rather than a collective,
+and a SEND needs only a size, a source, a destination, and a tag —
+there is no collective type to name. The converter recognises the row
+by exactly this pair, `comm_type` `NONE` with `comm_size` greater than
+`0`, not by its name.
 
-The value is the **per-layer, per-rank K+V** byte count, honouring
-`kv_cache_dtype`. It is deliberately *not* the layer's `output_size`,
-which is the whole QKV activation: reading that shipped Q as well and
-overstated the transfer by `(q_dim + 2 * kv_dim) / (2 * kv_dim)` — 3x
-on Llama-3.1-8B.
+The carrier is `qkv_proj` where the block has one (every GQA family).
+A block without it carries the send on the attention row that writes
+the cache, `attention` or `sparse_attention`: an MLA block (DeepSeek,
+GLM) projects its latent in `mla_qkv_a_proj` and has no `qkv_proj`.
 
-Everywhere else, `comm_size` is `0` when `comm_type` is `NONE`.
+The value is the layer's **per-rank KV** byte count, from its own
+cache shape and honouring `kv_cache_dtype`: GQA ships its share of K
+and V, while an MLA latent (and a sparse indexer's keys) is whole on
+every TP rank, so each rank ships all of it. It is deliberately *not*
+the layer's `output_size`, which is the whole QKV activation: reading
+that shipped Q as well and overstated the transfer by
+`(q_dim + 2 * kv_dim) / (2 * kv_dim)` — 3x on Llama-3.1-8B.
+
+Everywhere else, `comm_size` is `0` when `comm_type` is `NONE`; the
+simulator stops with an error rather than write that pair on any other
+row.
 
 ## Special markers
 

@@ -9,7 +9,8 @@ from .utils import (
 )
 import pandas as pd
 import yaml
-from .memory_model import activation_element_bytes, calculate_sizes, kv_element_bytes
+from .memory_model import (activation_element_bytes, calculate_sizes, kv_element_bytes,
+                           kv_bytes_per_token_per_layer)
 from .communication import dtype_bytes, vocab_shard_size
 from .gate_function import GateRouter
 from .config_builder import get_device
@@ -1400,6 +1401,20 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
     if layer_num is None and comm_type == 'NONE':
         comm_type, comm_size = _shared_tp_collective(ctx, bctx, layer_name)
 
+    # comm_type NONE with comm_size > 0 is not "no communication": on a PREFILL
+    # trace the Chakra converter reads it as a P/D KV send of comm_size bytes
+    # (llm_converter.py, convert_prefill). Only the carrier row that
+    # _pd_kv_carrier picked on a prefill instance may write it; anywhere else it
+    # would become a stray send, or a silent marker waiting to become one, so
+    # stop here instead.
+    if comm_type == 'NONE' and comm_size and not (
+            ctx.pd_type == 'prefill' and layer_name in _PD_KV_CARRIERS):
+        raise ValueError(
+            f"{layer_name!r} would be written with comm_type NONE and comm_size "
+            f"{comm_size}. The Chakra converter reads that pair as a P/D KV send, "
+            f"which only a prefill instance's {'/'.join(_PD_KV_CARRIERS)} row may "
+            f"carry; give a real collective its comm_type.")
+
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
 
     lines.append((layer_name, str(latency_ns), input_loc, str(inp), wt_loc,
@@ -1447,19 +1462,56 @@ def _shared_tp_collective(ctx, bctx, name):
     return 'NONE', 0
 
 
-def _pd_kv_send_bytes(ctx, bctx):
+def _pd_kv_send_bytes(ctx, bctx, layer_num):
     """Per-layer, per-rank KV bytes a prefill instance ships to its decode peer.
 
     ``batch.pd_kv_send_tokens`` counts this iteration's computed tokens plus, on a
     request's first step, its prefix-cache hit: the decode side needs that KV even
     though the prefill side read it from cache instead of computing it. Using the
     trace's ``total_len`` instead would silently drop exactly the hit.
+
+    The bytes follow this layer's own cache shape (``kv_bytes_per_token_per_layer``).
+    A sharded cache -- GQA's K and V -- is split across the TP ranks, so each rank
+    ships its share. A replicated one -- an MLA latent, a sparse indexer's keys -- is
+    whole on every rank, so each rank ships all of it. For GQA this is
+    ``2 * kv_heads * head_dim * kv_fp / tp`` per token, the formula it replaced;
+    DeepSeek-R1 ships its 1,152-byte bf16 latent (576 values) rather than a GQA
+    size computed from its 128 attention heads.
     """
     tokens = getattr(bctx.batch, 'pd_kv_send_tokens', 0) or 0
     if tokens <= 0:
         return 0
-    kv_dim = ctx.kv_head * ctx.head_dim
-    return 2 * kv_dim * tokens * ctx.kv_fp // max(ctx.tp_size, 1)
+    sharded, replicated = kv_bytes_per_token_per_layer(
+        ctx.config, ctx.kv_fp, _layer_spec(ctx.perf_db, layer_num))
+    return sharded * tokens // max(ctx.tp_size, 1) + replicated * tokens
+
+
+# The rows that may carry a P/D KV send (see ``_pd_kv_carrier``). The Chakra
+# converter does not look at these names; it recognises a send by its comm
+# fields alone, which is why ``_emit_layer`` refuses those fields on any other row.
+_PD_KV_CARRIERS = ('qkv_proj', 'attention', 'sparse_attention')
+
+
+def _pd_kv_carrier(layers):
+    """The row of a block that carries a prefill instance's per-layer KV send.
+
+    How the send works: the row's ``comm_size`` holds the KV bytes while its
+    ``comm_type`` stays ``NONE``, and on a PREFILL trace the Chakra converter turns
+    exactly such a row into a SEND to the paired decode NPU after that row's
+    compute (``llm_converter.py``, ``convert_prefill``). A real collective always
+    has a ``comm_type``, so the two cannot be confused.
+
+    Which row: the KV projection where the block has one (``qkv_proj``, every GQA
+    family, unchanged from before), otherwise the attention kernel that writes the
+    layer's cache (``attention`` / ``sparse_attention``). An MLA block (DeepSeek,
+    GLM) projects its latent in ``mla_qkv_a_proj`` and has no ``qkv_proj``, so it
+    used to ship nothing; MiniMax-M3's sparse block likewise. ``None`` for a list
+    with neither: a block's post-attention half, the shared prologue/head, or a
+    linear-attention block, which caches nothing per token.
+    """
+    if 'qkv_proj' in layers:
+        return 'qkv_proj'
+    return next((name for name in layers if name in _PD_KV_CARRIERS[1:]), None)
 
 
 def _tp_comm(ctx, layer_name, total_len, collective='ALLREDUCE'):
@@ -1509,11 +1561,16 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
     lines.append(("PIM END",))
 
 
-def _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
-    """Emit NPU attention (unified prefill+decode lookup)."""
+def _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE', comm_size=0):
+    """Emit NPU attention (unified prefill+decode lookup).
+
+    ``comm_size`` is a P/D KV send when this row is the block's carrier
+    (``_pd_kv_carrier``), 0 otherwise.
+    """
     if bctx.prefill_chunk == 0 and bctx.n_decode == 0:
         return
-    _emit_layer(ctx, bctx, "attention", lines, power_acc, batch_tag, layer_num)
+    _emit_layer(ctx, bctx, "attention", lines, power_acc, batch_tag, layer_num,
+                comm_size=comm_size)
 
 
 def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag='NONE'):
@@ -1982,7 +2039,13 @@ def _is_contextual_profile(ctx):
 
 def _emit_resolved_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag, source_role=None):
     """Emit an already resolved sequence without applying substitutions twice."""
+    # P/D: on a prefill instance, one row of each block carries the layer's KV
+    # send to the decode peer -- its bytes go in that row's comm_size with
+    # comm_type NONE, which the Chakra converter turns into a SEND. See
+    # _pd_kv_carrier for which row and _pd_kv_send_bytes for how many bytes.
+    carrier = _pd_kv_carrier(layers) if ctx.pd_type == 'prefill' else None
     for layer_name in layers:
+        pd_kv = _pd_kv_send_bytes(ctx, bctx, layer_num) if layer_name == carrier else 0
         if layer_name == 'attn_res' and _is_contextual_profile(ctx):
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
                         source_role=source_role)
@@ -1990,7 +2053,8 @@ def _emit_resolved_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batc
         if layer_name == "attention":
             if ctx.enable_attn_offloading:
                 _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
-            _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag)
+            _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag,
+                                comm_size=pd_kv)
             continue
         if layer_name == "rotary_emb" and "TPU" in ctx.hardware:
             continue
@@ -2010,23 +2074,17 @@ def _emit_resolved_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batc
             comm_size, comm_type = _tp_comm(ctx, layer_name, bctx.total_len)
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
                         comm_type=_with_dim(comm_type, ctx.tp_dim), comm_size=comm_size)
-        elif layer_name == 'qkv_proj' and ctx.pd_type == 'prefill':
-            # P/D disaggregation: this layer's KV has to reach the paired decode
-            # instance. The Chakra converter's PREFILL path emits a point-to-point
-            # send after every *v_proj layer and takes the byte count from the
-            # trace's comm_size column, so put the KV size there.
-            #
-            # Deliberately not the layer's output_size, which the converter used
-            # to read: that is the whole QKV activation, so it shipped Q as well
-            # and overstated the transfer by (q_dim + 2*kv_dim) / (2*kv_dim) --
-            # 3x for Llama-3.1-8B, 1.5x for MHA, more at wider GQA ratios -- and
-            # it ignored kv_cache_dtype. comm_type stays NONE: the converter
-            # builds a SEND/RECV pair, for which ASTRA-Sim reads comm_size,
-            # comm_src, comm_dst and comm_tag.
-            _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
-                        comm_size=_pd_kv_send_bytes(ctx, bctx))
         else:
-            _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num)
+            # pd_kv is non-zero only on the P/D carrier of a prefill instance
+            # (see above). Its bytes go in comm_size, not output_size, which the
+            # converter used to read: that is the whole QKV activation, so it
+            # shipped Q as well and overstated the transfer by
+            # (q_dim + 2*kv_dim) / (2*kv_dim) -- 3x for Llama-3.1-8B, 1.5x for
+            # MHA, more at wider GQA ratios -- and it ignored kv_cache_dtype.
+            # comm_type stays NONE: the converter builds a SEND/RECV pair, for
+            # which ASTRA-Sim reads comm_size, comm_src, comm_dst and comm_tag.
+            _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
+                        comm_size=pd_kv)
 
 
 def _block_copy_key(ctx, block_mode_on, *layer_nums):

@@ -58,6 +58,18 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   GLM-5) and 2.2–2.6× (MiniMax-M3) without saturating, so no regression clock
   moves. See
   [KV cache & memory → KV is not one shape](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory#kv-is-not-one-shape).
+- Ship the KV cache on P/D runs for blocks without a `qkv_proj` row. The
+  prefill trace put each layer's KV send only on `qkv_proj` and the Chakra
+  converter sent only after layers named `*v_proj`, so MLA models
+  (DeepSeek-R1, DeepSeek-V3.2, GLM-5) and MiniMax-M3's sparse layers moved no
+  KV from prefill to decode at all. Such a block now carries the send on its
+  `attention` / `sparse_attention` row, sized from the layer's own cache shape
+  (an MLA latent is whole on every TP rank, so each rank ships all of it). The
+  converter recognises a send by `comm_type` `NONE` with `comm_size` above 0,
+  and the simulator refuses that pair on any other row. GQA P/D graphs are
+  byte-identical and no regression clock moves. Reinstall Chakra
+  (`scripts/compile.sh`) to pick up the converter. See
+  [Trace format → comm_size without a collective](https://llmservingsim.ai/docs/reference/trace-format#comm_size-without-a-collective).
 
 ## [v1.3.0] - 2026-10-19
 

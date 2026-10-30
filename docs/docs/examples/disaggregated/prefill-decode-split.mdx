@@ -66,7 +66,10 @@ The single field that matters: **`pd_type`**.
 
 The router automatically sends new requests to a `"prefill"` instance,
 then transfers the request to a `"decode"` instance after the first
-token. The KV-cache transfer cost is modeled through the inter-link.
+token. The KV-cache transfer cost is modeled through the inter-link:
+every prefill layer sends its KV, sized from the layer's own cache shape,
+to the paired decode GPU. GQA ships each rank's share of K and V; an MLA
+model (DeepSeek, GLM) ships the whole latent from every rank.
 
 ## Run
 

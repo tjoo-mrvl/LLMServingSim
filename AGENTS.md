@@ -1680,12 +1680,18 @@ sampler_291  25933        LOCAL        2565120       LOCAL         0            
   dimension scoping `ALLREDUCE:1,0`, `ALLGATHER:0,1`, `ALLREDUCE:1,0,0` (the
   `:dim0,...` suffix maps to ASTRA-Sim's `involved_dim` BoolList for
   multi-dimensional topologies, one entry per topology dimension)
-- `comm_size` on `qkv_proj` carries the **P/D KV transfer amount** (per layer, per rank,
-  K+V only, honouring `kv_cache_dtype`), and is 0 unless `pd_type == "prefill"`.
-  `convert_prefill` reads it for the per-layer SEND/RECV to the paired decode NPU. It used
-  to read the layer's `output_size`, i.e. the whole QKV activation, which shipped Q as well
-  and overstated the transfer by `(q_dim + 2*kv_dim) / (2*kv_dim)` — 3x for Llama-3.1-8B.
-  `comm_type` stays `NONE` there: a SEND/RECV pair only needs comm_size/src/dst/tag
+- On a prefill instance (`pd_type == "prefill"`) one row per block carries the **P/D KV
+  transfer**: its `comm_size` holds the layer's per-rank KV bytes while `comm_type` stays
+  `NONE`, since a SEND/RECV pair only needs comm_size/src/dst/tag. The carrier is
+  `qkv_proj` where the block has one, otherwise its `attention` / `sparse_attention` row
+  (`_pd_kv_carrier`): MLA blocks (DeepSeek, GLM) have no `qkv_proj` and used to ship
+  nothing. The bytes follow the layer's cache shape (`kv_bytes_per_token_per_layer`:
+  sharded ÷ TP + replicated, honouring `kv_cache_dtype`), so GQA ships its K+V share and
+  MLA its whole latent. `convert_prefill` sends after any row with `comm_type NONE` and
+  `comm_size > 0` — the name no longer matters — and `_emit_layer` refuses that pair on
+  any other row, so a stray value cannot become a send. It used to read the layer's
+  `output_size`, i.e. the whole QKV activation, which shipped Q as well and overstated
+  the transfer by `(q_dim + 2*kv_dim) / (2*kv_dim)` — 3x for Llama-3.1-8B
 - `misc`: `NONE` or batch tag for sub-batch interleaving (`BATCH_1`, `BATCH_2`)
 - First layer (embedding) input comes from `REMOTE` (CPU → NPU), last layer (sampler) output goes to `REMOTE` (NPU → CPU)
 - MoE uses `EXPERT {i}` / `EXPERT END` markers (comm_type on EXPERT line can include dimension scoping)
