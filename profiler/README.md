@@ -1148,7 +1148,9 @@ parent binding and its bound child. Audit nested matches as well. Existing
 `indexer_glue` rows need a dense-category refresh; changing the catalog does
 not repair stored CSV timings.
 Phi-MoE's `block_glue` excludes its MoE, normalization and attention child
-subtrees, retaining only direct decoder residual work. Refresh old Phi dense
+subtrees, retaining only direct decoder residual work. DeepSeek-V3/R1's
+`mla_glue` likewise excludes every child of the MLA wrapper and keeps only its
+copy of the rotated query half back into `q`. Refresh old Phi dense
 rows as well. These exclusions also apply to category slices. The collector
 rejects overlapping canonical CUDA claims within a capture before saving timings.
 

@@ -254,6 +254,9 @@ slice still must not claim work owned by an attention entry. Refresh old
 `indexer_glue` rows through dense acquisition after changing this guard.
 Phi-MoE's `block_glue` likewise excludes `PhiMoE`, `LayerNorm` and
 `PhiMoEAttention`; only the decoder's direct residual work belongs there.
+DeepSeek-V3/R1's `mla_glue` excludes every child of `MultiHeadLatentAttentionWrapper`
+(`MLAAttention`, the linears, norms and rotary); only the wrapper's copy of the
+rotated query half back into `q` belongs there.
 Acquisition rejects shared CUDA activity across canonical bindings. Old Phi
 glue measurements require a dense-category refresh, not a metadata restamp.
 
@@ -2141,7 +2144,11 @@ expert parallelism, so it is divided by TP; only sequence-parallel MoE
 (TP > 1 in a DP > 1 group whose catalog declares it) replicates it. An MLA
 `attention` layer holds the `W_UK` / `W_UV` copies
 `MLAAttention.process_weights_after_loading` derives from `kv_b_proj` at the
-activation dtype. DeepSeek-R1 at TP8/EP8 comes to 79.51 GiB per GPU.
+activation dtype. It also holds `kv_b_proj` itself when the catalog binds
+`q_b_proj` alone (`mla_q_b_proj`, the DeepSeek-V3/R1 catalog), because vLLM 0.31
+calls `kv_b_proj` only inside `MLAAttention`; the V3.2 catalog's merged
+`mla_b_proj` (vLLM 0.28's tree) carries it there instead. Never count it in both.
+DeepSeek-R1 at TP8/EP8 comes to 79.51 GiB per GPU.
 
 `kv_bytes_per_token_per_layer()` is the one place that knows the KV shapes, and
 they are not interchangeable:
@@ -3135,8 +3142,10 @@ which fits one card. Still unguarded, because every MLA bundle here is TP1:
 the shared expert's TP split and an MLA cache's single host copy at TP > 1 and
 PP 1. Add those scenarios with the first TP > 1 MLA bundle. No shipped native
 MoE table has a shared expert or FP8 experts either, so serving's
-`shared_experts` charge and its FP8 table loading are unguarded too. Add a
-scenario that moves when either is reverted with the first DeepSeek-R1 bundle.
+`shared_experts` charge and its FP8 table loading are unguarded too, as are
+the DeepSeek-V3/R1 catalog's rows (`mla_q_b_proj`, `mla_glue`, and `kv_b_proj`'s
+weight on `attention`), because no scenario runs R1. Add scenarios that move
+when any of these is reverted with the first DeepSeek-R1 bundle.
 
 ## Common Pitfalls
 

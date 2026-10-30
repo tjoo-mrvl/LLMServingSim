@@ -872,7 +872,10 @@ catalog's completeness.
 
 Raw-kernel wildcards also need child exclusions: Phi-MoE's `block_glue`
 excludes `PhiMoE`, `LayerNorm` and `PhiMoEAttention`, so routing kernels and
-attention copies are not counted again as decoder residual work. This applies
+attention copies are not counted again as decoder residual work. DeepSeek-V3/R1's
+`mla_glue` similarly excludes `MLAAttention` and every other child of
+`MultiHeadLatentAttentionWrapper`, keeping only the wrapper's copy of the
+rotated query half. This applies
 even when profiling only the dense category. Shared native CUDA activities
 claimed by multiple canonical entries reject acquisition before CSV storage.
 Refresh old affected rows; changing a catalog does not correct stored timings.

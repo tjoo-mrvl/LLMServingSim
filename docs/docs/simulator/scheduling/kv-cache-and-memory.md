@@ -99,6 +99,13 @@ MLA's `mla_qkv_a_proj` is replicated rather than sharded, its `q_b_proj` and
 more projections. That is why the weight is read from the catalog rather than
 from a fixed list of six layer names.
 
+The catalog also decides which row carries `kv_b_proj`. vLLM 0.31 calls
+`q_b_proj` in the MLA wrapper on every step but `kv_b_proj` only inside
+`MLAAttention`, for prefill. The DeepSeek-V3/R1 catalog therefore binds
+`q_b_proj` alone as `mla_q_b_proj`, and the `attention` row carries
+`kv_b_proj`'s weight. The DeepSeek-V3.2 and GLM-5 catalog keeps vLLM 0.28's
+merged `mla_b_proj` row for both. The total is the same either way.
+
 :::tip[Check a new family against its published parameter count]
 It is the one number that catches a wrong tensor shape anywhere in the stack,
 and it is public. Counting the parameters in the size formulas over

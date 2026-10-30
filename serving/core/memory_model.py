@@ -1022,6 +1022,13 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto', tp_size=1,
 
 
 # calculate the per-rank input, weight, output size of each layer
+def _catalog_merges_mla_b_proj(model):
+    """Whether the model's catalog binds ``mla_b_proj``, the merged q_b + kv_b
+    entry that carries kv_b_proj's weight. Otherwise MLA ``attention`` does."""
+    dense = (get_architecture(model).get("catalog") or {}).get("dense") or {}
+    return "mla_b_proj" in dense
+
+
 def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=1, fp=2,
                     kv_lens=None, *, component_sizes=None, moe_tp=1, shared_tp=None):
     """Calculate input, weight, and output tensor sizes for a given layer.
@@ -1220,6 +1227,13 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
             # builds ``W_UK_T`` and ``W_UV`` at the activation dtype beside
             # kv_b_proj itself, so they are this layer's resident weight.
             weight_size = (n_head // p) * kv_lora_rank * (qk_nope_dim + v_head_dim) * afp
+            # kv_b_proj itself, at the weight dtype. vLLM 0.31 calls it only
+            # inside MLAAttention (its prefill up-projection), so a catalog
+            # whose b-projection entry is q_b alone (``mla_q_b_proj``) leaves
+            # its weight to this layer. A merged ``mla_b_proj`` entry -- vLLM
+            # 0.28's tree, kept by the V3.2 catalog -- already carries it.
+            if not _catalog_merges_mla_b_proj(model):
+                weight_size += kv_lora_rank * ((n_head * (qk_nope_dim + v_head_dim)) // p) * fp
             output_size = (n_head // p) * length * v_head_dim * afp
         elif not pim:
             input_size = (
@@ -1299,6 +1313,25 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         weight_size = (q_lora_rank * (q_b_out // p)
                        + kv_lora_rank * (kv_b_out // p)) * fp
         output_size = length * ((q_b_out + kv_b_out) // p) * afp
+
+    elif layer_name == "mla_q_b_proj":
+        # q_b_proj alone: the query up-projection, a ColumnParallelLinear
+        # sharded on the output dim, called by vLLM 0.31's MLA wrapper on every
+        # step. kv_b_proj runs inside MLAAttention, so ``attention`` carries
+        # its weight (see that branch).
+        q_b_out = n_head * qk_head_dim
+        input_size = length * q_lora_rank * afp
+        weight_size = q_lora_rank * (q_b_out // p) * fp
+        output_size = length * (q_b_out // p) * afp
+
+    elif layer_name == "mla_glue":
+        # The MLA wrapper's eager copy that writes the rotated query half back
+        # into q after rotary_emb, bound as a group in the catalog. Sized as
+        # one pass over that half, which is what the copy moves; the latency
+        # is measured, this is a stand-in for the byte counts.
+        input_size = length * (n_head // p) * qk_rope_dim * afp
+        weight_size = 0
+        output_size = input_size
 
     # ----------------- DeepSeek sparse-attention indexer -----------------
     elif layer_name == "indexer_wq_b":

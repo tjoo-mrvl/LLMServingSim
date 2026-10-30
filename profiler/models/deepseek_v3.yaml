@@ -11,19 +11,35 @@
 # ``pre_attn`` and component layouts expect ``Indexer`` / ``SparseAttnIndexer``
 # nodes, which never fire here.
 #
-# Two bindings carry what a live profile tree taught the V3.2 catalog:
+# Four bindings need care. The first two carry what a live profile tree
+# taught the V3.2 catalog; the last two follow vLLM 0.31's MLA wrapper:
 #
 #  * The **shared expert is a ``DeepseekV2MLP``**, the same class as a dense
 #    layer's own ``mlp``. ``not_within: DeepseekV2MoE`` keeps the shared
 #    expert (2048 wide) out of the dense MLP entries (18432 wide); its cost is
 #    already inside ``moe``, which binds the whole block. Without it the two
 #    widths are averaged into one row that describes neither.
-#  * ``q_a_layernorm`` / ``kv_a_layernorm`` and ``q_b_proj`` / ``kv_b_proj``
-#    each share (class, parent), so each pair is one canonical entry whose
-#    value is the pair's **sum** (``mla_a_layernorm``, ``mla_b_proj``). The sum
-#    is also what makes ``kv_b_proj`` correct per regime: FlashAttention-MLA
-#    sends requests of up to 512 new tokens down the weight-absorbed decode
-#    path (``reorder_batch_threshold``), where ``kv_b_proj`` never runs.
+#  * ``q_a_layernorm`` / ``kv_a_layernorm`` share (class, parent), so the pair
+#    is one canonical entry whose value is their **sum** (``mla_a_layernorm``).
+#  * ``q_b_proj`` and ``kv_b_proj`` are both ``ColumnParallelLinear`` children
+#    of ``DeepseekV2MLAAttention``, but vLLM 0.31 calls them in different
+#    places. ``q_b_proj`` runs in ``MultiHeadLatentAttentionWrapper.forward``
+#    on every step and scales with tokens, so ``mla_q_b_proj`` binds it in
+#    ``dense``. ``kv_b_proj`` runs only inside ``MLAAttention``, on its
+#    prefill paths (``forward_mha``, ``_compute_prefill_context``), and only
+#    for requests past the backend's ``reorder_batch_threshold`` (512 new
+#    tokens for FlashAttention-MLA, 128 for FlashMLA, 1 for Triton MLA);
+#    shorter ones take the absorbed ``W_UK`` / ``W_UV`` decode path. Its
+#    time therefore belongs to ``attention``, whose grid is keyed by batch
+#    regime, and ``not_within: MLAAttention`` keeps it out of
+#    ``mla_q_b_proj``. The V3.2 catalog's ``mla_b_proj`` sums both, as vLLM
+#    0.28's tree did; on 0.31 that entry would also claim prefill work
+#    ``attention`` already owns. Sizing follows the same split:
+#    ``memory_model.calculate_sizes`` charges ``kv_b_proj``'s weight to
+#    ``attention`` when no ``mla_b_proj`` carries it.
+#  * ``mla_glue`` claims the wrapper's own copy kernel, which writes the
+#    rotated query half back into ``q`` after ``rotary_emb``. Without it the
+#    copy is CUDA work no entry measures (``profiler coverage`` reports it).
 #
 # Canonical layer names mirror vLLM's attribute names (see
 # ../vllm/vllm/model_executor/models/deepseek_v2.py). Re-derive the bindings
@@ -32,8 +48,8 @@
 blocks:
   attn:
     full_attention:
-      pre_attn:  [layernorm, mla_qkv_a_proj, mla_a_layernorm, mla_b_proj,
-                  rotary_emb, attention]
+      pre_attn:  [layernorm, mla_qkv_a_proj, mla_a_layernorm, mla_q_b_proj,
+                  rotary_emb, mla_glue, attention]
       post_attn: [o_proj, layernorm]
   mlp:
     dense: [gate_up_proj, act_fn, down_proj]
@@ -60,15 +76,28 @@ catalog:
       vllm: RMSNorm
       within: DeepseekV2MLAAttention
       tp_stable: true
-    mla_b_proj:
+    mla_q_b_proj:
       vllm: ColumnParallelLinear
       within: DeepseekV2MLAAttention
+      not_within: MLAAttention
     o_proj:
       vllm: RowParallelLinear
       within: DeepseekV2MLAAttention
     rotary_emb:
       vllm: [DeepseekScalingRotaryEmbedding, RotaryEmbedding]
       within: MultiHeadLatentAttentionWrapper
+    mla_glue:
+      # The MLA wrapper's own eager work between its module calls. On vLLM
+      # 0.31, ``q[..., qk_nope_head_dim:], k_pe = self.rotary_emb(...)`` in
+      # ``MultiHeadLatentAttentionWrapper.forward`` writes the rotated query
+      # half back into ``q`` with one copy kernel per layer, outside every
+      # bound module. Exclude each child subtree: those kernels belong to the
+      # children's own bindings (``attention`` owns MLAAttention's copies).
+      vllm: ["void at::native::*", "Memcpy*", "Memset*"]
+      within: MultiHeadLatentAttentionWrapper
+      not_within: [MLAAttention, DeepSeekV2FusedQkvAProjLinear, RMSNorm,
+                   ColumnParallelLinear, RowParallelLinear,
+                   DeepseekScalingRotaryEmbedding, RotaryEmbedding]
     gate_up_proj:
       vllm: MergedColumnParallelLinear
       within: DeepseekV2MLP

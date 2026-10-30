@@ -109,6 +109,18 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   byte-identical and no regression clock moves. Reinstall Chakra
   (`scripts/compile.sh`) to pick up the converter. See
   [Trace format → comm_size without a collective](https://llmservingsim.ai/docs/reference/trace-format#comm_size-without-a-collective).
+- Bind DeepSeek-V3/R1's MLA query up-projection alone (`mla_q_b_proj`), and
+  claim the MLA wrapper's own copy kernel (`mla_glue`). vLLM 0.31 calls
+  `q_b_proj` in the MLA wrapper on every step but `kv_b_proj` only inside
+  `MLAAttention`, for prefill. The catalog's merged `mla_b_proj` therefore also
+  claimed the `kv_b_proj` GEMM that `attention` owns: `profiler coverage`
+  reported that shared CUDA activity in prefill and mixed batches, and
+  acquisition rejects it. The wrapper's write of the rotated query half back
+  into `q` was CUDA work no entry measured. `kv_b_proj`'s weight moves to the
+  `attention` row, so DeepSeek-R1's per-GPU weight is unchanged (79.51 GiB at
+  TP8/EP8). The DeepSeek-V3.2 and GLM-5 catalog keeps vLLM 0.28's merged
+  `mla_b_proj`, and no regression clock moves. See
+  [KV cache & memory → Model weights](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory#1-model-weights-per-gpu).
 
 ## [v1.3.0] - 2026-10-19
 
