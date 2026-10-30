@@ -350,6 +350,12 @@ vLLM 0.20.2 profile they were first validated with is kept, with the simulator
 that read it, on branch `legacy/vllm-0.20.2`. Their links are hand-set, not
 measured: `link_bw` 450 on the NVLink dimension (the per-direction ring bus
 bandwidth, 900 bidirectional / 2) and 50 on the inter-node one (an EFAv3
-node's 400 shared by its 8 GPUs), with `link_latency` 1000 / 5000 ns. Those
-are decimal GB/s figures in a binary-GiB/s field, about 7% optimistic; replace
-them with `profiler hardware` measurements once an H200 node is profiled.
+node's 400 shared by its 8 GPUs), with `link_latency` 1000 / 5000 ns.
+
+Each R1 instance sets `npu_mem.mem_size` to 140.4 GiB, the 143,771 MiB that
+`nvidia-smi` lists for an H200. That value stands until the H200 profile records
+CUDA's own total, which is what vLLM applies its utilization to. `mem_util` is
+0.92, vLLM 0.31's default `gpu_memory_utilization`, as the deployment runs it;
+it is not fitted to a benchmark. Each instance also declares
+`cudagraph.runner: "v2"`: vLLM 0.31 serves these deployments on Model Runner V2,
+which sets graph padding and the pipeline's async admission rule.

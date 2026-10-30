@@ -50,6 +50,18 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   regression scenario will come with the first DeepSeek-R1 bundle. See
   [Native MoE components → Shared experts](https://llmservingsim.ai/docs/profiler/native-moe-components#shared-experts-on-the-modular-path).
 
+### Changed
+
+- The DeepSeek-R1 cluster configs (`configs/cluster/deepseek_r1_*.json`) state
+  their H200 memory and model runner. `npu_mem.mem_size` is 140.4 GiB, the
+  total `nvidia-smi` lists for an H200, until an H200 profile records CUDA's
+  own total; `mem_util` is 0.92, vLLM 0.31's default, instead of the
+  simulator's 0.9, and is not fitted to a benchmark; and
+  `cudagraph.runner: "v2"` makes graph padding and pipeline admission follow
+  the Model Runner V2 that vLLM 0.31 serves R1 with. R1's KV pool at TP8/EP8
+  grows from 47.4 to 49.7 GiB per GPU. No regression scenario uses these
+  configs.
+
 ### Fixed
 
 - Size tensors between layers at the checkpoint's floating (activation) dtype

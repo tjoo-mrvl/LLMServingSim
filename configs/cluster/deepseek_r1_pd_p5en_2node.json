@@ -15,14 +15,18 @@
                     "model_name": "deepseek-ai/DeepSeek-R1",
                     "hardware": "H200",
                     "npu_mem": {
-                        "mem_size": 141,
+                        "mem_size": 140.4,
                         "mem_bw": 4800,
-                        "mem_latency": 0
+                        "mem_latency": 0,
+                        "mem_util": 0.92
                     },
                     "num_npus": 8,
                     "tp_size": 8,
                     "ep_size": 8,
-                    "pd_type": "prefill"
+                    "pd_type": "prefill",
+                    "cudagraph": {
+                        "runner": "v2"
+                    }
                 }
             ]
         },
@@ -38,14 +42,18 @@
                     "model_name": "deepseek-ai/DeepSeek-R1",
                     "hardware": "H200",
                     "npu_mem": {
-                        "mem_size": 141,
+                        "mem_size": 140.4,
                         "mem_bw": 4800,
-                        "mem_latency": 0
+                        "mem_latency": 0,
+                        "mem_util": 0.92
                     },
                     "num_npus": 8,
                     "tp_size": 8,
                     "ep_size": 8,
-                    "pd_type": "decode"
+                    "pd_type": "decode",
+                    "cudagraph": {
+                        "runner": "v2"
+                    }
                 }
             ]
         }
