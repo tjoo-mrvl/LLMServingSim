@@ -378,6 +378,15 @@ Unlike NPU memory, CPU/CXL accounting is **per node**, not per
 instance. Multiple instances on the same node share the same
 `cpu_used` counter.
 
+A host block holds one copy of the instance's KV cache for its tokens,
+sized the way vLLM's native offloading stores it. A sharded cache (GQA) is
+stored once, split across the ranks. A replicated cache (an MLA latent, a
+sparse indexer's keys) is stored once per TP rank that writes it, except for
+an MLA cache at TP > 1 and PP 1: vLLM 0.31 writes that layout from TP rank 0
+only, so the host holds a single copy, and each GPU's recall loads that copy.
+Private and shared pools use the same rule, so instances sharing a pool must
+agree on the size.
+
 ## How the scheduler uses this
 
 The scheduler does not estimate. It asks the pool, and the pool either

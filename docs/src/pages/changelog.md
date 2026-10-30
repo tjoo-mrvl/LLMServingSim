@@ -40,6 +40,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   declared or observed runner the 0.28 rule still applies, so no regression
   clock moves. See
   [Continuous batching](https://llmservingsim.ai/docs/simulator/scheduling/continuous-batching).
+- Size host prefix-storage copies (`--prefix-storage CPU` / `CXL`) the way
+  vLLM's native offloading stores them. An MLA cache at TP > 1 and PP 1 is
+  written by TP rank 0 only and held once; a replicated cache otherwise once
+  per TP rank instead of once per GPU. A shared pool for an MLA model at
+  TP > 1 or PP > 1 used to stop at startup because the pool and its
+  instances disagreed on the block size, and each GPU's recall now loads the
+  single host copy. GQA models are unchanged and no regression clock moves.
+  See [KV cache & memory](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory).
 
 ## [v1.3.0] - 2026-10-19
 

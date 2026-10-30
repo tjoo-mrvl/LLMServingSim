@@ -389,7 +389,8 @@ vLLM stores them: layers it never quantizes stay at the floating dtype on a quan
 checkpoint. Modify these when adding a new model architecture.
 Sizes the NPU KV cache the way vLLM does: `npu_mem.mem_size * npu_mem.mem_util - weight`, then
 divided into blocks. `npu_used` / `cpu_used` are properties derived from the pools, so there
-is exactly one ledger per tier.
+is exactly one ledger per tier. A host (CPU/CXL) prefix tier holds one copy of the instance's
+cache, sized like vLLM's native offloading: an MLA cache at TP > 1 and PP 1 is stored once.
 
 ### `block_pool.py`
 

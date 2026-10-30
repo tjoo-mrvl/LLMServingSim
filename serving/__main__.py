@@ -763,7 +763,20 @@ def main():
                 )
             model = instances[inst_ids[0]]['model_name']
             cfg = instance_runtime_configs[inst_ids[0]]
-            return full_cluster_kv_bytes_per_token(model, cfg["fp"], cfg["kv_cache_dtype"])
+            # A replicated (MLA) cache is stored once or once per TP rank
+            # depending on the instance's TP and PP, so every member's host
+            # copy has to come out the same size.
+            per_token = {
+                full_cluster_kv_bytes_per_token(
+                    model, cfg["fp"], cfg["kv_cache_dtype"],
+                    instances[i]["tp_size"], instances[i]["pp_size"])
+                for i in inst_ids
+            }
+            if len(per_token) > 1:
+                raise RuntimeError(
+                    "Shared prefix pool requires instances whose host KV copies "
+                    f"agree in size; got {sorted(per_token)} bytes per token")
+            return per_token.pop()
 
         def _pool_block_size(inst_ids):
             sizes = {instance_runtime_configs[i]["block_size"] for i in inst_ids}

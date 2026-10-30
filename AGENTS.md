@@ -1863,6 +1863,12 @@ arrival time to avoid busy-looping.
   tier there is nothing to recall from, so both byte counts are 0. `batch.evict` is 0 in
   every mode — eviction from the NPU costs nothing, because the data is either a finished
   request's cache or already written down off the critical path
+- A host (CPU/CXL) block holds one copy of the instance's cache, sized by
+  `host_copy_bytes_per_token` the way vLLM's native offloading stores it: a sharded (GQA)
+  cache once, a replicated one (MLA latent, indexer keys) once per TP rank that writes it,
+  and an MLA cache at TP > 1 and PP 1 once in total — vLLM 0.31's replicated layout, where
+  only TP rank 0 writes. Shared and private pools use the same rule, so instances sharing a
+  pool must agree on it, and each NPU's recall loads that copy
 
 ### Speculative decoding
 `--num-speculative-tokens N` turns it on. Which draft tokens the target accepts

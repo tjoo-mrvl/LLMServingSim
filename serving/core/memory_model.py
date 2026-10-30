@@ -210,6 +210,7 @@ class MemoryModel():
 
         # Filled on first get_kv(); the layer walk is per model, not per call.
         self._kv_bytes_per_token_per_rank = None
+        self._kv_parts = None
 
         self.weight = self.get_weight() # assume weight is loaded
         if self.weight > self.npu_mem:
@@ -222,7 +223,10 @@ class MemoryModel():
 
         self._bytes_per_token = self.get_kv(1)              # per rank
         self._npu_bytes_per_block = self._bytes_per_token * block_size
-        self._cluster_bytes_per_token = self._bytes_per_token * self.num_npus
+        # One host (CPU/CXL) copy of the instance's cache, as vLLM's
+        # offloading stores it.
+        self._cluster_bytes_per_token = host_copy_bytes_per_token(
+            self.config, self._kv_parts, self.tp_size, self.pp_size)
 
         # vLLM: requested = total_gpu_memory * gpu_memory_utilization, then
         # subtract the non-KV memory (weights, and the activation peak plus CUDA
@@ -346,8 +350,9 @@ class MemoryModel():
     def _build_storage_pool(self, prefix_pool, prefix_storage):
         """The second-tier pool: shared across instances, or private.
 
-        Its blocks hold ``LOWER_TIER_CHUNK_TOKENS`` tokens and are sized in
-        full-cluster bytes, because a host copy holds every rank's shard.
+        Its blocks hold ``LOWER_TIER_CHUNK_TOKENS`` tokens and are sized as one
+        host copy of the instance (``host_copy_bytes_per_token``): every rank's
+        shard, and a replicated cache once per rank that writes it.
         """
         if self.enable_prefix_sharing and prefix_pool is not None:
             if prefix_pool.block_size % self.block_size != 0:
@@ -500,6 +505,7 @@ class MemoryModel():
                 for spec in stack
             ]
             parts += self._drafter_kv_parts(stack)
+            self._kv_parts = parts
             # Sharded caches divide across every NPU of the instance; a
             # replicated one is the same bytes on each, so it must not.
             sharded = sum(a for a, _ in parts)
@@ -967,19 +973,41 @@ def kv_element_bytes(config, fp, kv_cache_dtype='auto'):
     return fp
 
 
-def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
-    """Bytes of KV cache per token aggregated over the full TP cluster.
+def host_copy_bytes_per_token(config, parts, tp_size=1, pp_size=1):
+    """KV bytes per token one host (CPU/CXL) copy of an instance's cache holds.
 
-    Mirrors MemoryModel.get_kv(1) * num_npus but computes directly, avoiding
-    the per-rank floor-division roundoff. ``fp`` is the model weight dtype
-    in bits (16, 32, ...); the element size is ``kv_element_bytes``.
+    ``parts`` is every cached layer's ``(sharded, replicated)`` bytes per
+    token. vLLM's native offloading stores what each rank writes. A sharded
+    cache (GQA) is one copy split across the ranks, so it adds up once. A
+    replicated cache (an MLA latent, an indexer's keys) is the same on every
+    TP rank and each rank writes its own, a pipeline stage only its own
+    layers -- except in vLLM 0.31's replicated layout
+    (``kv_connector/v1/offloading/config.py``): an MLA cache at TP > 1 and
+    PP 1, without context parallelism, on one node, where only TP rank 0
+    writes and the host holds one copy. The simulator places an instance on
+    one node and models no context parallelism.
+    """
+    sharded = sum(a for a, _ in parts)
+    replicated = sum(b for _, b in parts)
+    if config.get('kv_lora_rank') is not None and tp_size > 1 and pp_size == 1:
+        return sharded + replicated
+    return sharded + tp_size * replicated
+
+
+def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto', tp_size=1, pp_size=1):
+    """Bytes of KV cache per token in one host copy of a TP x PP instance.
+
+    The rule ``MemoryModel`` applies to a private host pool
+    (``host_copy_bytes_per_token``), computed from the model alone so that a
+    pool shared across instances can be sized before they exist. The
+    drafter's layers are not included. ``fp`` is the model weight dtype in
+    bits (16, 32, ...); the element size is ``kv_element_bytes``.
     """
     config = get_config(model)
     kv_fp = kv_element_bytes(config, fp // 8, kv_cache_dtype)
     stack = get_layer_stack(model) or [None] * config['num_hidden_layers']
-    return sum(
-        sum(kv_bytes_per_token_per_layer(config, kv_fp, spec)) for spec in stack
-    )
+    parts = [kv_bytes_per_token_per_layer(config, kv_fp, spec) for spec in stack]
+    return host_copy_bytes_per_token(config, parts, tp_size, pp_size)
 
 
 # calculate the per-rank input, weight, output size of each layer
