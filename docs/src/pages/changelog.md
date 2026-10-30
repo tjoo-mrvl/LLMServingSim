@@ -25,8 +25,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   engine's. Seeded weights are stored in the checkpoint's FP8 block layout, one
   kernel call is checked against an fp32 reference before any timing, and the
   DP1 input quantization is timed inside `experts`. Serving loads these tables
-  only when the experts quantize their own input (`identity` preparation);
-  per-tensor and static FP8 and FP8 at DP > 1 are refused. See
+  with either preparation label. Per-tensor and static FP8, and FP8 at DP > 1,
+  are refused. See
   [Native MoE components → FP8 experts](https://llmservingsim.ai/docs/profiler/native-moe-components#fp8-experts-on-the-modular-path).
 - Native MoE component acquisition for the shared expert of an EP > 1 target.
   A model with a shared expert, such as DeepSeek-V3/R1, gets a `shared_experts`
@@ -36,7 +36,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   timed with the runner's routed scale and add. Admission goes by module
   structure, not model family. Sequence-parallel MoE and gated shared experts
   are refused, and models without a shared expert keep unchanged contracts.
-  Serving refuses these tables until it charges the component. See
+  Serving charges the component on local rows after the routed experts and
+  before the TP reduction. The serial charge is an upper bound where vLLM
+  overlaps the shared expert. No shipped bundle has such a table yet; its
+  regression scenario will come with the first DeepSeek-R1 bundle. See
   [Native MoE components → Shared experts](https://llmservingsim.ai/docs/profiler/native-moe-components#shared-experts-on-the-modular-path).
 
 ### Fixed

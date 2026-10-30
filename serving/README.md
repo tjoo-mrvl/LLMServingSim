@@ -127,7 +127,9 @@ When variant-root metadata contains a deployment-matched
 `per_tp[tp].moe_components` entry, DP+EP execution
 uses separate local routing, gathered expert and local finalization timings.
 Modular DP1 uses local routing and expert timings, omitting verified no-op finalization
-and DP collectives; full EP at TP>1 retains its trailing TP AllReduce.
+and DP collectives; full EP at TP>1 retains its trailing TP AllReduce. A table that
+measures a shared expert adds its `shared_experts` timing on local rows after the
+routed work, before that reduction, as a serial upper bound on vLLM's overlap.
 The full padded DP token vector determines each stage's shape; recorded dtypes
 determine the hidden/top-k collective payloads. The live TP1/DP1/EP1 contract adds
 measured wrapper work around native quantized/routed experts, retaining shared
@@ -497,7 +499,8 @@ These tensor contracts are independent of measured bandwidth and latency.
 ### `moe_components.py`
 
 Loads native MoE component tables, validates deployment and acquisition
-contracts, and caches bounded interpolation over their measured coordinates.
+contracts (including FP8 preparation labels and shared-expert boundaries), and
+caches bounded interpolation over their measured coordinates.
 Deployment selection caches absent coverage as well as loaded tables, without
 turning corrupt installed data into a fallback.
 
@@ -507,7 +510,8 @@ Selects matching native component tables and emits routing, ordered dispatch,
 expert work, combine and finalization. Missing coverage is distinct from corrupt
 installed data; unsupported paths retain legacy fallback only when that table exists.
 Modular DP1 emits routing and experts plus optional TP reduction, and never uses
-full-EP data for tensor-sharded experts.
+full-EP data for tensor-sharded experts. A measured shared expert is emitted after
+the routed work (after finalization at DP>1), and the TP restore follows it.
 The live local contract adds a wrapper row and preserves its measured physical
 weight storage separately from the clone bank's allocation footprint.
 RR/RAND can use new three-axis tables; old balanced-total tables retain their

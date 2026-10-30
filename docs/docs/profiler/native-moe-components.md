@@ -162,9 +162,11 @@ would time the EP1 kernel, so an EP > 1 target whose routed experts use vLLM's
 An EP1 target keeps the live path, whose engine already runs the target's
 kernel. Refused for now: per-tensor and static-activation FP8 schemes, other
 quantization methods and FP8 at DP > 1 (its prepare quantizes before the
-dispatch all-gather, which this region does not time). Serving's loader admits
-only the `identity` preparation, so it loads FP8 tables whose experts quantize
-their own input and refuses `timed_input_quantization` tables.
+dispatch all-gather, which this region does not time). Serving loads both
+preparations, because the input quantization is already inside the timed
+`experts` call. The label must match `expert_region.input_quantization`:
+`experts` with `identity`, and `prepare` with `timed_input_quantization`.
+Serving refuses quantized tables at DP > 1.
 
 ## Shared experts on the modular path
 
@@ -217,8 +219,16 @@ after the others and timed on the rank's local rows:
 Like `gate_routing`, this component is measured warm in isolation. Repeated
 calls can keep its weights in L2, which does not happen in a full forward. An
 EP1 target keeps the live path, whose `wrapper` component already contains the
-shared expert. Serving refuses tables with a `shared_experts` component until
-the simulator charges it.
+shared expert.
+
+Serving charges `shared_experts` on the rank's local rows after the routed
+experts, and after `finalize_copy` at DP > 1. The TP restore of the sum moves
+after it. Its loader checks the boundary the same way for every model: the
+width times TP, the TP degree, dtypes, and weight bytes that cover both linears.
+The charge is serial. Where vLLM overlaps the shared expert with routed work,
+the charge is an upper bound. vLLM overlaps it on an auxiliary CUDA stream for
+batches up to `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD` tokens, or inside a
+modular kernel that supports it. That overlap is not modelled.
 
 ## Shapes and measurement protocol
 
@@ -398,12 +408,14 @@ after changing a bundle; cache reuse does not change lookup or routing arithmeti
 ## Runtime communication and limits
 
 The supported DP+EP modular path emits gate/routing, three logical AllGathers (hidden
-states, top-k weights, top-k IDs), experts, ReduceScatter and local finalization
-in dependency order. Tensor widths come from recorded dtypes. For TP greater than
-one, the audited wrapper also restores TP output with AllGather for sequence
-parallelism or AllReduce otherwise. Native components and collectives are charged
-separately; collective time is not included in the component CSV.
-Modular DP1 emits gate/routing and experts, followed by TP AllReduce only when TP>1.
+states, top-k weights, top-k IDs), experts, ReduceScatter, local finalization and,
+when the table measures one, the shared expert, in dependency order. Tensor widths
+come from recorded dtypes. For TP greater than one, the audited wrapper also
+restores TP output with AllGather for sequence parallelism or AllReduce otherwise.
+Native components and collectives are charged separately; collective time is not
+included in the component CSV.
+Modular DP1 emits gate/routing, experts and any shared expert, followed by TP
+AllReduce only when TP>1.
 There are no DP AllGathers, ReduceScatter or finalize-copy in that trace.
 The live TP1 path emits gate/routing, experts and wrapper without collectives;
 wrapper work can surround the expert call in the native forward, so this order

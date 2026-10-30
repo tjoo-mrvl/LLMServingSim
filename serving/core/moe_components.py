@@ -20,6 +20,7 @@ from profiler.core.bundle_metadata import read_tp
 from profiler.core.metadata_names import (
     EAGER_ATTRIBUTION, GRAPH_ATTRIBUTION, MOE_CONDITIONING_POLICY)
 from .communication import dtype_bytes
+from .memory_model import tensor_nbytes
 
 
 class MoeCoverageError(ValueError):
@@ -202,11 +203,30 @@ class MoeComponentTable:
             raise ValueError('MoE backend or parallel configuration differs from the supported execution path')
         self.components = component_names(contract)
         if 'shared_experts' in self.components:
-            # Acquisition can measure an EP rank's shared expert as its own
-            # component (profiler/core/hooks/moe_shared_expert.py). The trace
-            # has no phase for it yet; refuse rather than drop its time.
-            raise ValueError('This native MoE table measures a shared expert, which the '
-                             'simulator does not charge yet')
+            # Measured by profiler/core/hooks/moe_shared_expert.py: a TP rank's
+            # slice of the shared MLP plus the runner's routed scale and add,
+            # on the rank's local rows. moe_execution charges it after the
+            # routed experts. The same checks hold for every model.
+            shared = contract['shared_experts']
+            linears = shared.get('linears')
+            width, hidden = shared.get('intermediate_size'), contract['hidden_dim']
+            if (target.sequence_parallel
+                    or shared.get('boundary') != 'shared_mlp_routed_scale_and_add'
+                    or shared.get('tensor_parallel') != target.tp
+                    or shared.get('hidden_dim') != hidden
+                    or shared.get('input_dtype') != contract['input_dtype']
+                    or type(width) is not int or width < 1
+                    or shared.get('unsharded_intermediate_size') != width*target.tp
+                    or not isinstance(linears, dict)
+                    or set(linears) != {'gate_up_proj', 'down_proj'}
+                    or type(shared.get('weight_bytes')) is not int):
+                raise ValueError('Invalid shared-expert component contract')
+            # Recorded bytes are the checkpoint's: values plus any FP8 scales.
+            values = (tensor_nbytes((2*width, hidden), linears['gate_up_proj'].get('weight_dtype'))
+                      + tensor_nbytes((hidden, width), linears['down_proj'].get('weight_dtype')))
+            quantized = any(linear.get('weight_block_size') for linear in linears.values())
+            if shared['weight_bytes'] < values or (not quantized and shared['weight_bytes'] != values):
+                raise ValueError('Shared-expert weight bytes do not cover its two linears')
         region = contract['expert_region']
         self.live = region['schema'] == 'native-live-expert-region'
         if self.live:
@@ -241,9 +261,25 @@ class MoeComponentTable:
             if (region.get('hidden_dim') != contract['expert_hidden_dim']
                     or region.get('intermediate_size') != contract['expert_intermediate_size']):
                 raise ValueError('Live expert tensor geometry differs from the component contract')
-        elif target.dp == 1 and contract.get('local_execution') != dict(
-                prepare='identity', finalize='output_alias_noop', expert_output_alias=True):
-            raise ValueError('DP1 requires verified identity preparation and aliased no-op finalization')
+        elif target.dp == 1:
+            # The DP1 prepare either hands the input through or, for FP8 experts
+            # that take quantized input, quantizes it inside the timed experts
+            # call (profiler/core/hooks/moe_components.py:_verify_local_boundary).
+            # Neither adds a phase; the label must match the recorded quantizer.
+            quantization = region.get('quantization')
+            if quantization is None:
+                prepare = 'identity'
+            elif (quantization.get('method') == 'fp8'
+                    and region.get('input_quantization') in ('experts', 'prepare')):
+                prepare = ('identity' if region['input_quantization'] == 'experts'
+                           else 'timed_input_quantization')
+            else:
+                raise ValueError('Unknown native expert quantization contract')
+            if contract.get('local_execution') != dict(
+                    prepare=prepare, finalize='output_alias_noop', expert_output_alias=True):
+                raise ValueError('DP1 requires a verified preparation and aliased no-op finalization')
+        elif region.get('quantization') is not None:
+            raise ValueError('Quantized native experts are measured at DP1 only')
         geometry = () if self.live else ('hidden_dim', 'intermediate_size')
         if (region.get('expert_parallel_config') != parallel
                 or any(region.get(k) != contract[k] for k in

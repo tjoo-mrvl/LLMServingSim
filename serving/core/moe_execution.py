@@ -127,9 +127,11 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
         if type(gate_bytes) is not int or type(expert_bytes) is not int:
             raise ValueError('Native MoE profile must record measured component weight sizes')
         weights = dict(gate_routing=gate_bytes, experts=expert_bytes,
-                       finalize_copy=0, wrapper=contract.get('wrapper_weight_bytes', 0))
+                       finalize_copy=0, wrapper=contract.get('wrapper_weight_bytes', 0),
+                       shared_experts=(contract.get('shared_experts') or {}).get('weight_bytes', 0))
         widths = dict(gate_routing=contract.get('gate_hidden_dim', h),
-                      experts=contract.get('expert_hidden_dim', h), finalize_copy=h, wrapper=h)
+                      experts=contract.get('expert_hidden_dim', h), finalize_copy=h, wrapper=h,
+                      shared_experts=h)
         parts.append((times, tuple(weights[name] for name in components),
                       tuple(widths[name] for name in components)))
     group_size = ctx.ep_total if sp else dp
@@ -170,6 +172,15 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
         # the boundary does not claim overlap or allocator-accurate lifetimes.
         phases = [(0,'moe_gate_routing',dispatch), (1,'moe_experts','NONE 0'),
                   (2,'moe_wrapper',restore)]
+    if 'shared_experts' in components:
+        # The shared-expert component (profiler/core/hooks/moe_shared_expert.py)
+        # runs on the rank's local rows and holds the runner's routed scale and
+        # the add, so the TP restore of the sum moves after it. Charged in
+        # series, like the live wrapper: vLLM can overlap the shared expert with
+        # routed work (aux stream, modular-kernel overlap), which is not modelled.
+        index, name, end = phases[-1]
+        phases[-1] = (index, name, 'NONE 0')
+        phases.append((components.index('shared_experts'), 'moe_shared_experts', end))
     for phase, name, end in phases:
         for local_rank, (times, weights, widths) in enumerate(parts):
             lines.append((f'EXPERT {local_rank} NONE 0',))

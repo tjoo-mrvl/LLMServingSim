@@ -270,8 +270,9 @@ class ComponentMeasurement:
         if getattr(runner, '_shared_experts', None) is not None:
             from .moe_shared_expert import SharedExpertCopy
             # The shared expert becomes its own component, timed on the rank's
-            # local rows; component_names admits it by this contract entry.
-            # Models without one keep their contracts unchanged.
+            # local rows; component_names admits it by this contract entry, and
+            # serving (serving/core/moe_execution.py) charges it after the
+            # routed experts. Models without one keep their contracts unchanged.
             self.shared = SharedExpertCopy(model_runner.vllm_config, runner, self.target,
                                            self.device, ue8m0)
             self.shared.check_output(torch.randn((min(16, self.cfg.max_num_tokens), h),

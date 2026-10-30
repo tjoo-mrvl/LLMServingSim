@@ -2420,7 +2420,8 @@ preserve the input and return no scale or token metadata; with a NoOP reduction,
 experts write directly to the caller's output alias. Observe no CUDA work in
 prepare/finalize before recording `local_execution` and omit `finalize_copy`
 entirely. Preserve the alias in every conditioned eager variant. DP1
-traces contain gate/routing, experts and optional TP AllReduce, no DP collectives.
+traces contain gate/routing, experts, any measured shared expert and optional TP
+AllReduce, no DP collectives.
 Full EP at TP>1 owns whole experts and is not plain tensor-sharded TP.
 
 An EP>1 target whose routed experts use vLLM's `Fp8MoEMethod` (block scales,
@@ -2435,8 +2436,9 @@ DP1 prepare runs inside `experts`, recorded as `local_execution.prepare`
 `identity` (experts quantize their own input) or `timed_input_quantization`.
 Weight banks clone the scales with the weights. EP1 keeps the live path;
 per-tensor or static FP8, other quantization methods and FP8 at DP>1 are
-refused. Serving's loader admits only `identity` preparation, so it loads FP8
-tables whose experts quantize their own input and refuses the others.
+refused. Serving loads both preparations; the label must match
+`expert_region.input_quantization` (`experts` with `identity`, `prepare` with
+`timed_input_quantization`). Quantized tables at DP>1 are refused.
 
 An EP>1 target's shared expert (`runner._shared_experts`) is measured as a
 `shared_experts` component on local rows, placed after the other components.
@@ -2452,7 +2454,11 @@ then checks one call against fp32. The timed call adds the runner's native
 `_maybe_apply_routed_scale_to_output` and the add of a zero routed output; the
 TP reduction stays simulated. Sequence-parallel MoE and gated shared experts are
 refused. Contracts of models without a shared expert are unchanged. Serving
-refuses `shared_experts` tables until the trace charges them.
+validates the boundary the same way for every model: width × TP, dtypes, and
+weight bytes covering both linears. It charges `shared_experts` on local rows
+after the routed experts (after finalize-copy at DP>1), with the TP restore
+moved after it. The serial charge is an upper bound where vLLM overlaps the
+shared expert (aux stream, modular-kernel overlap); do not model that overlap.
 
 Missing
 DP1 native coverage falls back only when a historical whole-block table exists,
@@ -2565,8 +2571,8 @@ unsupported. Keep historical acquisition
 fingerprints as provenance; do not relabel old samples after changing a method.
 
 DP+EP trace order is gate/routing, hidden/top-k-weights/top-k-IDs AllGathers, experts,
-ReduceScatter, finalize-copy, then the wrapper's optional TP AllGather (SP) or
-AllReduce (non-SP). Chakra must chain every marker collective and retain the
+ReduceScatter, finalize-copy, any measured shared expert, then the wrapper's
+optional TP AllGather (SP) or AllReduce (non-SP). Chakra must chain every marker collective and retain the
 last dependency through ranks it skips. The ragged Ring envelope and independent
 logical collective costs remain approximations of grouped NCCL execution.
 See `docs/docs/profiler/native-moe-components.md` for flags and exact limits.
@@ -3119,7 +3125,10 @@ async rule) each move if the rule they guard is reverted; that was checked by
 reverting each fix. They use the reduced 16-layer DeepSeek-V3.2 checkpoint,
 which fits one card. Still unguarded, because every MLA bundle here is TP1:
 the shared expert's TP split and an MLA cache's single host copy at TP > 1 and
-PP 1. Add those scenarios with the first TP > 1 MLA bundle.
+PP 1. Add those scenarios with the first TP > 1 MLA bundle. No shipped native
+MoE table has a shared expert or FP8 experts either, so serving's
+`shared_experts` charge and its FP8 table loading are unguarded too. Add a
+scenario that moves when either is reverted with the first DeepSeek-R1 bundle.
 
 ## Common Pitfalls
 
