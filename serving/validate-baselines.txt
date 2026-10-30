@@ -69,6 +69,11 @@ spec_sparse_mla 3218715700
 spec_sparse_gqa 1719869751
 spec_pp 1414952342
 spec_dp_ep 3795053247
+saturated_mla 38105445910
+saturated_mla_pp 24493689372
+mla_pp_cpu_pool 1819277112
+pd_mla 2708393541
+moe_pp_v2_runner 1688095541
 rtx4090_single 20106941997
 rtx4090_multi 17256331060
 accuracy:RTX4090/Llama-3.1-8B 6f1c7914fc31f2a6d4faa1d472c63005

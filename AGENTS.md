@@ -3076,6 +3076,18 @@ and PP rather than TP because only `tp1` is profiled for three of the four.
 `--num-reqs` is deliberately small: what these check is which layers get
 emitted, and the stacks are 60-78 deep.
 
+**A sizing rule needs a scenario that moves when it is wrong.** The family
+scenarios run four requests and never fill an MLA cache, so per-GPU weight and
+KV sizing pass them unseen. `saturated_mla` (weights as vLLM stores them),
+`saturated_mla_pp` (one stage's replicated cache), `mla_pp_cpu_pool` (host
+copies, which stopped at startup before), `pd_mla` (P/D sends on an MLA block,
+over a deliberately slow link) and `moe_pp_v2_runner` (a declared runner's
+async rule) each move if the rule they guard is reverted; that was checked by
+reverting each fix. They use the reduced 16-layer DeepSeek-V3.2 checkpoint,
+which fits one card. Still unguarded, because every MLA bundle here is TP1:
+the shared expert's TP split and an MLA cache's single host copy at TP > 1 and
+PP 1. Add those scenarios with the first TP > 1 MLA bundle.
+
 ## Common Pitfalls
 
 - **Don't reintroduce `sequence:`, or any second layer-order form.** There is

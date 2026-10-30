@@ -334,6 +334,10 @@ TP because only `tp1` is profiled for those three — see
 | `single_node_sparse_mla_instance.json` | DeepSeek-V3.2-Exp at PP=16 — MLA plus the DSA indexer, a stack whose first three layers are dense, and the only checkpoint with group-limited expert routing (`n_group 8`, `topk_group 4`) |
 | `single_node_sparse_mla_dp_ep_instance.json` | GLM-5, two PP=32 instances in one DP group over EP=2. Same catalog and vLLM path as DeepSeek-V3.2, but `n_group 1` — the unrestricted routing case spelled out |
 | `single_node_sparse_gqa_instance.json` | MiniMax-M3 at PP=16 — the other sparse shape: top-16 blocks of 128 over GQA, against DeepSeek's top-2048 tokens over MLA |
+| `single_node_mla_instance.json` | DeepSeek-V3.2-Exp-16L64E, the reduced 16-layer checkpoint, on one GPU. The `saturated_mla` scenario fills its KV cache, so the per-GPU weight decides the result |
+| `single_node_mla_pp_instance.json` | The same checkpoint at PP=4, four of its 16 layers per stage. Used saturated (`saturated_mla_pp`) and with a shared CPU prefix pool (`mla_pp_cpu_pool`) |
+| `single_node_pd_mla_instance.json` | The same checkpoint as a prefill/decode pair over a deliberately slow link (0.001 GiB/s), so each layer's MLA KV send sits on the critical path (`pd_mla`) |
+| `single_node_moe_pp_v2_runner_instance.json` | `single_node_moe_pp_instance.json` with `cudagraph.runner: "v2"` declared, which sets the scheduler's async rule for the pipeline (`moe_pp_v2_runner`) |
 | `deepseek_r1_single_instance.json` | DeepSeek-R1 on 8×H200 at TP=8 with EP=8 |
 | `deepseek_r1_tp8_ep1_single_instance.json` | DeepSeek-R1 at TP=8 with expert parallelism off: every rank holds every expert at 1/8 width, and the MoE block closes with a TP all-reduce |
 | `deepseek_r1_tp1_pp8_single_instance.json` | DeepSeek-R1 at TP=1 × PP=8 |

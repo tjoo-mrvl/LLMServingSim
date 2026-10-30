@@ -264,6 +264,13 @@ check the new number differs from the closest existing one, and if it does
 not, find a configuration where the flag actually bites (turning the KV
 cache saturated with `--npu-memory-utilization` is usually enough).
 
+Confirm it by reverting your change locally and rerunning the scenario: its
+clock has to move. A fix that moves no scenario has no regression check, and a
+later change can undo it unnoticed. The `saturated_mla`, `saturated_mla_pp`,
+`mla_pp_cpu_pool`, `pd_mla` and `moe_pp_v2_runner` scenarios were added this
+way for MLA weight and KV sizing, host prefix copies, P/D KV sends and the
+declared model runner.
+
 `serving/run.sh` is a menu of one example per feature, not a test suite —
 adding to it does not get your case validated.
 

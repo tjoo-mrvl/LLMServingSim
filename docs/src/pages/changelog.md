@@ -8,6 +8,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
 
 ## [Unreleased]
 
+### Added
+
+- Regression scenarios that move when the MLA sizing, host-copy, P/D and
+  runner fixes below are reverted. `saturated_mla` and `saturated_mla_pp` fill
+  the KV cache of the reduced 16-layer DeepSeek-V3.2 checkpoint at PP1 and PP4,
+  `mla_pp_cpu_pool` builds its shared CPU prefix pool, `pd_mla` runs it as a
+  prefill/decode pair over a deliberately slow link, and `moe_pp_v2_runner`
+  declares Model Runner V2 for a MoE pipeline. The shared expert's TP split and
+  an MLA cache's single host copy at TP > 1 still need a TP > 1 MLA bundle. See
+  [Validating changes](https://llmservingsim.ai/docs/contributor/validating-changes).
+
 ### Fixed
 
 - Size tensors between layers at the checkpoint's floating (activation) dtype

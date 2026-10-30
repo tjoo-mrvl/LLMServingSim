@@ -1,0 +1,43 @@
+{
+ "num_nodes": 1,
+ "link_bw": 0.001,
+ "link_latency": 20000,
+ "nodes": [
+  {
+   "num_instances": 2,
+   "cpu_mem": {
+    "mem_size": 512,
+    "mem_bw": 256,
+    "mem_latency": 0
+   },
+   "instances": [
+    {
+     "model_name": "deepseek-ai/DeepSeek-V3.2-Exp-16L64E",
+     "hardware": "RTXPRO6000",
+     "npu_mem": {
+      "mem_size": 96,
+      "mem_bw": 1597,
+      "mem_latency": 0
+     },
+     "num_npus": 1,
+     "tp_size": 1,
+     "pd_type": "prefill",
+     "pp_size": 1
+    },
+    {
+     "model_name": "deepseek-ai/DeepSeek-V3.2-Exp-16L64E",
+     "hardware": "RTXPRO6000",
+     "npu_mem": {
+      "mem_size": 96,
+      "mem_bw": 1597,
+      "mem_latency": 0
+     },
+     "num_npus": 1,
+     "tp_size": 1,
+     "pd_type": "decode",
+     "pp_size": 1
+    }
+   ]
+  }
+ ]
+}

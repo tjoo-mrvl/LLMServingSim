@@ -205,6 +205,31 @@ SCENARIOS=(
     "spec_pp|--cluster-config $C/single_node_hybrid_pp_instance.json --num-speculative-tokens 5 --dataset $TRACE --num-reqs 4"
     "spec_dp_ep|--cluster-config $C/single_node_sparse_mla_dp_ep_instance.json --num-speculative-tokens 4 --dataset $TRACE --num-reqs 4"
 
+    # --- MLA memory and transfer sizing. The scenarios above never fill an MLA
+    # --- cache, so a wrong per-GPU size passes unseen. These use the reduced
+    # --- 16-layer DeepSeek-V3.2 checkpoint, which fits one card, and each moves
+    # --- if the rule it guards changes. The utilizations leave about 12K tokens
+    # --- of KV at PP1 and 22K at PP4 against 38.5K demanded, so both run
+    # --- saturated; every request still fits on its own.
+    # Weights sized as vLLM stores them: bf16 embedding, head, norms and gate
+    # on an FP8 checkpoint, plus MLA's W_UK/W_UV copies. 2.2 GiB more weight
+    # leaves this pool a twentieth of what it would otherwise be.
+    "saturated_mla|--cluster-config $C/single_node_mla_instance.json --npu-memory-utilization 0.4464 --dataset $SG_L --num-reqs 20"
+    # A pipeline stage holds only its own layers' MLA latent: 4 of 16 here, so
+    # 2,832 bytes per token per GPU rather than all layers' 11,328.
+    "saturated_mla_pp|--cluster-config $C/single_node_mla_pp_instance.json --npu-memory-utilization 0.1568 --dataset $SG_L --num-reqs 20"
+    # A host prefix copy holds the replicated latent once per writing TP rank,
+    # not once per GPU. The shared pool and the instance used to disagree on
+    # that size, and this configuration stopped at startup.
+    "mla_pp_cpu_pool|--cluster-config $C/single_node_mla_pp_instance.json --enable-prefix-caching --enable-prefix-sharing --prefix-storage CPU --dataset $TRACE --num-reqs 10"
+    # P/D on a block without qkv_proj: the KV send rides on the attention row.
+    # The link is deliberately slow (0.001 GiB/s) so the per-layer sends sit on
+    # the critical path; without them this clock does not move with the link.
+    "pd_mla|--cluster-config $C/single_node_pd_mla_instance.json --dataset $TRACE --num-reqs 10"
+    # A declared Model Runner V2 decides the async rule for a MoE pipeline,
+    # which vLLM 0.28's default would have put on V1.
+    "moe_pp_v2_runner|--cluster-config $C/single_node_moe_pp_v2_runner_instance.json --dataset $TRACE --num-reqs 10"
+
     # --- a second hardware profile ---
     "rtx4090_single|--cluster-config $C/rtx4090_single_instance.json --dataset $SG_L --num-reqs 20"
     "rtx4090_multi|--cluster-config $C/rtx4090_multi_instance.json --dataset $SG_L --num-reqs 20"
