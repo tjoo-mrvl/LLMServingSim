@@ -494,8 +494,10 @@ class MemoryModel():
         gated-DeltaNet layer caches nothing per token at all.
 
         Sharding differs with it. GQA splits K and V across ranks; MLA does
-        not (``num_kv_heads = 1``), so its bytes are the same on every rank and
-        must not be divided.
+        not (``num_kv_heads = 1``), so its bytes are the same on every TP rank
+        and must not be divided by TP. A pipeline stage still holds only its
+        own layers: vLLM builds the others as ``PPMissingLayer``, so their
+        caches live on other ranks.
         """
         if self._kv_bytes_per_token_per_rank is None:
             config, kv_fp = self.config, self.kv_fp
@@ -504,14 +506,23 @@ class MemoryModel():
                 kv_bytes_per_token_per_layer(config, kv_fp, spec)
                 for spec in stack
             ]
-            parts += self._drafter_kv_parts(stack)
-            self._kv_parts = parts
-            # Sharded caches divide across every NPU of the instance; a
-            # replicated one is the same bytes on each, so it must not.
-            sharded = sum(a for a, _ in parts)
-            replicated = sum(b for _, b in parts)
+            drafter = self._drafter_kv_parts(stack)
+            self._kv_parts = parts + drafter
+            # Sharded caches divide across every NPU of the instance. A
+            # replicated one is not divided by TP, but a rank holds only its
+            # stage's layers: the fullest stage, ceil(n / pp) contiguous
+            # layers, the heaviest such window -- the one ``get_weight``
+            # charges. The drafter's layers are added to it, as the last
+            # stage carries them.
+            sharded = sum(a for a, _ in self._kv_parts)
+            replicated = [b for _, b in parts]
+            window = -(-len(replicated) // max(self.pp_size, 1))
+            stage = max(
+                sum(replicated[i:i + window])
+                for i in range(0, len(replicated) - window + 1)
+            )
             self._kv_bytes_per_token_per_rank = (
-                sharded // self.num_npus + replicated
+                sharded // self.num_npus + stage + sum(b for _, b in drafter)
             )
         return self._kv_bytes_per_token_per_rank * seq
 

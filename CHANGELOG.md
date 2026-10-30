@@ -45,6 +45,16 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   instances disagreed on the block size, and each GPU's recall now loads the
   single host copy. GQA models are unchanged and no regression clock moves.
   See [KV cache & memory](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory).
+- Count only one pipeline stage's layers in a GPU's replicated KV caches (MLA
+  latents, sparse-indexer keys). TP does not divide them, but a PP stage holds
+  only its own layers' caches, and every GPU was charged all of them:
+  DeepSeek-R1's KV pool came out 1.97× too small at TP8/PP2 and 7.62× at
+  TP1/PP8. A GPU now holds the fullest stage, `ceil(layers / pp)` layers (the
+  window `get_weight()` uses), plus the drafter's layers. GQA caches and PP1
+  runs are unchanged. The PP sparse scenarios' pools grow 12–26× (DeepSeek-V3.2,
+  GLM-5) and 2.2–2.6× (MiniMax-M3) without saturating, so no regression clock
+  moves. See
+  [KV cache & memory → KV is not one shape](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory#kv-is-not-one-shape).
 
 ## [v1.3.0] - 2026-10-19
 

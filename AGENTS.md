@@ -2147,6 +2147,13 @@ they are not interchangeable:
 | + sparse indexer | plus `index_head_dim + index_head_dim//128 * 4` bytes (fp8 keys + fp32 scales, uint8) | replicated |
 | linear attention | 0 per token — the state is per **sequence** | n/a |
 
+Replicated means across TP only: a pipeline stage still holds just its own layers,
+because vLLM builds the others as `PPMissingLayer`. `get_kv()` divides sharded
+caches by TP × PP and charges the replicated ones of the fullest stage —
+`ceil(n / pp)` contiguous layers, the heaviest window, as `get_weight()` does — plus
+the drafter's layers. DeepSeek-R1 at TP1/PP8 holds 9,216 bytes per token per GPU,
+not all 61 layers' 70,272.
+
 A per-sequence state is charged as blocks the request holds for its whole life
 (`MemoryModel._state_blocks_per_request`), in a list separate from the token
 blocks: the token list is positional, so a block backing no tokens must not

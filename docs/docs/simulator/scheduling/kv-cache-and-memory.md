@@ -150,9 +150,17 @@ layer has from the checkpoint:
 | Attention | Bytes per token per layer | Sharded by TP? |
 | --- | --- | --- |
 | GQA | `2 * num_key_value_heads * head_dim * kv_fp` | yes |
-| **MLA** (DeepSeek-V3.2, GLM-5) | `(kv_lora_rank + qk_rope_head_dim) * kv_fp` — one latent, no separate V | **no** — `num_kv_heads` is 1, so every rank holds the same bytes |
+| **MLA** (DeepSeek-V3.2, GLM-5) | `(kv_lora_rank + qk_rope_head_dim) * kv_fp` — one latent, no separate V | **no** — `num_kv_heads` is 1, so every TP rank holds the same bytes |
 | **+ sparse indexer** (the same two) | plus `index_head_dim + index_head_dim/128 * 4` — a **second** cache beside the latent, fp8 keys with one fp32 scale per 128 elements | no |
 | **Linear attention** (Qwen3.5/3.8 gated DeltaNet) | 0 — its state is fixed *per sequence*, not per token | n/a |
+
+A cache TP does not divide is still split by pipeline stage: vLLM builds only
+a stage's own layers, so a GPU holds only their caches. `get_kv()` charges the
+replicated caches of the fullest stage — `ceil(num_layers / pp_size)`
+contiguous layers, the heaviest such window, as `get_weight()` charges
+weights — plus the drafter's layers, which the last stage carries. DeepSeek-R1
+at TP1/PP8 holds 9,216 bytes per token per GPU (8 of its 61 layers), not
+70,272.
 
 These are the ordinary simulator's capacity formulas. New native DeepSeek-V3.2
 tables record a packed 656+132-byte cache per token per layer, which this
