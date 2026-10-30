@@ -59,10 +59,16 @@ because that is where each one is actually decided:
 | Cache | Config field | Rule |
 | --- | --- | --- |
 | Weights | `quantization_config.quant_method`, then `torch_dtype` / `dtype` | On a quantized checkpoint the dtype fields describe the *activation* dtype, so DeepSeek-V3.2 (`quant_method: fp8`, `torch_dtype: bfloat16`) is fp8, not bf16. Same rule as the profiler's, because it also picks which `perf/.../<variant>/` folder is read |
-| KV cache | `quantization_config.kv_cache_scheme` (compressed-tensors) or `kv_cache_quant_algo` (ModelOpt) | Either one present means fp8, otherwise the weight dtype. This is vLLM's own promotion at `attention.py:281`, and the direction its source states for itself: *"kv cache dtype should be specified in the FP8 checkpoint config and become the 'auto' behavior"* |
+| KV cache | `quantization_config.kv_cache_scheme` (compressed-tensors) or `kv_cache_quant_algo` (ModelOpt) | Either one present means fp8. This is vLLM's own promotion at `attention.py:281`, and the direction its source states for itself: *"kv cache dtype should be specified in the FP8 checkpoint config and become the 'auto' behavior"*. Otherwise the cache takes the floating dtype (`torch_dtype` / `dtype`), as vLLM's `auto` does, so a quantized checkpoint without a KV scheme keeps a 16-bit cache: DeepSeek-R1 (`quant_method: fp8`, `torch_dtype: bfloat16`) caches bf16. Sparse-MLA models (`index_topk`, DeepSeek-V3.2 and GLM-5) keep the weight dtype instead, because vLLM picks their cache format per attention backend |
 | Mamba conv state | `mamba_cache_dtype` | `auto` falls back to the weight dtype |
 | Mamba recurrent state | `mamba_ssm_dtype` | `auto` falls back to the conv dtype. Qwen3.8-27B declares `float32`, so its recurrent state is 4 bytes where its conv state is 2 |
 | Sparse-indexer side cache | none — fixed by the model | DeepSeek/GLM store fp8 keys plus fp32 scales as uint8; MiniMax-M3 stores bf16. Neither follows the KV cache dtype |
+
+Activations follow the floating dtype as well, whatever the weights are stored
+in. DeepSeek-R1 runs W8A8 FP8 GEMMs, converting each layer's input to FP8 inside
+the layer, but every tensor between layers is bf16: a layer's input and output
+sizes, TP collectives, pipeline-stage transfers and MoE dispatch payloads are all
+sized at 2 bytes per element, while weights keep the weight dtype.
 
 A dtype is a property of the checkpoint, and once a model carries five of
 them a flag per dtype is both unusable and unfaithful — it describes a model

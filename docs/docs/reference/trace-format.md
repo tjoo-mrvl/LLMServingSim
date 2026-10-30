@@ -88,11 +88,11 @@ contain a space.
 | `Layername` | string | Canonical layer name + index (e.g., `qkv_proj_0`, `attention_31`) |
 | `comp_time` | int | Computation latency in **nanoseconds** |
 | `input_loc` | enum | Where the input tensor lives (see [memory locations](#memory-locations)) |
-| `input_size` | int | Input tensor size in bytes |
+| `input_size` | int | Input tensor size in bytes, at the checkpoint's floating (activation) dtype even when its weights are quantized |
 | `weight_loc` | enum | Where the layer's weights live |
-| `weight_size` | int | Weight size in bytes |
+| `weight_size` | int | Weight size in bytes, at the weight dtype |
 | `output_loc` | enum | Where the output tensor will be written |
-| `output_size` | int | Output tensor size in bytes |
+| `output_size` | int | Output tensor size in bytes, at the activation dtype |
 | `comm_type` | enum | Collective type after this layer (see [communication](#communication-types)) |
 | `comm_size` | int | Collective message size in bytes. Usually `0` when `comm_type` is `NONE`, but **not always**: on a `PREFILL` trace, `qkv_proj` carries the per-layer P/D KV transfer here while keeping `comm_type` at `NONE` (see [below](#comm_size-without-a-collective)) |
 | `misc` | string | Misc tag (sub-batch interleaving, etc.; usually `NONE`) |

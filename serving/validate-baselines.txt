@@ -61,11 +61,11 @@ hybrid 4781444558
 hybrid_prefix_off 4781444558
 hybrid_tp 8639254995
 hybrid_pp 4686922673
-sparse_mla 3576751922
+sparse_mla 3577659197
 sparse_mla_dp_ep 6507210163
 sparse_gqa 2830511007
 spec_hybrid 1489226574
-spec_sparse_mla 3216960053
+spec_sparse_mla 3218715700
 spec_sparse_gqa 1719869751
 spec_pp 1414952342
 spec_dp_ep 3795053247
@@ -73,7 +73,7 @@ rtx4090_single 20106941997
 rtx4090_multi 17256331060
 accuracy:RTX4090/Llama-3.1-8B 6f1c7914fc31f2a6d4faa1d472c63005
 summary:RTX4090/Llama-3.1-8B 2f50d14be87c67564e25646a8efa00a9
-accuracy:RTXPRO6000/DeepSeek-V3.2-Exp-16L64E 06c3f20db56fc97a05ddc57a6f7c4c04
+accuracy:RTXPRO6000/DeepSeek-V3.2-Exp-16L64E 2929ae804944c91d7ebac2c5b421ec57
 summary:RTXPRO6000/DeepSeek-V3.2-Exp-16L64E 4db43ad480a4107247465472e69603d0
 accuracy:RTXPRO6000/Llama-3.1-8B e1969d5a33ceb9dc87850a3cc41dc452
 summary:RTXPRO6000/Llama-3.1-8B 7c7620edf0ae4f8b8c8aead79ac46ac0

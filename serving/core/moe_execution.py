@@ -110,9 +110,9 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
         raise ValueError('MoE ranks disagree on their native component boundaries')
     for table in tables:
         contract = table.contract
-        if dtype_bytes(contract['input_dtype']) != ctx.fp:
+        if dtype_bytes(contract['input_dtype']) != ctx.act_fp:
             raise ValueError('Native MoE activation dtype differs from runtime')
-        this_payloads = (h*ctx.fp, k*dtype_bytes(contract['topk_weights_dtype']),
+        this_payloads = (h*ctx.act_fp, k*dtype_bytes(contract['topk_weights_dtype']),
                          k*dtype_bytes(contract['topk_ids_dtype']))
         if payloads is not None and this_payloads != payloads:
             raise ValueError('MoE ranks disagree on dispatch tensor dtypes')
@@ -151,12 +151,12 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
     if dp > 1:
         remote_rows = gathered-min(chunks)
         dispatch_sizes = [(remote_rows*b+group_size-2)//(group_size-1) for b in payloads]
-        combine_size = ((remote_rows*h*ctx.fp+group_size-2)//(group_size-1))*group_size
+        combine_size = ((remote_rows*h*ctx.act_fp+group_size-2)//(group_size-1))*group_size
         dispatch = ' '.join(_collective('ALLGATHER',dispatch_dims,size) for size in dispatch_sizes)
         combine = _collective('REDUCESCATTER',dispatch_dims,combine_size)
     restore = 'NONE 0'
     if ctx.tp_size > 1:
-        restore = _collective('ALLGATHER' if sp else 'ALLREDUCE',ctx.tp_dim,local*h*ctx.fp)
+        restore = _collective('ALLGATHER' if sp else 'ALLREDUCE',ctx.tp_dim,local*h*ctx.act_fp)
 
     # DP1 has no dispatch/combine or finalize copy. The final expert marker
     # still carries its optional TP reduction and preserves PP boundaries.
@@ -174,7 +174,7 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
         for local_rank, (times, weights, widths) in enumerate(parts):
             lines.append((f'EXPERT {local_rank} NONE 0',))
             rows = gathered if phase == 1 else local
-            activation_bytes = rows*widths[phase]*ctx.fp
+            activation_bytes = rows*widths[phase]*ctx.act_fp
             lines.append((name,str(times[phase]),'LOCAL',str(activation_bytes),weight_loc,
                           str(weights[phase]),'LOCAL',str(activation_bytes),'NONE','0',batch_tag))
         lines.append((f'EXPERT END {end}',))
@@ -186,6 +186,6 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
         if dp > 1:
             power_acc.link_data_bytes += total_ring_data(combine_size,group_size,collective='reducescatter')
         if ctx.tp_size > 1:
-            power_acc.link_data_bytes += total_ring_data(local*h*ctx.fp,ctx.tp_size,
+            power_acc.link_data_bytes += total_ring_data(local*h*ctx.act_fp,ctx.tp_size,
                 collective='allgather' if sp else 'allreduce')
     return True

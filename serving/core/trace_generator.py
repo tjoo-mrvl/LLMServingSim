@@ -9,7 +9,7 @@ from .utils import (
 )
 import pandas as pd
 import yaml
-from .memory_model import calculate_sizes, kv_element_bytes
+from .memory_model import activation_element_bytes, calculate_sizes, kv_element_bytes
 from .communication import dtype_bytes, vocab_shard_size
 from .gate_function import GateRouter
 from .config_builder import get_device
@@ -107,6 +107,7 @@ class TraceCtx:
     head_dim: int
     is_moe: bool
     kv_fp: int    # bytes per KV element (1 for fp8, else fp) -- P/D transfer sizing
+    act_fp: int   # bytes per element of tensors between layers (the floating dtype)
     pd_type: str  # 'prefill', 'decode', or None
     tp_size: int       # tensor parallel degree (for ALLREDUCE on attention/FFN)
     pp_size: int       # pipeline parallel degree
@@ -1236,6 +1237,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         power_model=power_model, pim_model=pim_model, pim_channels=pim_channels,
         n_head=n_head, kv_head=kv_head, head_dim=head_dim, is_moe=is_moe,
         kv_fp=kv_element_bytes(config, fp, kv_cache_dtype),
+        act_fp=activation_element_bytes(config, fp),
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         dp_rank=dp_rank,
@@ -1428,7 +1430,7 @@ def _shared_tp_collective(ctx, bctx, name):
     if ctx.tp_size <= 1:
         return 'NONE', 0
     arch = ctx.perf_db['architecture']
-    activation_fp = dtype_bytes(ctx.config.get('torch_dtype', ctx.config.get('dtype')), ctx.fp)
+    activation_fp = ctx.act_fp
     shared = arch.get('shared') or {}
     catalog = arch['catalog']
     if name == 'embedding' and name in shared.get('prologue', []):
@@ -1464,18 +1466,18 @@ def _tp_comm(ctx, layer_name, total_len, collective='ALLREDUCE'):
     """Compute TP communication size. Returns (comm_size, comm_type)."""
     if ctx.tp_size <= 1:
         return 0, 'NONE'
-    # What crosses the link is the layer's output activation, so its width is
-    # the activation dtype whatever the weights are stored in: on an FP8
-    # checkpoint (DeepSeek-R1) o_proj and down_proj still reduce bf16.
-    element_bytes = dtype_bytes(ctx.config.get('torch_dtype', ctx.config.get('dtype')), ctx.fp)
+    # What crosses the link is the layer's output activation, which
+    # ``calculate_sizes`` sizes at the activation dtype whatever the weights
+    # are stored in: on an FP8 checkpoint (DeepSeek-R1) o_proj and down_proj
+    # still reduce bf16.
     entry = ctx.perf_db["architecture"]["catalog"].get("dense", {}).get(layer_name, {})
     if entry.get("tp_output_reduction") == "all_reduce":
         # RowParallelLinear reduces the full hidden-state output, not its
         # sharded input.
         _, _, out = calculate_sizes(ctx.model, layer_name, total_len,
-                                    parallel=ctx.tp_size, fp=element_bytes)
+                                    parallel=ctx.tp_size, fp=ctx.fp)
         return out, 'ALLREDUCE'
-    _, _, out = calculate_sizes(ctx.model, layer_name, total_len, parallel=ctx.tp_size, fp=element_bytes)
+    _, _, out = calculate_sizes(ctx.model, layer_name, total_len, parallel=ctx.tp_size, fp=ctx.fp)
     return out, collective
 
 
@@ -1553,8 +1555,8 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # RS ``data_size`` is the pre-scatter total buffer.
     n_embd = ctx.config['hidden_size']
     num_experts = utils_num_experts(ctx.config)
-    dispatch_per_token = (n_embd + num_experts) * ctx.fp
-    combine_per_token = n_embd * ctx.fp
+    dispatch_per_token = (n_embd + num_experts) * ctx.act_fp
+    combine_per_token = n_embd * ctx.act_fp
     # Both EP collectives are **ragged**, and that decides what they cost.
     # ``AgRsAll2AllManager`` passes per-rank ``sizes`` straight through, and
     # ``pynccl.all_gatherv`` is one ``ncclBroadcast`` per rank at that rank's
@@ -2328,8 +2330,8 @@ def _emit_pp_pd_power(ctx, bctx):
         pp_comm = bctx.total_len * ctx.config['hidden_size'] * (ctx.pp_size - 1)
         ctx.power_model.add_link_energy_consumption(ctx.node_id, pp_comm)
     if ctx.pd_type == 'prefill':
-        kv_comm = bctx.total_len * ctx.config['hidden_size'] * ctx.fp
-        out_size = bctx.lm_head_len * ctx.config['hidden_size'] * ctx.fp
+        kv_comm = bctx.total_len * ctx.config['hidden_size'] * ctx.act_fp
+        out_size = bctx.lm_head_len * ctx.config['hidden_size'] * ctx.act_fp
         ctx.power_model.add_link_energy_consumption(ctx.node_id, kv_comm + out_size)
 
 
