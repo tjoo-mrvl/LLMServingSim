@@ -82,7 +82,8 @@ profiler/                          Python package: python -m profiler
 ├── perf/                          hardware/model/variant profile bundles
 ├── v0/                            archived profiler, not current simulator inputs
 ├── profile.sh                     editable single-model template
-└── profile-all.sh                 explicit multi-model campaign template
+├── profile-all.sh                 explicit multi-model campaign template
+└── profile-deepseek-h200.sh       staged DeepSeek-R1 driver (TP1/TP8, EP8 MoE)
 ```
 
 The simulator also imports the shared stack, catalog, attention, skew and MoE
@@ -625,6 +626,25 @@ arbitrary per-job CLI options go in the entry's extra flags.
 To change the model list or deployment degrees, edit the `JOBS=( ... )` array at the top
 of the script. This file is meant to be copied or tweaked in-place,
 not treated as a stable CLI.
+
+### DeepSeek-R1 on H200: `profiler/profile-deepseek-h200.sh`
+
+A staged driver for DeepSeek-R1 at TP1 and TP8. Run the stages in order, or
+`STAGE=full` for all three:
+
+```bash
+STAGE=coverage ./profiler/profile-deepseek-h200.sh   # catalog check, no CSVs
+SMOKE=1 ./profiler/profile-deepseek-h200.sh          # tiny grid plus EP8 rank 0's MoE, scratch root
+STAGE=fast ./profiler/profile-deepseek-h200.sh       # every category at TP1 and TP8, MoE at TP1/EP1
+STAGE=moe ./profiler/profile-deepseek-h200.sh        # TP8/EP8 MoE components, one process per GPU
+STAGE=skew ./profiler/profile-deepseek-h200.sh       # the skew sweep
+```
+
+`STAGE=moe` runs `slice --group moe --moe-ranks r` for EP ranks 0-7, rank r on
+the r-th visible GPU, with per-rank logs in `MOE_LOG_DIR`
+(default `outputs/profile-deepseek-h200/`). `MOE_PARALLEL=0` measures every
+rank in one process instead. `SMOKE=1` writes `outputs/profile-deepseek-h200/smoke/`
+unless `OUT_ROOT` is set, so its tiny grid never mixes with the real bundle.
 
 ## Measurement behavior
 

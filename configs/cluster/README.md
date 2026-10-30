@@ -346,6 +346,7 @@ TP because only `tp1` is profiled for those three — see
 
 The DeepSeek-R1 configs read `hardware: H200`, so they run once an H200 profile
 of the checkpoint exists (`profiler/profile-deepseek-h200.sh`, vLLM 0.31). The
+TP8/EP8 deployments also need that script's `STAGE=moe` tables. The
 vLLM 0.20.2 profile they were first validated with is kept, with the simulator
 that read it, on branch `legacy/vllm-0.20.2`. Their links are hand-set, not
 measured: `link_bw` 450 on the NVLink dimension (the per-direction ring bus

@@ -58,6 +58,16 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   the Model Runner V2 that vLLM 0.31 serves R1 with. R1's KV pool at TP8/EP8
   grows from 47.4 to 49.7 GiB per GPU. No regression scenario uses these
   configs.
+- `profiler/profile-deepseek-h200.sh` acquires the TP8/EP8 MoE tables.
+  `STAGE=moe` runs `slice --group moe --moe-ranks r` for EP ranks 0-7, one
+  process per GPU (`MOE_PARALLEL=0` measures every rank in one process), and
+  fails if any rank fails; `STAGE=full` now runs fast, moe and skew in turn.
+  `SMOKE=1` also measures EP8 rank 0's MoE components and writes a scratch
+  output root, so its tiny grid no longer blocks the real run from resuming.
+  `STAGE=skew` no longer passes `--ep 1`, which the CLI refuses with
+  `--only-skew`. The attention chunk factor returns to the profiler default
+  2.0, and the script's comments no longer describe nearest-neighbour lookup
+  or MoE priced from an EP1 table.
 
 ### Fixed
 

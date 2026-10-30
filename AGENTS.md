@@ -66,7 +66,8 @@ LLMServingSim/
 │   ├── perf/                   # Output: perf/<hw>/<model>/<variant>/tp<N>/{dense,per_sequence,attention,linear_attention,moe,skew,skew_fit}.csv
 │   ├── v0/                     # Legacy (pre-rewrite) profiler, kept for reference
 │   ├── profile.sh              # Editable user template (MODEL / HARDWARE / TP_DEGREES / …)
-│   └── profile-all.sh          # Helper: sweeps several MODELs × TP degrees
+│   ├── profile-all.sh          # Helper: sweeps several MODELs × TP degrees
+│   └── profile-deepseek-h200.sh # Staged DeepSeek-R1 driver; STAGE=moe runs one EP rank per GPU
 ├── bench/                      # vLLM end-to-end benchmark + sim validation (`python -m bench`)
 │   ├── __main__.py             # CLI dispatch (run / validate)
 │   ├── core/                   # internals
