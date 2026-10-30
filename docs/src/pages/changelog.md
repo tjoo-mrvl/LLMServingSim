@@ -28,6 +28,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   with either preparation label. Per-tensor and static FP8, and FP8 at DP > 1,
   are refused. See
   [Native MoE components → FP8 experts](https://llmservingsim.ai/docs/profiler/native-moe-components#fp8-experts-on-the-modular-path).
+- `--moe-ranks` for `slice --group moe`: measure only the listed EP ranks, so
+  one process per GPU can acquire a native MoE target in parallel on one output
+  root. Each rank keeps its own table and lock. A rank outside every selected
+  target fails before engine startup. Once every rank of a deployment is
+  published, a CPU-only rank cross-check logs each rank's time ratio to the
+  other ranks at the same points; it reports and changes no data. The default
+  remains one process measuring every rank in turn. See
+  [Native MoE components → Acquire](https://llmservingsim.ai/docs/profiler/native-moe-components#acquire-a-deployment-matched-table).
 - Native MoE component acquisition for the shared expert of an EP > 1 target.
   A model with a shared expert, such as DeepSeek-V3/R1, gets a `shared_experts`
   component, timed on the rank's local rows. The runner's own module is copied

@@ -523,7 +523,20 @@ def _build_profile_args(
         if not values or min(values) < 1:
             raise ValueError(f"--{name} degrees must be positive integers")
         degrees[name] = values
-    if any(value is not None for value in degrees.values()):
+    moe_ranks = getattr(ns, "moe_ranks", None)
+    if moe_ranks is not None:
+        try:
+            moe_ranks = tuple(sorted({int(value.strip()) for value in moe_ranks.split(",")}))
+        except ValueError:
+            raise ValueError("--moe-ranks requires comma-separated non-negative integers") from None
+        if not moe_ranks or min(moe_ranks) < 0:
+            raise ValueError("--moe-ranks requires comma-separated non-negative integers")
+        # Only the slice parser registers the flag: profile also writes ordinary
+        # categories, which need one writer per variant root. Within slice,
+        # only the MoE group has ranks to split across processes.
+        if not (ns.cmd == "slice" and ns.group == "moe"):
+            raise ValueError("--moe-ranks is only supported for slice --group moe")
+    if any(value is not None for value in degrees.values()) or moe_ranks is not None:
         if ns.cmd != "profile" and not (ns.cmd == "slice" and ns.group == "moe"):
             raise ValueError("--dp and --ep are only supported for profile or slice --group moe")
         if getattr(ns, "only_skew", False) or getattr(ns, "profile_mtp", False):
@@ -549,6 +562,7 @@ def _build_profile_args(
         profile_mtp=bool(getattr(ns, "profile_mtp", False)),
         dp_degrees=degrees["dp"],
         ep_degrees=degrees["ep"],
+        moe_ranks=moe_ranks,
         moe_rounds=ns.moe_rounds,
         moe_grid_factor=ns.moe_grid_factor,
         grid_factor=ns.grid_factor,
@@ -682,6 +696,14 @@ def build_parser() -> argparse.ArgumentParser:
                  "moe", "mtp"],
         required=True,
         help="Which profile category to refresh; mtp requires --profile-mtp.",
+    )
+    p_slice.add_argument(
+        "--moe-ranks", default=None, dest="moe_ranks",
+        help="EP ranks to measure within the selected native MoE targets, comma "
+             "separated (0-based); --group moe only. Defaults to every rank in turn. "
+             "Run one process per GPU with disjoint ranks to acquire a target in "
+             "parallel; each rank writes its own table. A rank outside every "
+             "selected target fails before engine startup.",
     )
     _add_common_flags(p_slice)
 

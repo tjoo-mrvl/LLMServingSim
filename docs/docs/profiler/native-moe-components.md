@@ -66,6 +66,38 @@ fail before engine startup. EP selection does not infer additional TP/DP values
 or enable tensor-sharded experts. Both shell templates forward `TP_DEGREES`,
 `DP_DEGREES` and `EP_DEGREES` as `--tp`, `--dp` and `--ep`.
 
+By default one process measures every rank of each target in turn, on one GPU.
+`--moe-ranks` (comma-separated, 0-based) restricts a MoE slice to those ranks.
+This lets one process per GPU acquire a target in parallel:
+
+```bash
+for rank in 0 1; do
+  CUDA_VISIBLE_DEVICES=$rank python -m profiler slice Qwen/Qwen3-30B-A3B-Instruct-2507 \
+    --hardware RTXPRO6000 --tp 1,2 --tp-refresh 2 --group moe --dp 1 --ep 2 \
+    --moe-ranks $rank > moe-rank$rank.log 2>&1 &
+done
+wait
+```
+
+Each rank keeps its own table folder and writer lock, and every process
+replaces only its own entry in the locked `meta.yaml`. Processes with disjoint
+ranks can therefore share one output root. Give each process its own GPU.
+Processes sharing a GPU disturb each other's timings, and the expert
+conditioning gate then refuses to publish their tables. Overlapping ranks
+collide on the lock, and the second writer fails. A rank outside every selected
+target fails before engine startup. `profile` does not accept the option, because its
+ordinary categories need one writer per variant root.
+
+When every rank of a deployment is published, the process that finishes it logs
+a rank cross-check. For each rank, it reports the median, 5th-percentile,
+95th-percentile and worst ratio of its time to the median of the other ranks'
+times at the same points. Every rank of a full-EP target does the same work at
+a point, so a rank whose ratios drift was measured under different conditions,
+such as a busy or slower GPU. The check only reports: it changes no data, and
+re-measuring a rank is a separate decision. In parallel acquisition, the last
+process to finish reports. Earlier processes log which ranks they are still
+waiting for.
+
 The profiler uses **one physical GPU**, not TP times DP processes. It retains
 the checkpoint's global expert count and top-k, resolves each target rank's
 expert map through vLLM, and builds local expert weights in the native layout.

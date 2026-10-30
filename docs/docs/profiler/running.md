@@ -195,6 +195,10 @@ omission keeps all, and unmatched degrees fail before engine startup. It does no
 infer TP/DP values or enable tensor-sharded experts. A MoE slice matches only
 `--tp-refresh`; other categories retain their ordinary TP sweep.
 Each rank is emulated on one physical GPU, with communication modeled separately.
+`slice --group moe` also accepts `--moe-ranks` to measure only some EP ranks, so
+one process per GPU can acquire a target in parallel and a rank cross-check is
+logged once every rank is published; see
+[native components](./native-moe-components#acquire-a-deployment-matched-table).
 In either shell template, `DP_DEGREES="1,2"` selects local and DP+EP targets,
 `EP_DEGREES` forwards `--ep`, and `MOE_ROUNDS` controls repeated contexts.
 For a mixed dense/MoE `profile-all.sh` job list, put explicit `--dp`/`--ep`
@@ -575,7 +579,9 @@ and existing attention references without starting vLLM. Engine-limit flags
 do not replace those saved limits in a plan preview.
 
 `slice` additionally requires `--tp-refresh N` and `--group G`; include `N`
-in `--tp`. `--dp` and `--ep` are supported only for `profile` or `slice --group moe`.
+in `--tp`. With `--group moe` it also accepts `--moe-ranks` (comma-separated EP
+ranks; default every rank of each target, in turn). `--dp` and `--ep` are
+supported only for `profile` or `slice --group moe`.
 `--profile-mtp` with `slice` requires `--group mtp`. `--only-skew` selects
 the skew-only path of `profile`; it is not a slice category.
 

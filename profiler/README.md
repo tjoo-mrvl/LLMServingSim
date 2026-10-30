@@ -140,7 +140,7 @@ not run profiling, replace CSVs or certify eager timings as graph timings.
 | **resume** | `--force` (default is resume) |
 | **paths** | `--out-root`, `--model-config-root` (`OUT_ROOT`, `MODEL_CONFIG_ROOT`) |
 | **verbosity** | `--log-level` (`LOG_LEVEL`), `--silent`, `--verbose` (`VERBOSITY`; choose one logging setting) |
-| **slice only** | `--tp-refresh`, `--group {dense,per_sequence,attention,linear_attention,moe,mtp}`. `--tp-refresh N` needs `N` to be in `--tp` too |
+| **slice only** | `--tp-refresh`, `--group {dense,per_sequence,attention,linear_attention,moe,mtp}`, `--moe-ranks` (with `--group moe`: measure only those EP ranks, for one process per GPU). `--tp-refresh N` needs `N` to be in `--tp` too |
 
 Variant names retain checkpoint quantization: an FP8/BF16 checkpoint stays
 `fp8` with `--dtype bfloat16`, while `--dtype float16` uses `fp8-actfp16`.
@@ -153,7 +153,8 @@ Changed acquisition identities require fresh measurements, not renamed rows.
 The table covers `profile`, `slice`, `coverage` and `plan-skew`; not every
 accepted option affects every command. `plan-skew` reads saved engine limits
 and does not boot an engine. `--dp` and `--ep` are valid only for `profile` or
-`slice --group moe`; `--profile-mtp` with `slice` requires `--group mtp`.
+`slice --group moe`, and `--moe-ranks` only for `slice --group moe`;
+`--profile-mtp` with `slice` requires `--group mtp`.
 
 `refit-skew` instead accepts `--hardware`, `--variant`, `--tp`, `--out` and
 `--log-level`; omitting `--tp` refits every measured degree. `hardware` accepts

@@ -876,6 +876,9 @@ class ProfileArgs:
             and coverage are unaffected. EP is TP times DP.
         ep_degrees: Optional EP filter over those TP/DP targets. None keeps
             every target; an explicit degree must match a selected TP times DP.
+        moe_ranks: Optional EP ranks to measure within those targets (MoE
+            slice only). None measures every rank in turn; disjoint sets let
+            one process per GPU acquire a target in parallel.
         profile_mtp: When set, boot with ``speculative_config`` so the drafter
             is built and its kernels land in the profile tree. The drafter
             runs inside ``sample_tokens()`` (``propose_draft_token_ids`` ->
@@ -942,6 +945,13 @@ class ProfileArgs:
     """Optional full-EP target filter. None selects all TP times DP targets.
 
     This does not change expert tensor sharding or infer additional TP/DP degrees.
+    """
+    moe_ranks: tuple[int, ...] | None = None
+    """Optional EP ranks to measure. None measures every rank of each target.
+
+    Each rank keeps its own table and lock, so processes with disjoint ranks can
+    write one variant root concurrently. A rank outside every selected target
+    is an error before any engine starts.
     """
     moe_rounds: int = 3
     moe_grid_factor: float = 2.0

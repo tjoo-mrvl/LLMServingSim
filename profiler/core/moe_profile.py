@@ -425,8 +425,82 @@ def resolve_targets(arch, args, tps):
     experts, _ = probe_moe_params(text_config(args.model_config))
     if any(tp*dp > experts for tp, dp in pairs):
         raise ValueError("Requested EP degree exceeds the global expert count")
-    return [MoeTarget(tp, dp, tp*dp, rank, bool(entry.sequence_parallel and tp>1 and dp>1))
-            for tp, dp in pairs for rank in range(tp*dp)]
+    targets = [MoeTarget(tp, dp, tp*dp, rank, bool(entry.sequence_parallel and tp>1 and dp>1))
+               for tp, dp in pairs for rank in range(tp*dp)]
+    ranks = getattr(args, 'moe_ranks', None)
+    if ranks is not None:
+        if (not ranks or any(type(rank) is not int or rank < 0 for rank in ranks)):
+            raise ValueError("--moe-ranks requires non-negative integer ranks")
+        missing = set(ranks) - {target.rank for target in targets}
+        if missing:
+            raise ValueError(
+                f"Requested --moe-ranks {sorted(missing)} are not ranks of any selected "
+                f"target (EP {sorted({target.ep for target in targets})})")
+        targets = [target for target in targets if target.rank in ranks]
+    return targets
+
+
+def _percentile(ordered, fraction):
+    """Nearest-rank percentile of an already sorted list."""
+    return ordered[min(len(ordered)-1, max(0, math.ceil(fraction*len(ordered))-1))]
+
+
+def _describe_point(key):
+    point = dict(zip(KEYS, key))
+    text = f"{point['component']} ({point['mode']}) N={point['tokens']}"
+    if point['component'] == 'experts':
+        text += f" A={point['activated_experts']} M={point['local_assignments']}"
+    return text
+
+
+def rank_cross_check(variant_root, targets):
+    """Compare every rank of a fully acquired deployment, point by point.
+
+    A rank's ratio at a point is its time over the median of the other ranks'
+    times at the same coordinates. Every rank of a full-EP target runs the
+    same work there, so a rank whose ratios drift may have been measured under
+    different conditions (another process on its GPU, clocks, a faulty device).
+    This only reports: it changes no data, and re-measuring a rank is the
+    user's decision. Deployments whose ranks are not all published yet are
+    skipped; in parallel acquisition, the last process to finish reports them.
+    """
+    from . import logger as log
+
+    for tp, dp, ep, sp in sorted({(t.tp, t.dp, t.ep, t.sequence_parallel) for t in targets}):
+        if ep < 2:
+            continue
+        tp_dir = Path(variant_root)/f'tp{tp}'
+        block = read_tp(tp_dir, 'moe_components', None) or {}
+        entries = {entry['target']['rank']: entry for entry in block.get('entries', [])
+                   if (entry['target']['tp'], entry['target']['dp'], entry['target']['ep'],
+                       entry['target']['sequence_parallel']) == (tp, dp, ep, sp)}
+        waiting = [rank for rank in range(ep)
+                   if not (entries.get(rank) or {}).get('coverage', {}).get('complete')]
+        if waiting:
+            log.info("Native MoE TP=%d DP=%d EP=%d rank cross-check waits for ranks %s",
+                     tp, dp, ep, waiting)
+            continue
+        tables = {}
+        for rank, entry in entries.items():
+            with (tp_dir/entry['path']).open() as stream:
+                tables[rank] = {tuple(row[k] for k in KEYS): float(row['time_us'])
+                                for row in csv.DictReader(stream)}
+        common = set.intersection(*(set(table) for table in tables.values()))
+        if not common:
+            log.info("Native MoE TP=%d DP=%d EP=%d rank cross-check: the ranks share no "
+                     "measured points", tp, dp, ep)
+            continue
+        log.info("Native MoE TP=%d DP=%d EP=%d rank cross-check over %d common points "
+                 "(time / median of the other ranks):", tp, dp, ep, len(common))
+        for rank in range(ep):
+            ratios = sorted((tables[rank][key]/statistics.median(
+                tables[other][key] for other in range(ep) if other != rank), key)
+                for key in common)
+            worst, point = max(ratios, key=lambda item: abs(math.log(item[0])))
+            values = [ratio for ratio, _ in ratios]
+            log.info("  rank %d: median %.3f, p5 %.3f, p95 %.3f, worst %.3f at %s",
+                     rank, statistics.median(values), _percentile(values, .05),
+                     _percentile(values, .95), worst, _describe_point(point))
 
 
 def run_components(arch_path, args, tps, variant_root, *, kv_cache_memory_bytes=1024**3):
@@ -532,3 +606,4 @@ def run_components(arch_path, args, tps, variant_root, *, kv_cache_memory_bytes=
                 llm.collective_rpc('moe_component_release')
     finally:
         spin_down(llm, temporary)
+    rank_cross_check(variant_root, targets)

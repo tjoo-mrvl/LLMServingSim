@@ -2406,6 +2406,14 @@ EP degrees filter the supported TP/DP targets; they never change expert sharding
 or infer additional TP/DP degrees. Omitted EP keeps every target. Reject unmatched
 EP degrees before any engine starts; a slice matches only `--tp-refresh`.
 The filter affects only MoE components, not ordinary categories at the other TPs.
+`moe_ranks` (`--moe-ranks`, `slice --group moe` only, no shell variable) measures
+only those EP ranks of the selected targets; reject a rank outside every target
+before any engine starts. Disjoint ranks may run as concurrent processes on one
+variant root: each rank has its own folder lock and replaces only its own locked
+`meta.yaml` entry. `profile` refuses the option, because ordinary categories need
+one writer. Once every rank of a deployment is published, `rank_cross_check` logs
+each rank's time ratio to the other ranks' median per point. It only reports;
+never adjust or drop data from it.
 The removed whole-block path no longer shrinks global expert count/top-k.
 The target is full EP=TP*DP with
 DP>=1, independently of the one-GPU acquisition process. `MoeTarget` is shared
