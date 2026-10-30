@@ -2434,8 +2434,25 @@ rank's own experts (relative Frobenius error below 0.1) before any timing. The
 DP1 prepare runs inside `experts`, recorded as `local_execution.prepare`
 `identity` (experts quantize their own input) or `timed_input_quantization`.
 Weight banks clone the scales with the weights. EP1 keeps the live path;
-per-tensor or static FP8, other quantization methods, FP8 at DP>1 and shared
-experts at EP>1 are refused, and serving does not consume these contracts yet.
+per-tensor or static FP8, other quantization methods and FP8 at DP>1 are
+refused. Serving's loader admits only `identity` preparation, so it loads FP8
+tables whose experts quantize their own input and refuses the others.
+
+An EP>1 target's shared expert (`runner._shared_experts`) is measured as a
+`shared_experts` component on local rows, placed after the other components.
+`component_names` admits it only with the contract's `shared_experts` entry
+(schema `native-shared-expert-mlp`). `hooks/moe_shared_expert.py` admits the
+module by structure, never by model family: a merged gate/up of two equal
+halves, a weightless `act_fn` and a row-parallel down projection without its
+own reduction; no bias; TP-sharded; unquantized or block-FP8. It copies the
+module and rebuilds both linears at width/TP with the same vLLM classes, quant
+config and prefix, so vLLM picks a TP rank's kernel. It loads seeded
+checkpoint-layout weights through vLLM's own loaders and post-load processing,
+then checks one call against fp32. The timed call adds the runner's native
+`_maybe_apply_routed_scale_to_output` and the add of a zero routed output; the
+TP reduction stays simulated. Sequence-parallel MoE and gated shared experts are
+refused. Contracts of models without a shared expert are unchanged. Serving
+refuses `shared_experts` tables until the trace charges them.
 
 Missing
 DP1 native coverage falls back only when a historical whole-block table exists,

@@ -140,9 +140,12 @@ class ComponentMeasurement:
         # An EP rank's FP8 experts are rebuilt here from the target
         # configuration, because the engine's own kernel was selected for EP1.
         # Other quantized methods, and EP1 itself, keep the live engine's.
-        fp8_rank = MoeTarget(**target).ep > 1 and _fp8_method(runner) is not None
+        # Likewise an EP rank's shared expert is rebuilt at its TP width
+        # (moe_shared_expert); at EP1 the live path's wrapper measures it.
+        ep_rank = MoeTarget(**target).ep > 1
+        fp8_rank = ep_rank and _fp8_method(runner) is not None
         if ((model_runner.vllm_config.quant_config is not None and not fp8_rank)
-                or getattr(runner, '_shared_experts', None) is not None
+                or (getattr(runner, '_shared_experts', None) is not None and not ep_rank)
                 or getattr(runner, 'routed_output_transform', None) is not None
                 or getattr(runner, 'routed_input_transform', None) is not None
                 or runner.moe_config.skip_final_all_reduce):
@@ -174,11 +177,10 @@ class ComponentMeasurement:
                 raise NotImplementedError("FP8 experts at DP > 1 quantize before the dispatch "
                                           "all-gather, which this expert region does not time")
         cfg = runner.moe_config
-        if (getattr(runner, '_shared_experts', None) is not None
-                or _deferred_finalize_enabled(cfg) or cfg.skip_final_all_reduce
+        if (_deferred_finalize_enabled(cfg) or cfg.skip_final_all_reduce
                 or cfg.hidden_dim != cfg.hidden_dim_unpadded
                 or getattr(runner.routed_experts, 'apply_router_weight_on_input', False)):
-            raise NotImplementedError("Shared, deferred, padded-hidden or input-weighted MoE needs a separate component contract")
+            raise NotImplementedError("Deferred, padded-hidden or input-weighted MoE needs a separate component contract")
         self.gate = getattr(runner, 'gate', None)
         if self.gate is None:
             parents = [m for m in model_runner.get_model().modules()
@@ -198,14 +200,14 @@ class ComponentMeasurement:
                           dtype=self.cfg.in_dtype, generator=gen)*.01
         w2 = torch.randn((local_e, h, inter), device=self.device,
                          dtype=self.cfg.in_dtype, generator=gen)*.01
+        hf_quant = getattr(model_runner.vllm_config.model_config.hf_config, 'quantization_config', None)
+        ue8m0 = isinstance(hf_quant, dict) and hf_quant.get('scale_fmt') == 'ue8m0'
         if self.fp8 is None:
             self.expert = NativeExpertRegion(self.cfg, w13, w2)
             self.checkpoint_weights = (w13,w2)
             expert_weight_bytes = w13.numel()*w13.element_size()+w2.numel()*w2.element_size()
         else:
             # The same seeded values, stored as the checkpoint stores them.
-            hf_quant = getattr(model_runner.vllm_config.model_config.hf_config, 'quantization_config', None)
-            ue8m0 = isinstance(hf_quant, dict) and hf_quant.get('scale_fmt') == 'ue8m0'
             w13, w2, scales = _block_fp8_checkpoint(w13, w2, self.fp8.quant_config, ue8m0,
                                                     self.cfg.w13_num_shards)
             self.expert = NativeExpertRegion(self.cfg, w13, w2, scales)
@@ -264,6 +266,20 @@ class ComponentMeasurement:
             prepare = self._verify_local_boundary(hidden, weights, ids)
             self.contract['local_execution'] = dict(
                 prepare=prepare, finalize='output_alias_noop', expert_output_alias=True)
+        self.shared = None
+        if getattr(runner, '_shared_experts', None) is not None:
+            from .moe_shared_expert import SharedExpertCopy
+            # The shared expert becomes its own component, timed on the rank's
+            # local rows; component_names admits it by this contract entry.
+            # Models without one keep their contracts unchanged.
+            self.shared = SharedExpertCopy(model_runner.vllm_config, runner, self.target,
+                                           self.device, ue8m0)
+            self.shared.check_output(torch.randn((min(16, self.cfg.max_num_tokens), h),
+                                                 device=self.device, dtype=self.cfg.in_dtype,
+                                                 generator=gen))
+            self.contract['components'].append('shared_experts')
+            self.contract['excluded'].remove('shared_experts')
+            self.contract['shared_experts'] = self.shared.contract
 
     @torch.inference_mode()
     def _check_fp8_output(self, w13, w2, scales, gen):
@@ -363,7 +379,7 @@ class ComponentMeasurement:
         from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
 
         n = point['tokens']
-        if point['component'] not in self.target.components:
+        if point['component'] not in self.contract['components']:
             raise ValueError('Component is not part of the native target execution')
         if type(iterations) is not int or iterations < 1:
             raise ValueError("Measurement needs positive iterations")
@@ -377,6 +393,8 @@ class ComponentMeasurement:
         original_group = naive_dp_ep.get_ep_group
         if point['component'] == 'gate_routing':
             call = lambda: self._gate(hidden)
+        elif point['component'] == 'shared_experts':
+            call = self.shared.bind(hidden)
         elif point['component'] == 'finalize_copy':
             output = torch.empty_like(hidden)
             gathered_n = n * (self.target.ep if self.target.sequence_parallel else self.target.dp)

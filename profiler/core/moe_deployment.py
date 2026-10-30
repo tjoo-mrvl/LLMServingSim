@@ -16,6 +16,13 @@ def component_names(contract):
         expected = ('gate_routing', 'experts', 'wrapper')
     elif schema == 'native-modular-expert-region':
         expected = target.components
+        # A model's shared expert is measured as the last component when the
+        # contract carries its boundary (hooks/moe_shared_expert.py). Its
+        # absence keeps the routed-only components of every older contract.
+        if 'shared_experts' in contract:
+            if (contract['shared_experts'] or {}).get('schema') != 'native-shared-expert-mlp':
+                raise ValueError('Unknown shared-expert component boundary')
+            expected = expected + ('shared_experts',)
     else:
         raise ValueError('Unknown native expert component boundary')
     if contract.get('components') != list(expected):

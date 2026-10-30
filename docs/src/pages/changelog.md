@@ -24,10 +24,20 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   target — FlashInfer CUTLASS for block FP8 on Hopper — rather than the EP1
   engine's. Seeded weights are stored in the checkpoint's FP8 block layout, one
   kernel call is checked against an fp32 reference before any timing, and the
-  DP1 input quantization is timed inside `experts`. Serving does not consume
-  these tables yet; per-tensor and static FP8, FP8 at DP > 1 and shared experts
-  at EP > 1 are refused. See
+  DP1 input quantization is timed inside `experts`. Serving loads these tables
+  only when the experts quantize their own input (`identity` preparation);
+  per-tensor and static FP8 and FP8 at DP > 1 are refused. See
   [Native MoE components → FP8 experts](https://llmservingsim.ai/docs/profiler/native-moe-components#fp8-experts-on-the-modular-path).
+- Native MoE component acquisition for the shared expert of an EP > 1 target.
+  A model with a shared expert, such as DeepSeek-V3/R1, gets a `shared_experts`
+  component, timed on the rank's local rows. The runner's own module is copied
+  with both linears rebuilt at a TP rank's width, using the same vLLM classes
+  and quantization. One call is checked against an fp32 reference. The copy is
+  timed with the runner's routed scale and add. Admission goes by module
+  structure, not model family. Sequence-parallel MoE and gated shared experts
+  are refused, and models without a shared expert keep unchanged contracts.
+  Serving refuses these tables until it charges the component. See
+  [Native MoE components → Shared experts](https://llmservingsim.ai/docs/profiler/native-moe-components#shared-experts-on-the-modular-path).
 
 ### Fixed
 

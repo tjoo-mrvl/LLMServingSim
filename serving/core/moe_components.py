@@ -201,6 +201,12 @@ class MoeComponentTable:
         if any(parallel.get(k) != v for k,v in expected_parallel.items()):
             raise ValueError('MoE backend or parallel configuration differs from the supported execution path')
         self.components = component_names(contract)
+        if 'shared_experts' in self.components:
+            # Acquisition can measure an EP rank's shared expert as its own
+            # component (profiler/core/hooks/moe_shared_expert.py). The trace
+            # has no phase for it yet; refuse rather than drop its time.
+            raise ValueError('This native MoE table measures a shared expert, which the '
+                             'simulator does not charge yet')
         region = contract['expert_region']
         self.live = region['schema'] == 'native-live-expert-region'
         if self.live:

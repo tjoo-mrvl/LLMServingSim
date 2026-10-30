@@ -161,10 +161,64 @@ would time the EP1 kernel, so an EP > 1 target whose routed experts use vLLM's
 
 An EP1 target keeps the live path, whose engine already runs the target's
 kernel. Refused for now: per-tensor and static-activation FP8 schemes, other
-quantization methods, FP8 at DP > 1 (its prepare quantizes before the dispatch
-all-gather, which this region does not time) and shared experts at EP > 1.
-Serving does not consume these tables yet: its loader admits only the
-unquantized `identity` preparation.
+quantization methods and FP8 at DP > 1 (its prepare quantizes before the
+dispatch all-gather, which this region does not time). Serving's loader admits
+only the `identity` preparation, so it loads FP8 tables whose experts quantize
+their own input and refuses `timed_input_quantization` tables.
+
+## Shared experts on the modular path
+
+A model with a shared expert, such as DeepSeek-V3/R1, runs it beside the
+routed experts. `MoERunner.forward` then applies the routed scale when the
+model applies `routed_scaling_factor` there, adds the two outputs and reduces
+the sum over TP once. The shared expert is an ordinary tensor-parallel MLP. In
+a full-EP deployment at TP > 1, each GPU holds 1/TP of the shared expert's
+intermediate width but owns whole routed experts.
+
+An EP > 1 target measures it as one more component, `shared_experts`, placed
+after the others and timed on the rank's local rows:
+
+- **Copy.** The acquisition engine runs at TP1, so its shared expert has the
+  full width. The adapter copies the runner's module (`runner._shared_experts`)
+  and rebuilds both linears at width/TP with the same vLLM classes,
+  quantization config and prefix. vLLM then selects the quantization method and
+  GEMM kernel for a TP rank's shapes. The module's own `forward` and `act_fn`
+  run unchanged.
+- **Admission by structure.** The module must hold exactly these submodules:
+  - a `gate_up_proj` `MergedColumnParallelLinear` of two equal halves over the
+    hidden size;
+  - an `act_fn` without weights;
+  - a `down_proj` `RowParallelLinear` over one half that leaves the reduction
+    to the runner.
+
+  Neither linear may have a bias or be replicated across TP, and each must be
+  unquantized or block-FP8 with dynamic activations. A gated shared expert and
+  sequence-parallel MoE, which replicates the shared expert, are refused. Every
+  refusal names the mismatch, and the code names no model family.
+- **Weights and check.** Seeded values (`randn × 0.01`) are stored in the
+  checkpoint layout: gate and up as separate shards, and FP8 with block scales
+  where the checkpoint is quantized. They go through the layers' own vLLM
+  weight loaders and post-load processing. Before any timing, one call is
+  compared with fp32 arithmetic over the same dequantized weights. The relative
+  Frobenius error must stay below 0.1.
+- **Timed call.** It covers the copy's forward, the runner's native
+  `_maybe_apply_routed_scale_to_output`, and the add of the routed output. The
+  routed output itself belongs to the `experts` component, so a zero tensor
+  stands in for it. The TP reduction of the sum remains a simulated collective.
+- **Contract.** The `shared_experts` entry records:
+  - the module, activation and linear classes;
+  - each linear's quantization method and selected kernel;
+  - both widths and the checkpoint weight bytes;
+  - `routed_scaling_factor`.
+
+  `excluded` no longer lists `shared_experts`. A model without a shared expert
+  keeps its contract and components unchanged.
+
+Like `gate_routing`, this component is measured warm in isolation. Repeated
+calls can keep its weights in L2, which does not happen in a full forward. An
+EP1 target keeps the live path, whose `wrapper` component already contains the
+shared expert. Serving refuses tables with a `shared_experts` component until
+the simulator charges it.
 
 ## Shapes and measurement protocol
 

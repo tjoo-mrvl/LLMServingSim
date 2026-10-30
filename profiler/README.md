@@ -68,6 +68,7 @@ profiler/                          Python package: python -m profiler
 │       ├── cache_pages.py         shared physical KV page allocation
 │       ├── moe_live_components.py native local gate/expert/wrapper boundaries
 │       ├── moe_live_region.py     processed native expert state and bank cloning
+│       ├── moe_shared_expert.py   EP-rank shared expert rebuilt at TP width
 │       └── moe_hook.py            native MoE runner discovery
 ├── models/                        architecture catalogs and model-type aliases
 │   ├── llama.yaml
@@ -747,7 +748,10 @@ weights/backends and measures gate/routing, experts and surrounding wrapper work
 including shared experts and latent transforms. It sums unique CUDA activity
 durations, not an overlap-aware elapsed latency. Exact native-reference checks,
 storage-preserving bank clones and capability admission remain mandatory;
-unsupported paths cannot fall back to the removed acquisition method. See the
+unsupported paths cannot fall back to the removed acquisition method. An EP > 1
+target instead measures a shared expert as its own `shared_experts` component.
+It copies the runner's module and rebuilds the linears at a TP rank's width.
+Admission goes by module structure, not model family. See the
 [native component contract](../docs/docs/profiler/native-moe-components.md).
 
 The isolated MoE engine uses the MLP prefix and a privately configurable KV-memory
