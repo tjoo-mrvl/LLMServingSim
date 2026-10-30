@@ -15,6 +15,16 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   declares Model Runner V2 for a MoE pipeline. The shared expert's TP split and
   an MLA cache's single host copy at TP > 1 still need a TP > 1 MLA bundle. See
   [Validating changes](https://llmservingsim.ai/docs/contributor/validating-changes).
+- Native MoE component acquisition for FP8 experts of an EP > 1 target at DP1.
+  vLLM's `Fp8MoEMethod` checkpoints (block scales, dynamic activations) now take
+  the modular path, so each rank is timed with the kernel vLLM selects for the
+  target — FlashInfer CUTLASS for block FP8 on Hopper — rather than the EP1
+  engine's. Seeded weights are stored in the checkpoint's FP8 block layout, one
+  kernel call is checked against an fp32 reference before any timing, and the
+  DP1 input quantization is timed inside `experts`. Serving does not consume
+  these tables yet; per-tensor and static FP8, FP8 at DP > 1 and shared experts
+  at EP > 1 are refused. See
+  [Native MoE components → FP8 experts](https://llmservingsim.ai/docs/profiler/native-moe-components#fp8-experts-on-the-modular-path).
 
 ### Fixed
 

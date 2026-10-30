@@ -2421,7 +2421,23 @@ experts write directly to the caller's output alias. Observe no CUDA work in
 prepare/finalize before recording `local_execution` and omit `finalize_copy`
 entirely. Preserve the alias in every conditioned eager variant. DP1
 traces contain gate/routing, experts and optional TP AllReduce, no DP collectives.
-Full EP at TP>1 owns whole experts and is not plain tensor-sharded TP. Missing
+Full EP at TP>1 owns whole experts and is not plain tensor-sharded TP.
+
+An EP>1 target whose routed experts use vLLM's `Fp8MoEMethod` (block scales,
+dynamic activations, DP1) takes the modular path as well, because the EP1
+engine's own kernel was selected for EP1 (Hopper block FP8: Triton at EP1,
+FlashInfer CUTLASS above). The seeded values are stored in the checkpoint's FP8
+block layout by vLLM's `per_block_cast_to_fp8` (power-of-two scales for
+`scale_fmt: ue8m0`); vLLM's FP8 oracle selects, converts and configures the
+kernel for the target; one call is checked against an fp32 computation of the
+rank's own experts (relative Frobenius error below 0.1) before any timing. The
+DP1 prepare runs inside `experts`, recorded as `local_execution.prepare`
+`identity` (experts quantize their own input) or `timed_input_quantization`.
+Weight banks clone the scales with the weights. EP1 keeps the live path;
+per-tensor or static FP8, other quantization methods, FP8 at DP>1 and shared
+experts at EP>1 are refused, and serving does not consume these contracts yet.
+
+Missing
 DP1 native coverage falls back only when a historical whole-block table exists,
 without consuming a mismatched EP component table. Match the legacy lookup's TP
 choice (TP1 when present, otherwise its first available degree); a fresh bundle

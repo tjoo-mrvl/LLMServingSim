@@ -174,7 +174,12 @@ rather than `--force`. Expert forward counts can exceed
 `MOE_GRID_FACTOR` control repetitions and grid spacing. Dense models, coverage,
 ordinary category slices and skew-only acquisition do not acquire components.
 Modular DP1 measures gate/routing and experts, verifying identity preparation and
-aliased no-op finalization instead of adding a copy. The separately admitted
+aliased no-op finalization instead of adding a copy. FP8 experts of an EP > 1
+target also take the modular path: seeded weights in the checkpoint's FP8 block
+layout, the backend vLLM selects for that target, a one-time fp32 output check
+and the DP1 input quantization timed inside `experts`
+([details](../docs/docs/profiler/native-moe-components.md#fp8-experts-on-the-modular-path)).
+The separately admitted
 [live local path](../docs/docs/profiler/native-moe-components.md#live-local-boundaries)
 retains native expert prepare/finalize and adds measured wrapper work.
 TP>1 means full EP, not tensor-sharded

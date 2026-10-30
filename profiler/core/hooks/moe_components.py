@@ -1,7 +1,10 @@
 """Worker-local native component acquisition, with explicit token domains."""
+import logging
+import math
+
 import torch
 
-from .moe_expert_region import NativeExpertRegion
+from .moe_expert_region import Fp8Scales, NativeExpertRegion
 from .moe_hook import single_moe_runner
 from .skew_measurement import MARKER
 from .eager_measurement import extract_eager_forwards
@@ -30,6 +33,98 @@ def _deferred_finalize_enabled(config):
     return enabled
 
 
+def _fp8_method(runner):
+    """vLLM's FP8 MoE method on the routed experts, or None.
+
+    Only ``Fp8MoEMethod`` has a modular builder here (``NativeExpertRegion``);
+    any other quantized method keeps the live path.
+    """
+    from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+    method = getattr(runner.routed_experts, 'quant_method', None)
+    return method if isinstance(method, Fp8MoEMethod) else None
+
+
+def _block_fp8_checkpoint(w13, w2, quant_config, ue8m0, shards):
+    """Seeded weights in the FP8 checkpoint layout, one rank's experts.
+
+    Every weight block gets the dequantization scale ``amax / 448`` that a
+    serialized checkpoint carries -- written by vLLM's own
+    ``per_block_cast_to_fp8``, rounded to a power of two when the checkpoint
+    declares ``scale_fmt: ue8m0``. ``w13`` stacks ``shards`` projections (gate
+    and up) and each has its own block grid, as in the scale tensor
+    ``Fp8MoEMethod.create_weights`` allocates; that matters whenever the
+    intermediate size is not a multiple of the block. Experts are cast one at
+    a time to bound the temporary memory.
+    """
+    from vllm.utils.deep_gemm import per_block_cast_to_fp8
+
+    block = list(quant_config.weight_block_size)
+
+    def cast(matrix, parts):
+        cast_parts = [per_block_cast_to_fp8(part, block, use_ue8m0=ue8m0)
+                      for part in matrix.chunk(parts, dim=0)]
+        return torch.cat([v for v, _ in cast_parts]), torch.cat([s for _, s in cast_parts])
+
+    def cast_all(weights, parts):
+        values, scales = zip(*(cast(w, parts) for w in weights))
+        return torch.stack(values), torch.stack(scales)
+
+    q13, s13 = cast_all(w13, shards)
+    q2, s2 = cast_all(w2, 1)
+    return q13, q2, Fp8Scales(s13, s2, tuple(block),
+                              bool(quant_config.is_checkpoint_fp8_serialized))
+
+
+# Relative Frobenius error allowed between one FP8 expert call and the fp32
+# reference over the same dequantized weights. What the two cannot share is the
+# FP8 rounding of the kernel's two activation quantizations (input and
+# intermediate), expected to be a few percent; a wrong layout, scale or expert
+# map is O(1).
+FP8_OUTPUT_TOLERANCE = 0.1
+
+
+def _dequantize(values, scales, block, parts=1):
+    """fp32 weights from FP8 values and per-block ``weight_scale_inv``.
+
+    ``parts`` stacked projections each carry their own block grid (see
+    ``_block_fp8_checkpoint``).
+    """
+    if parts > 1:
+        return torch.cat([_dequantize(v, s, block) for v, s in
+                          zip(values.chunk(parts, dim=0), scales.chunk(parts, dim=0))])
+    rows, cols = values.shape[-2:]
+    scale = scales.repeat_interleave(block[0], dim=-2)[..., :rows, :]
+    return values.float() * scale.repeat_interleave(block[1], dim=-1)[..., :cols]
+
+
+def _fp8_reference(hidden, ids, weights, w13, w2, scales, place, cfg):
+    """fp32 output of this rank's own experts for a routed batch.
+
+    Remote experts contribute nothing, as on the rank; each local expert is
+    dequantized only when a token selects it.
+    """
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    gated = {MoEActivation.SILU: F.silu, MoEActivation.GELU: F.gelu,
+             MoEActivation.GELU_TANH: lambda x: F.gelu(x, approximate='tanh')}
+    if cfg.activation not in gated or cfg.w13_num_shards != 2:
+        raise NotImplementedError(f'The FP8 output check covers gated SiLU/GELU experts, not {cfg.activation}')
+    act, inter, block = gated[cfg.activation], cfg.intermediate_size_per_partition, scales.weight_block_size
+    local = torch.tensor(place.expert_map, device=hidden.device)[ids.long()]
+    reference = torch.zeros(hidden.shape, device=hidden.device, dtype=torch.float32)
+    for expert in range(w13.shape[0]):
+        rows, slots = (local == expert).nonzero(as_tuple=True)
+        if rows.numel() == 0:
+            continue
+        gate_up = hidden[rows].float() @ _dequantize(w13[expert], scales.w13[expert], block,
+                                                     cfg.w13_num_shards).T
+        output = (act(gate_up[:, :inter]) * gate_up[:, inter:]) @ _dequantize(
+            w2[expert], scales.w2[expert], block).T
+        reference.index_add_(0, rows, output * weights[rows, slots].unsqueeze(1))
+    return reference
+
+
 class ProfileCall(torch.nn.Module):
     def __init__(self, call):
         super().__init__()
@@ -42,7 +137,11 @@ class ProfileCall(torch.nn.Module):
 class ComponentMeasurement:
     def __new__(cls, model_runner, target, local_budget):
         runner = single_moe_runner(model_runner)
-        if (model_runner.vllm_config.quant_config is not None
+        # An EP rank's FP8 experts are rebuilt here from the target
+        # configuration, because the engine's own kernel was selected for EP1.
+        # Other quantized methods, and EP1 itself, keep the live engine's.
+        fp8_rank = MoeTarget(**target).ep > 1 and _fp8_method(runner) is not None
+        if ((model_runner.vllm_config.quant_config is not None and not fp8_rank)
                 or getattr(runner, '_shared_experts', None) is not None
                 or getattr(runner, 'routed_output_transform', None) is not None
                 or getattr(runner, 'routed_input_transform', None) is not None
@@ -62,8 +161,18 @@ class ComponentMeasurement:
         self.target = MoeTarget(**target)
         self.runner = single_moe_runner(model_runner)
         runner = self.runner
+        self.fp8 = None
         if model_runner.vllm_config.quant_config is not None:
-            raise NotImplementedError("Quantized MoE requires a quantization-aware component adapter")
+            self.fp8 = _fp8_method(runner)
+            if self.fp8 is None:
+                raise NotImplementedError("Quantized MoE requires a quantization-aware component adapter")
+            quant = self.fp8.quant_config
+            if quant.weight_block_size is None or quant.activation_scheme != 'dynamic':
+                raise NotImplementedError("FP8 experts need block scales and dynamic activations; "
+                                          "per-tensor and static schemes are not admitted")
+            if self.target.dp > 1:
+                raise NotImplementedError("FP8 experts at DP > 1 quantize before the dispatch "
+                                          "all-gather, which this expert region does not time")
         cfg = runner.moe_config
         if (getattr(runner, '_shared_experts', None) is not None
                 or _deferred_finalize_enabled(cfg) or cfg.skip_final_all_reduce
@@ -89,8 +198,20 @@ class ComponentMeasurement:
                           dtype=self.cfg.in_dtype, generator=gen)*.01
         w2 = torch.randn((local_e, h, inter), device=self.device,
                          dtype=self.cfg.in_dtype, generator=gen)*.01
-        self.expert = NativeExpertRegion(self.cfg, w13, w2)
-        self.checkpoint_weights = (w13,w2)
+        if self.fp8 is None:
+            self.expert = NativeExpertRegion(self.cfg, w13, w2)
+            self.checkpoint_weights = (w13,w2)
+            expert_weight_bytes = w13.numel()*w13.element_size()+w2.numel()*w2.element_size()
+        else:
+            # The same seeded values, stored as the checkpoint stores them.
+            hf_quant = getattr(model_runner.vllm_config.model_config.hf_config, 'quantization_config', None)
+            ue8m0 = isinstance(hf_quant, dict) and hf_quant.get('scale_fmt') == 'ue8m0'
+            w13, w2, scales = _block_fp8_checkpoint(w13, w2, self.fp8.quant_config, ue8m0,
+                                                    self.cfg.w13_num_shards)
+            self.expert = NativeExpertRegion(self.cfg, w13, w2, scales)
+            # Weight banks are rebuilt from these, scales included.
+            self.checkpoint_weights = (w13,w2,scales)
+            expert_weight_bytes = w13.numel()*w13.element_size()+w2.numel()*w2.element_size()+scales.nbytes()
         self.expert_banks = [self.expert]
         self.reduction = self.expert.experts.finalize_weight_and_reduce_impl()
         if not isinstance(self.reduction, TopKWeightAndReduceNoOP):
@@ -113,7 +234,7 @@ class ComponentMeasurement:
             topk_ids_dtype=str(ids.dtype), topk_weights_dtype=str(weights.dtype),
             hidden_dim=h, intermediate_size=inter, input_dtype=str(self.cfg.in_dtype),
             gate_weight_bytes=self.gate.weight.numel()*self.gate.weight.element_size(),
-            expert_weight_bytes=w13.numel()*w13.element_size()+w2.numel()*w2.element_size(),
+            expert_weight_bytes=expert_weight_bytes,
             activation=str(self.cfg.activation),
             measurement_context=MOE_WEIGHT_POLICY,
             expert_conditioning=dict(schema=MOE_CONDITIONING_POLICY,
@@ -129,35 +250,104 @@ class ComponentMeasurement:
             gpu=dict(name=props.name, total_memory=props.total_memory,
                      capability=list(torch.cuda.get_device_capability(self.device))),
             excluded=['collectives', 'cpu_time', 'launch_gaps', 'shared_experts'])
+        if self.fp8 is not None:
+            error = self._check_fp8_output(w13, w2, scales, gen)
+            logging.getLogger(__name__).info(
+                'FP8 expert output check: relative error %.4f against the fp32 reference '
+                '(tolerance %s)', error, FP8_OUTPUT_TOLERANCE)
+            self.contract['expert_weight_recipe'] = dict(
+                values='seeded_randn_0.01', quantization='per_block_cast_to_fp8',
+                scale_format='ue8m0' if ue8m0 else 'float32',
+                output_check=dict(reference='fp32_dequantized_local_experts',
+                                  relative_frobenius_tolerance=FP8_OUTPUT_TOLERANCE))
         if self.target.dp == 1:
-            self._verify_local_boundary(hidden, weights, ids)
+            prepare = self._verify_local_boundary(hidden, weights, ids)
             self.contract['local_execution'] = dict(
-                prepare='identity', finalize='output_alias_noop', expert_output_alias=True)
+                prepare=prepare, finalize='output_alias_noop', expert_output_alias=True)
+
+    @torch.inference_mode()
+    def _check_fp8_output(self, w13, w2, scales, gen):
+        """One kernel call against an fp32 computation of this rank's experts.
+
+        Runs once, before any timing, over a balanced batch that activates as
+        many local experts as the token count allows. A mismatch stops the
+        acquisition: the seeded weights, their conversion to the selected
+        backend's layout or the expert map would be wrong.
+        """
+        cfg = self.cfg
+        n = min(16, cfg.max_num_tokens)
+        hidden = torch.randn((n, cfg.hidden_dim), device=self.device, dtype=cfg.in_dtype, generator=gen)
+        active = self.place.active_bounds(n)[1]
+        pairs = self.place.assignment_bounds(n, active)[1]
+        ids = torch.tensor(self.place.balanced_route(n, active, pairs), device=self.device,
+                           dtype=self.indices_dtype)
+        weights = torch.full(ids.shape, 1/cfg.experts_per_token, device=self.device, dtype=torch.float32)
+        output = torch.empty_like(hidden) if self.target.dp == 1 else None
+        result = self.expert.bind(hidden, ids, weights, output_alias=output)()
+        reference = _fp8_reference(hidden, ids, weights, w13, w2, scales, self.place, cfg)
+        error = ((result.float() - reference).norm() / reference.norm()).item()
+        if not math.isfinite(error) or error > FP8_OUTPUT_TOLERANCE:
+            raise ValueError(f'FP8 expert output differs from the fp32 reference by {error:.4f} '
+                             f'(relative Frobenius norm, tolerance {FP8_OUTPUT_TOLERANCE})')
+        return error
 
     @torch.inference_mode()
     def _verify_local_boundary(self, hidden, weights, ids):
-        """Omit DP1 boundaries only after observing their native no-op contract."""
+        """Omit DP1 boundaries only after observing their native contract.
+
+        Finalize must be a CUDA-free no-op on the output alias. Prepare must
+        hand back the input without reordering or token metadata, and returns
+        the label ``local_execution.prepare`` records: ``identity`` when it
+        passes the input through -- unquantized experts, or FP8 experts that
+        quantize it themselves -- or ``timed_input_quantization`` when vLLM's
+        prepare quantizes it to FP8. That is work the deployment runs, so the
+        expert region times it inside ``experts`` rather than omitting it.
+        """
         from torch.autograd import DeviceType
         from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
+
+        def cuda_work(hook):
+            return any(event.device_type() == DeviceType.CUDA and not event.is_user_annotation()
+                       for event in hook.profiler.kineto_results.events())
+
+        def profile():
+            return torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                      torch.profiler.ProfilerActivity.CUDA])
 
         output = torch.empty_like(hidden)
         call = self.expert.bind(hidden, ids, weights, output_alias=output)
         if call() is not output:
             raise NotImplementedError('Native DP1 expert output does not preserve its output alias')
         reference = output.clone()
+        quantizes = self.fp8 is not None and not self.expert.experts.expects_unquantized_inputs
         torch.cuda.synchronize()
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                               torch.profiler.ProfilerActivity.CUDA]) as hook:
-            prepared = self.finalize.prepare(hidden, weights, ids, self.cfg.num_experts,
-                self.expert.mapping, False, FUSED_MOE_UNQUANTIZED_CONFIG)
+        with profile() as prepare_hook:
+            if self.fp8 is None:
+                prepared = self.finalize.prepare(hidden, weights, ids, self.cfg.num_experts,
+                    self.expert.mapping, False, FUSED_MOE_UNQUANTIZED_CONFIG)
+            else:
+                prepared = self.finalize.prepare(hidden, weights, ids, self.cfg.num_experts,
+                    self.expert.mapping, False, self.expert.experts.quant_config,
+                    defer_input_quant=not quantizes)
+        with profile() as finalize_hook:
             self.finalize.finalize(output, output, weights, ids, False, self.reduction)
-        if (len(prepared) != 5 or prepared[0] is not hidden
-                or any(value is not None for value in prepared[1:])):
-            raise NotImplementedError('Native DP1 preparation is not an unquantized identity')
-        if any(event.device_type() == DeviceType.CUDA and not event.is_user_annotation()
-               for event in hook.profiler.kineto_results.events()):
+        if len(prepared) != 5 or any(value is not None for value in prepared[2:]):
+            raise NotImplementedError('Native DP1 preparation reorders tokens or adds metadata')
+        if not quantizes:
+            if prepared[0] is not hidden or prepared[1] is not None:
+                raise NotImplementedError('Native DP1 preparation is not an unquantized identity')
+            if cuda_work(prepare_hook):
+                raise NotImplementedError('Native DP1 prepare/finalize performs unprofiled CUDA work')
+            label = 'identity'
+        elif (prepared[0].dtype != torch.float8_e4m3fn or prepared[0].shape != hidden.shape
+                or prepared[1] is None):
+            raise NotImplementedError('Native DP1 FP8 preparation is not a plain input quantization')
+        else:
+            label = 'timed_input_quantization'
+        if cuda_work(finalize_hook):
             raise NotImplementedError('Native DP1 prepare/finalize performs unprofiled CUDA work')
         torch.testing.assert_close(output, reference, atol=0, rtol=0)
+        return label
 
     def _gate(self, hidden):
         logits, _ = self.gate(hidden)

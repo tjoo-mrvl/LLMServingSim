@@ -14,6 +14,9 @@ verified no-op preparation/finalization and no DP dispatch/combine. A separate
 capability-admitted live path retains native processed expert weights and backend
 at TP1/DP1/EP1, including supported quantized and shared-expert execution. It adds
 a local `wrapper` component for the surrounding native work.
+FP8 experts of an EP > 1 target at DP1 use the modular path too, with seeded
+weights in the checkpoint's FP8 layout and the kernel vLLM selects for that
+target; see [FP8 experts on the modular path](#fp8-experts-on-the-modular-path).
 
 The shipped RTXPRO6000 BF16 Qwen3-30B bundle includes a TP1/DP2/EP2 component
 entry in its root metadata. Its contracts define the actual bounds and backend; the same model name
@@ -122,6 +125,46 @@ the latter plus native workspace and reserved free memory. It does not apply the
 unquantized adapter's conversion-buffer estimate to already processed weights.
 Cloning preserves storage aliases, offsets and strides. Wrapper weight storage
 excludes the gate and routed expert storage rather than double-counting them.
+
+## FP8 experts on the modular path
+
+An FP8 checkpoint's EP1 engine runs the expert kernel vLLM selects for EP1, but an
+EP > 1 deployment of the same checkpoint can select another: for block-scaled
+FP8 on Hopper, Triton at EP1 and FlashInfer CUTLASS above it. The live adapter
+would time the EP1 kernel, so an EP > 1 target whose routed experts use vLLM's
+`Fp8MoEMethod` is measured on the modular path instead:
+
+- **Weights.** The modular adapter's seeded values (`randn × 0.01`, seed 0),
+  stored as the checkpoint stores them: FP8 values with one float32
+  dequantization scale per `weight_block_size` block, written by vLLM's own
+  `per_block_cast_to_fp8`. A checkpoint declaring `scale_fmt: ue8m0` gets
+  power-of-two scales.
+- **Kernel.** vLLM's FP8 oracle selects the backend from the target
+  configuration, converts the checkpoint layout into the kernel's and builds
+  the quantization config, as `Fp8MoEMethod` does. Whichever modular backend it
+  selects is accepted; one that needs layer state the adapter does not provide
+  is refused by name.
+- **Output check.** Once, before any timing, one kernel call is compared with
+  an fp32 computation of the rank's own experts over the same dequantized
+  weights. The relative Frobenius error must stay below 0.1: the FP8 rounding of
+  the two activation quantizations is expected to account for a few percent,
+  while a wrong layout, scale or expert map is of order one. A mismatch stops
+  the acquisition.
+- **Prepare.** vLLM's DP1 prepare quantizes the input to FP8, or hands it to
+  experts that quantize it themselves (FlashInfer CUTLASS). Either way it runs
+  inside the timed `experts` call, because the deployment runs it there;
+  `local_execution.prepare` records `timed_input_quantization` or `identity`.
+  Finalize must still be a CUDA-free no-op on the output alias.
+- **Weight banks.** Every conditioning bank is rebuilt from its own copy of the
+  checkpoint, scales included, and `expert_weight_bytes` counts the FP8 values
+  and their scales.
+
+An EP1 target keeps the live path, whose engine already runs the target's
+kernel. Refused for now: per-tensor and static-activation FP8 schemes, other
+quantization methods, FP8 at DP > 1 (its prepare quantizes before the dispatch
+all-gather, which this region does not time) and shared experts at EP > 1.
+Serving does not consume these tables yet: its loader admits only the
+unquantized `identity` preparation.
 
 ## Shapes and measurement protocol
 
@@ -319,8 +362,9 @@ channel selection or arbitrary ragged task schedule. Optional
 effective communication parameters without changing these tensor shapes.
 
 The modular adapter requires positive DP, full EP, linear expert placement and
-unquantized native modular experts with standard activation layout. Its local
-and DP+EP contracts remain unchanged. The live adapter requires TP1/DP1/EP1 and
+native modular experts with standard activation layout: unquantized, or vLLM FP8
+with block scales and dynamic activations at DP1. Its unquantized local and
+DP+EP contracts remain unchanged. The live adapter requires TP1/DP1/EP1 and
 standard token layout; monolithic kernels must expose verifiable native routing
 replay. Quantization or shared experts alone are not rejection conditions, but
 an unsupported API, deferred finalization, input-weighted routing, fused shared
