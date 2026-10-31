@@ -2366,6 +2366,19 @@ weights, inputs and batching, not a universal correction for that architecture.
   contracts. Neither a measured count curve nor matching CSV columns establish
   arbitrary-histogram or deployment coverage.
 
+`bench run --record-routed-experts` keeps per-token routing, not a curve. It
+turns on vLLM 0.31's own `enable_return_routed_experts` (no source patch) and
+saves each request's `routed_experts` to `routed_experts.npz`, keyed by
+`request_id`: `[input_toks + output_toks - 1, layers, top_k]`, uint8 for at most
+256 experts, dense layers zero. vLLM needs Model Runner V2 and prefix caching
+for it and refuses PP > 1 and Nixl P/D; the bench refuses PP > 1 before boot.
+Collect only array references while requests run; validate shapes and write the
+file after shutdown, so no I/O delays the arrival-pacing loop. It works with
+CUDA graphs (A10G: identical to eager for every token tested) and is not marked
+diagnostic: an A10G on/off A/B moved mean latencies by under 1%, inside
+run-to-run noise. Recheck that on the target hardware. Routing depends on the
+tokens and weights, so one capture serves every deployment of the workload.
+
 ### MoE dispatch/combine and TP restoration
 
 The modeled transport is vLLM's `allgather_reducescatter` backend.

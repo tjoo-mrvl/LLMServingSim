@@ -101,7 +101,14 @@ comparison is not apples-to-apples.
 | `--skip-tokenizer-init` | flag | off | Boot without loading a tokenizer; replay supplies token IDs directly. For a local config-only diagnostic, create a separate model directory containing `config.json`, pass that directory as `--model`, and use `--load-format dummy`. The benchmark does not materialize the repository's named JSON files into that layout for you. Real-weight runs still require checkpoint weights |
 | `--enforce-eager` | flag | off | Run vLLM eager, with `torch.compile` and CUDA graphs off. Leave it off when comparing with the default compiled target. An eager reference helps isolate execution-mode effects because ordinary layerwise acquisition requires module boundaries, while native MoE component tables can include graph timings. Record and match the target mode; graph padding alone does not reproduce graph kernel fusion. Saved in `meta.json` |
 | `--record-gate-stats` | flag | off | Observe distinct-expert counts between explicit workload start/end markers and write `gate_stats.json` for `--expert-routing-policy CUSTOM`. Concentrated routing is retained; counts do not identify warmup. Requires the `VLLM_MOE_ACTIVATED_LOG` source patch from `scripts/docker-vllm.sh` and **`--enforce-eager`**, because `.unique()` is not graph-capturable. The curve describes the recorded weights and inputs, not all deployments. Instrumented latency is marked diagnostic and rejected by `bench validate`. Dense models produce no curve and warn |
+| `--record-routed-experts` | flag | off | Save each request's routing to `routed_experts.npz` through vLLM's own `enable_return_routed_experts` capture: one array per `request_id`, `[input_toks + output_toks - 1, layers, top_k]`, the top-k expert IDs of every token the model processed (the last sampled token never enters it; dense layers stay zero). Works with CUDA graphs; needs Model Runner V2 and prefix caching, and vLLM refuses it at PP > 1 or with a Nixl P/D connector. Routing depends on the tokens and weights, not the deployment. Described under `routed_experts` in `meta.json`. MoE models only |
 | `--resolve-only` | flag | off | Boot the engine, write resolved settings and KV capacity metadata, then exit without replay. Match complete per-engine observations to simulator instances; the raw DP client count need not describe one engine. Dummy loading avoids checkpoint reads but does not certify a real-weight capacity. No `requests.jsonl` or `timeseries.csv` is written |
+
+A `--record-routed-experts` run is not marked diagnostic. The capture adds a
+device copy per MoE layer and a host transfer per step; in an A10G test with a
+small MoE model it moved mean TTFT, TPOT and request latency by under 1%, well
+inside run-to-run variation. Compare a capture run with an uninstrumented run
+on the target hardware before using it as the latency reference.
 
 :::note[Defaults differ from `python -m serving`]
 `bench run` defaults `--dtype` to `bfloat16` outright, where the
@@ -160,6 +167,8 @@ is not overwritten. Final results require `meta.json`, `requests.jsonl` and
                      reader can refuse a curve from another checkpoint
   moe_activated.jsonl  --record-gate-stats only: phase markers and raw per-call log
                      gate_stats.json was reduced from
+  routed_experts.npz --record-routed-experts only: per request_id, the top-k
+                     expert IDs of every processed token at every layer
 ```
 
 `preempted` counts preemption events during the tick, summed over DP engines.
@@ -310,6 +319,7 @@ MAX_NUM_SEQS=128 MAX_NUM_BATCHED_TOKENS=2048 \
 | `RESOLVE_ONLY` | `--resolve-only` when `1` | `0` |
 | `SKIP_TOKENIZER_INIT` | `--skip-tokenizer-init` when `1` | `0` |
 | `ENFORCE_EAGER` | `--enforce-eager` when `1` | `0` |
+| `RECORD_ROUTED_EXPERTS` | `--record-routed-experts` when `1` | `0` |
 | `TICK_SECONDS` | `--tick-seconds` | `1.0` |
 | `NUM_REQS` | `--num-reqs` | `0` |
 | `LOG_LEVEL` | `--log-level` | `INFO` |

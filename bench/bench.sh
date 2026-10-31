@@ -64,6 +64,10 @@ SKIP_TOKENIZER_INIT="${SKIP_TOKENIZER_INIT:-0}"
 # Run vLLM eager to record an execution-mode control. Leave off for a compiled
 # serving reference; simulated graph padding does not reproduce kernel fusion.
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+# Save every request's routed experts (top-k IDs per token and layer) to
+# routed_experts.npz, through vLLM's own capture. MoE models only; it needs
+# Model Runner V2 and prefix caching, and vLLM refuses it at PP > 1.
+RECORD_ROUTED_EXPERTS="${RECORD_ROUTED_EXPERTS:-0}"
 TICK_SECONDS="${TICK_SECONDS:-1.0}"
 NUM_REQS="${NUM_REQS:-0}"            # 0 => replay the full dataset
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
@@ -102,6 +106,7 @@ cmd=(python3 -m bench run
 [[ "$RESOLVE_ONLY" == "1" ]] && cmd+=(--resolve-only)
 [[ "$SKIP_TOKENIZER_INIT" == "1" ]] && cmd+=(--skip-tokenizer-init)
 [[ "$ENFORCE_EAGER" == "1" ]] && cmd+=(--enforce-eager)
+[[ "$RECORD_ROUTED_EXPERTS" == "1" ]] && cmd+=(--record-routed-experts)
 
 echo "Running: ${cmd[*]}"
 "${cmd[@]}"

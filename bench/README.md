@@ -85,6 +85,15 @@ latencies are marked diagnostic and rejected by `bench validate`. Unmarked or
 incomplete raw logs need a new recording, while existing `gate_stats.json`
 curves remain readable. Normal runs without this flag are unchanged.
 
+`--record-routed-experts` saves each request's routing to `routed_experts.npz`
+through vLLM's own `enable_return_routed_experts` capture: one array per
+`request_id`, `[input_toks + output_toks - 1, layers, top_k]`, holding the top-k
+expert IDs of every token the model processed (dense layers stay zero). It works
+with CUDA graphs and needs Model Runner V2 and prefix caching; vLLM refuses it at
+PP > 1 or with a Nixl P/D connector. Routing depends on the tokens and weights,
+not the deployment, so one capture serves every deployment of the workload.
+`meta.json` records the capture under `routed_experts`.
+
 Simulator examples include local CUDA graph padding before DP synchronization.
 Use per-instance `cudagraph` settings to describe the effective target worker
 mode and capture grid; the profiler's eager configuration is not that target.
@@ -134,6 +143,7 @@ Run options (also available through `python -m bench run --help`):
 | `--skip-tokenizer-init` | off | Replay token IDs without loading a tokenizer |
 | `--enforce-eager` | off | Disable compilation and CUDA graphs; match this mode to the simulation |
 | `--record-gate-stats` | off | Diagnostic routing observation; requires `--enforce-eager`, and its timings are rejected by validation |
+| `--record-routed-experts` | off | Save every request's per-token, per-layer top-k expert IDs to `routed_experts.npz` (MoE only; vLLM's native capture) |
 | `--resolve-only` | off | Boot and save resolved settings, then exit without replay or request/timeseries files |
 | `--tick-seconds` | `1.0` | `timeseries.csv` row spacing; the simulator's `--log-interval` |
 | `--num-reqs` | `0` | cap on requests from the dataset, `0` = all |
@@ -148,6 +158,7 @@ can describe only the last engine. Pass the matched value to the simulator as
 
 `bench.sh` is an editable run template, not a passthrough for every CLI flag.
 `DISABLE_CUSTOM_ALL_REDUCE=1` enables the same explicit opt-in; its default is `0`.
+`RECORD_ROUTED_EXPERTS=1` forwards `--record-routed-experts`.
 Use the module directly for `--kv-cache-memory-bytes` or `--record-gate-stats`.
 Its default TP is `2`, while the module defaults to `1`; see the
 [wrapper variable reference](../docs/docs/reference/bench-cli.md#shell-wrappers).
@@ -191,6 +202,7 @@ bench/results/<run_id>/
 ├── meta.json           run identity, engine settings, hardware and KV capacity
 ├── requests.jsonl      token counts, arrival and per-request engine timestamps
 ├── timeseries.csv      throughput, running/waiting requests and KV utilization
+├── routed_experts.npz  --record-routed-experts only: per-request routing arrays
 └── validation/         created by bench validate (default filenames below)
     ├── throughput.png
     ├── requests.png

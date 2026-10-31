@@ -145,6 +145,18 @@ def register_args(p: argparse.ArgumentParser) -> None:
                         "of fidelity for this: the gate's top-k output depends "
                         "on the weights and the input, not on how the forward "
                         "runs. MoE models only; a dense run writes nothing.")
+    p.add_argument("--record-routed-experts", action="store_true",
+                   dest="record_routed_experts", default=False,
+                   help="Save every request's routed experts to "
+                        "routed_experts.npz: the top-k expert IDs of each token "
+                        "the model processed, at every layer, keyed by request "
+                        "id. Uses vLLM's own enable_return_routed_experts "
+                        "capture, which works with CUDA graphs and needs Model "
+                        "Runner V2 and prefix caching; vLLM refuses it with "
+                        "pipeline parallelism or a Nixl P/D connector. Routing "
+                        "depends on the tokens and weights, not the deployment, "
+                        "so one capture serves every deployment of the same "
+                        "workload. MoE models only.")
     p.add_argument("--enforce-eager", action="store_true",
                    dest="enforce_eager", default=False,
                    help="Run vLLM eager, with torch.compile and cudagraphs "
@@ -241,6 +253,14 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
 
     from bench.core.stat_logger import BenchStatLogger
 
+    # vLLM refuses routed-experts capture with pipeline parallelism; say so
+    # before booting an engine rather than after.
+    if args.record_routed_experts and args.pipeline_parallel_size > 1:
+        raise SystemExit(
+            "--record-routed-experts cannot run with pipeline parallelism: vLLM "
+            "refuses enable_return_routed_experts at PP > 1. Routing depends on "
+            "the tokens and weights, not the deployment, so capture it at PP 1.")
+    routed_experts = {} if args.record_routed_experts else None
     gate_log = None
     if args.record_gate_stats:
         if not args.enforce_eager:
@@ -288,6 +308,7 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
         enforce_eager=args.enforce_eager,
         worker_extension_cls='bench.core.execution_metadata.ExecutionObserver',
         disable_log_stats=False,
+        enable_return_routed_experts=args.record_routed_experts,
     )
     engine_kwargs_for_meta = _engine_kwargs_for_meta(engine_args)
     engine_kwargs_for_meta["compilation_config"] = {"pass_config": {
@@ -364,7 +385,7 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
             gate_stats_mod.mark_phase(gate_log, "workload_start")
         with log.stage(f"Submitting {len(requests)} requests"):
             records = await _submit_all(
-                engine, requests, SamplingParams, TokensPrompt
+                engine, requests, SamplingParams, TokensPrompt, routed_experts
             )
         if gate_log is not None:
             gate_stats_mod.mark_phase(gate_log, "workload_end")
@@ -377,6 +398,10 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
     # ------------------------------------------------------------------
     # Persist outputs.
     # ------------------------------------------------------------------
+    # Check the routing capture before writing anything, so a run whose
+    # routing is unusable never publishes a partial result.
+    capture_meta = ({"routed_experts": _routed_experts_summary(routed_experts, records)}
+                    if routed_experts is not None else {})
     recorder.write_meta(
         output_dir,
         model=args.model,
@@ -397,8 +422,11 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
         resolved_config=resolved_config,
         execution=execution,
         **observation_meta,
+        **capture_meta,
     )
     recorder.write_requests(output_dir, records)
+    if routed_experts is not None:
+        _save_routed_experts(output_dir, routed_experts)
     header, rows = BenchStatLogger.downsample_to_csv_rows(args.tick_seconds)
     recorder.write_timeseries(output_dir, header, rows)
 
@@ -424,8 +452,15 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
     )
 
 
-async def _submit_all(engine, requests: list[dict], SamplingParams, TokensPrompt) -> list[dict]:
-    """Schedule each request at its arrival offset, gather metrics."""
+async def _submit_all(engine, requests: list[dict], SamplingParams, TokensPrompt,
+                      routed_experts: dict | None = None) -> list[dict]:
+    """Schedule each request at its arrival offset, gather metrics.
+
+    With ``routed_experts`` given, each finished request's routing array is
+    kept there by request id. Only a reference is stored here: compression and
+    file I/O wait until the engine has shut down, so they cannot delay the
+    asyncio loop that paces arrivals.
+    """
     loop = asyncio.get_event_loop()
     t0_loop = loop.time()
     completed = [0]  # boxed so the inner closure can mutate
@@ -453,9 +488,15 @@ async def _submit_all(engine, requests: list[dict], SamplingParams, TokensPrompt
             request_id = f"bench-{idx}"
 
             last_metrics = None
+            routing = None
             async for output in engine.generate(prompt, sp, request_id):
                 if output.metrics is not None:
                     last_metrics = output.metrics
+                if routed_experts is not None and output.outputs:
+                    # vLLM attaches the whole request's routing to its final output.
+                    routing = output.outputs[0].routed_experts
+            if routed_experts is not None:
+                routed_experts[request_id] = routing
 
             completed[0] += 1
             bar.advance()
@@ -463,6 +504,47 @@ async def _submit_all(engine, requests: list[dict], SamplingParams, TokensPrompt
 
         tasks = [asyncio.create_task(_one(i, r)) for i, r in enumerate(requests)]
         return await asyncio.gather(*tasks)
+
+
+ROUTED_EXPERTS_FILE = "routed_experts.npz"
+
+
+def _routed_experts_summary(routed: dict, records: list[dict]) -> dict:
+    """Check every request's captured routing and describe it for meta.json.
+
+    vLLM returns one array per request, ``[rows, layers, top_k]``: the top-k
+    expert IDs of every token the model processed, at every decoder layer
+    (dense layers stay zero). ``rows`` is prompt + output - 1, because the
+    last sampled token is never fed back through the model.
+    """
+    if not records:
+        raise RuntimeError("--record-routed-experts captured no requests")
+    shape = dtype = None
+    for record in records:
+        array = routed.get(record["request_id"])
+        if array is None:
+            raise RuntimeError(
+                f"vLLM returned no routed experts for {record['request_id']}; "
+                "--record-routed-experts needs an MoE model")
+        rows = int(record["input_toks"]) + int(record["output_toks"]) - 1
+        if array.ndim != 3 or array.shape[0] != rows:
+            raise RuntimeError(
+                f"{record['request_id']}: routed experts {array.shape} do not cover "
+                f"its {rows} processed tokens")
+        if shape is None:
+            shape, dtype = array.shape[1:], array.dtype
+        elif array.shape[1:] != shape or array.dtype != dtype:
+            raise RuntimeError("Requests disagree on routed-experts layers, top-k or dtype")
+    return dict(file=ROUTED_EXPERTS_FILE, source="vllm enable_return_routed_experts",
+                requests=len(records), layers=int(shape[0]), top_k=int(shape[1]),
+                dtype=str(dtype), rows="input_toks + output_toks - 1",
+                key="request_id")
+
+
+def _save_routed_experts(output_dir: Path, routed: dict) -> None:
+    """One compressed array per request, keyed by request id, after shutdown."""
+    import numpy as np
+    np.savez_compressed(output_dir / ROUTED_EXPERTS_FILE, **routed)
 
 
 def _record_from_metrics(idx: int, req: dict, metrics) -> dict:
@@ -508,6 +590,9 @@ def _engine_kwargs_for_meta(engine_args) -> dict:
         # an eager one are two different ground truths, and only the eager one
         # is comparable with a profiled latency.
         "enforce_eager",
+        # Recorded because the capture adds device copies and a per-step host
+        # transfer to the run it observes.
+        "enable_return_routed_experts",
     )
     return {k: getattr(engine_args, k, None) for k in fields}
 
