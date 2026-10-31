@@ -90,6 +90,11 @@ class GateRouter:
                               cannot be guessed. Per-token call sites
                               (``route``) still go through
                               ``_custom_gate_function``.
+        CAPTURED            — the **captured** routing of this very workload,
+                              recorded per request by ``bench run
+                              --record-routed-experts`` and replayed token by
+                              token (``captured_routing``). Every layer routes
+                              differently, so it turns ``block_copy`` off.
 
     ``block_copy``: simulator-side optimization that emits one
     transformer block's trace and replays it ``num_hidden_layers``
@@ -103,7 +108,7 @@ class GateRouter:
     ``block_copy=False`` in the constructor.
     """
 
-    _SUPPORTED_POLICIES = ("BALANCED", "RR", "RAND", "CUSTOM")
+    _SUPPORTED_POLICIES = ("BALANCED", "RR", "RAND", "CUSTOM", "CAPTURED")
 
     def __init__(
         self,
@@ -118,6 +123,7 @@ class GateRouter:
         topk_group=1,
         gate_stats=None,
         model_name=None,
+        captured=None,
     ):
         self.instance_id = instance_id
         self.E = int(num_local_experts)
@@ -139,6 +145,7 @@ class GateRouter:
         self.seed = seed
         self.rnd = random.Random(seed) if seed is not None else random
         self.block_copy = bool(block_copy)
+        self.captured = captured
 
         if self.routing_policy == "RR":
             self.routing_fn = self._rr_routing
@@ -152,6 +159,16 @@ class GateRouter:
             self.routing_fn = self._rand_routing
         elif self.routing_policy == "CUSTOM":
             self.routing_fn = self._custom_gate_function
+        elif self.routing_policy == "CAPTURED":
+            if captured is None:
+                raise ValueError("expert routing CAPTURED needs a routed-experts "
+                                 "capture (--routed-experts)")
+            # Whole steps are routed from the capture in ``route_ep``; there is
+            # no per-token draw to make.
+            self.routing_fn = self._captured_token_experts
+            # Each layer replays its own captured rows, so a block built for
+            # one layer cannot stand in for another.
+            self.block_copy = False
         else:
             raise ValueError(
                 f"Unknown routing_policy {routing_policy!r}. "
@@ -343,6 +360,9 @@ class GateRouter:
     def _custom_gate_function(self, token_idx, E, k):
         raise NotImplementedError("Implement custom gate function.")
 
+    def _captured_token_experts(self, token_idx, E, k):
+        raise NotImplementedError("CAPTURED routes whole steps through route_ep(segments=...)")
+
     def route(self, layer_num, batch_id, total_len):
         """Returns flat token counts per expert (used when EP=1)."""
         counts = [0] * self.E
@@ -358,7 +378,7 @@ class GateRouter:
         )
         return counts
 
-    def route_ep(self, layer_num, batch_id, total_len, ep_size, *, native=False):
+    def route_ep(self, layer_num, batch_id, total_len, ep_size, *, native=False, segments=None):
         """EP-aware routing: returns per-rank token counts and activated experts.
 
         Source-token counts here are a synthetic even split, not the real
@@ -368,7 +388,9 @@ class GateRouter:
         ``expert_id * ep // num_experts`` for historical tables. Native
         component tables use vLLM's contiguous remainder-to-first-ranks map.
         Native BALANCED/CUSTOM assignment totals are rounded expectations,
-        not a sampled histogram; RR/RAND count the actual selected pairs.
+        not a sampled histogram; RR/RAND count the actual selected pairs, and
+        CAPTURED the captured pairs of the tokens ``segments`` schedule
+        (``(request_id, start, end)`` ranges; see ``captured_routing``).
 
         BALANCED short-circuits the per-token draw and uses the
         pigeonhole expression — trained MoE gates (Qwen3, Mixtral,
@@ -397,7 +419,10 @@ class GateRouter:
         # differ only in where the distinct count comes from -- a closed form
         # or the measured curve. Both are deterministic in ``total_len``, which
         # is what keeps ``block_copy`` safe for either.
-        if self.routing_policy in ("BALANCED", "CUSTOM"):
+        if self.routing_policy == "CAPTURED":
+            local_tokens, activated_counts, assignments = self._captured_route_ep(
+                layer_num, segments, ep_size, owners)
+        elif self.routing_policy in ("BALANCED", "CUSTOM"):
             if native:
                 # Preserve the historical native balanced surface exactly.
                 # Routing owns this approximation; the lookup only prices it.
@@ -450,6 +475,36 @@ class GateRouter:
             source_tokens=source_tokens,
             local_assignments=assignments,
         )
+
+    def _captured_route_ep(self, layer_num, segments, ep_size, owners):
+        """Per-rank (tokens, distinct experts, pairs) from the captured rows.
+
+        Only a step's real tokens carry captured routing; graph-padding rows
+        and a DP dummy step's rows add nothing. That is vLLM 0.31's own
+        behaviour for its fused top-k routers, which give padding rows
+        expert -1 (``VLLM_MOE_SKIP_PADDING``, on by default). Its grouped
+        top-k router (DeepSeek/GLM) masks them only with DeepEP v2 kernels,
+        so on the modeled allgather_reducescatter backend their padding rows
+        do route, to experts the capture does not record: that work is not
+        charged. The expert lookup still sees the padded row count, as rows
+        with no local assignment (see moe_execution for EP1). ``owners`` is
+        the native placement map, or None for historical tables (even
+        partitioning).
+        """
+        import numpy as np
+        if segments is None:
+            raise ValueError("CAPTURED routing needs the step's request token ranges")
+        ids = self.captured.rows(layer_num, segments)
+        if owners is None:
+            owners = [self.expert_owner(e, ep_size, self.E) for e in range(self.E)]
+        rank = np.asarray(owners)[ids]
+        assignments = np.bincount(rank.ravel(), minlength=ep_size)
+        activated, local = [], []
+        for r in range(ep_size):
+            mine = rank == r
+            activated.append(int(np.unique(ids[mine]).size))
+            local.append(int(mine.any(axis=1).sum()))
+        return local, activated, [int(v) for v in assignments]
 
     def _balanced_route_ep(self, total_len, ep_size, source_tokens):
         """Closed-form per-rank load for a perfectly-balanced learned gate.

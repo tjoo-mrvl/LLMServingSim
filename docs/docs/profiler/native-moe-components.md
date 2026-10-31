@@ -419,7 +419,8 @@ The expert query is `(gathered/padded N, rank-local A, rank-local M)`, and all
 three coordinates enter the lookup cache key. Local gate/finalization components
 use their own row counts rather than expert assignments. The router supplies
 active counts and local assignments. BALANCED/CUSTOM retain
-rounded expected rank loads; RR/RAND count their selected pairs. CUSTOM's active
+rounded expected rank loads; RR/RAND count their selected pairs, and CAPTURED
+the captured pairs of the scheduled tokens. CUSTOM's active
 count curve does not provide a rank-load histogram. Historical balanced-total
 component tables keep their old interpolation and mode choice, and support only
 their previously admitted routing policies. Retained `moe.csv` reads are unchanged.

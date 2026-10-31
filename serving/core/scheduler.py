@@ -525,6 +525,7 @@ class Scheduler:
         decode_q_lens = []
         scheduled_tokens = {}
         spec_scheduled = {}
+        routing_segments = []
         pd_kv_send_tokens = 0
 
         for req, num_new, computed_before in scheduled:
@@ -537,6 +538,8 @@ class Scheduler:
             # leave num_computed_tokens N-1 past num_tokens_reached, and the
             # request could never be scheduled again.
             spec_scheduled[req.id] = req.num_spec_scheduled
+            # The positions this step runs, which CAPTURED routing replays.
+            routing_segments.append((req.id, computed_before, computed_before + num_new))
             total_len += num_new
             q_list.append(num_new)
             k_list.append(computed_before)
@@ -589,6 +592,7 @@ class Scheduler:
         batch.requests.extend(req for req, _, _ in scheduled)
         batch.scheduled_tokens = scheduled_tokens
         batch.spec_scheduled = spec_scheduled
+        batch.routing_segments = routing_segments
         # Written down to a victim tier off the critical path, so it carries no
         # latency -- but the bytes still cost DRAM energy.
         batch.write_through = write_through_bytes

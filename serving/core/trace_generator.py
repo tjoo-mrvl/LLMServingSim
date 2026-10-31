@@ -13,6 +13,7 @@ from .memory_model import (activation_element_bytes, calculate_sizes, kv_element
                            kv_bytes_per_token_per_layer)
 from .communication import dtype_bytes, vocab_shard_size
 from .gate_function import GateRouter
+from . import captured_routing
 from .config_builder import get_device
 from .power_model import PowerModel, total_ring_data
 from .pim_model import PIMModel
@@ -122,6 +123,7 @@ class TraceCtx:
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
     dp_min_total_len: int  # smallest member's total_len in the DP round (0 = DP inactive). Only the EP collectives read it: they are ragged, so their cost is set by the worst-off rank, not the average one. Equals max on a padded round.
     dp_token_counts: tuple = ()  # Authoritative padded model rows in DP-rank order.
+    dp_routing_segments: tuple = ()  # Each DP member's Batch.routing_segments, in DP-rank order (CAPTURED routing).
     component_sizes: object = None  # Explicit selected-runtime logical boundaries.
     duration_replay_only: bool = False  # Explicitly bypasses any serving/capacity support claim.
 
@@ -1200,7 +1202,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                      tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0, num_speculative_tokens=0,
-                     dp_rank=0, dp_token_counts=(), duration_replay_only=False):
+                     dp_rank=0, dp_token_counts=(), dp_routing_segments=(),
+                     duration_replay_only=False):
     if dp_rank < 0 or (gate is not None and (dp_rank + 1) * max(local_ep, 1) > ep_total):
         raise ValueError("DP member's local expert ranks exceed the EP group")
     model_type = config.get('model_type')
@@ -1245,6 +1248,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
         dp_min_total_len=dp_min_total_len,
         dp_token_counts=tuple(dp_token_counts),
+        dp_routing_segments=tuple(dp_routing_segments),
         num_speculative_tokens=num_speculative_tokens,
         component_sizes=_selected_component_sizes(perf_db, tp_size, config),
         duration_replay_only=duration_replay_only,
@@ -1581,7 +1585,7 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     ALLTOALL is handled by ASTRA-Sim with involved_dim scoping for DP groups,
     or as a simple ALLTOALL for local EP groups.
     """
-    from .moe_execution import emit_native_components
+    from .moe_execution import emit_native_components, routing_segments
     if emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag):
         return
     ep_total = ctx.ep_total
@@ -1604,7 +1608,8 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     effective_total_len_comm = (ctx.dp_sum_total_len if ctx.dp_sum_total_len > 0
                                 else bctx.total_len)
     effective_total_len_compute = effective_total_len_comm
-    routing = ctx.gate.route_ep(layer_num, batch_id_str, effective_total_len_compute, ep_total)
+    routing = ctx.gate.route_ep(layer_num, batch_id_str, effective_total_len_compute, ep_total,
+                                segments=routing_segments(ctx, bctx))
 
     # vLLM default ``allgather_reducescatter`` backend: dispatch = AllGather
     # (hidden + router_logits), combine = ReduceScatter (hidden only).
@@ -2432,7 +2437,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                       tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0,
-                      num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), duration_replay_only=False):
+                      num_speculative_tokens=0, dp_rank=0, dp_token_counts=(),
+                      dp_routing_segments=(), duration_replay_only=False):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -2442,6 +2448,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            dp_min_total_len=dp_min_total_len,
                            num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
                            dp_token_counts=dp_token_counts,
+                           dp_routing_segments=dp_routing_segments,
                            duration_replay_only=duration_replay_only)
     bctx = _build_batch_ctx(batch, ctx)
 
@@ -2532,7 +2539,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0,
-                                  num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), duration_replay_only=False):
+                                  num_speculative_tokens=0, dp_rank=0, dp_token_counts=(),
+                                  dp_routing_segments=(), duration_replay_only=False):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -2542,6 +2550,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            dp_min_total_len=dp_min_total_len,
                            num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
                            dp_token_counts=dp_token_counts,
+                           dp_routing_segments=dp_routing_segments,
                            duration_replay_only=duration_replay_only)
     if ctx.component_sizes is not None:
         raise NotImplementedError('Native DSA interleaved trace execution is not yet admitted')
@@ -2688,7 +2697,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
                    tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0, enable_block_copy=True, inputs_root=None,
                    num_speculative_tokens=0, gate_stats_path=None, dp_rank=0, dp_token_counts=(),
-                   *, duration_replay_only=False):
+                   *, duration_replay_only=False, routed_experts_path=None, dp_routing_segments=()):
 
     if type(duration_replay_only) is not bool:
         raise ValueError('duration_replay_only must be an explicit boolean')
@@ -2735,6 +2744,11 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
             # the closed form in place, which is the documented fallback.
             gate_stats=gate_stats_path,
             model_name=model,
+            # Only under ``CAPTURED``. Loaded once per run and checked against
+            # the dataset at startup (serving/__main__.py).
+            captured=(captured_routing.load(routed_experts_path, config,
+                                            _stack_module().expert_top_k(config))
+                      if expert_routing_policy == "CAPTURED" else None),
         )
     else:
         gate = None
@@ -2759,6 +2773,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         dp_min_total_len=dp_min_total_len,
                         num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
                         dp_token_counts=tuple(dp_token_counts),
+                        dp_routing_segments=tuple(dp_routing_segments),
                         duration_replay_only=duration_replay_only)
     if not enable_sub_batch_interleaving:
         rows, block_starts = _synthesize_trace(*synth_args, batch, max_len, **synth_kwargs)

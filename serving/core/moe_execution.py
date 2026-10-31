@@ -35,6 +35,19 @@ def _legacy_fallback(ctx, reason, *, warn=True):
     return False
 
 
+def routing_segments(ctx, bctx):
+    """The token ranges a MoE layer routes this step, for CAPTURED routing.
+
+    Under DP+EP every rank's experts run every member's gathered tokens, so a
+    round routes the whole group's ranges (``ctx.dp_routing_segments``, filled
+    by both DP completion paths in serving/__main__.py); otherwise the batch's
+    own (``Batch.routing_segments``, snapshotted by the scheduler).
+    """
+    if ctx.dp_routing_segments:
+        return tuple(segment for member in ctx.dp_routing_segments for segment in member)
+    return tuple(bctx.batch.routing_segments)
+
+
 def _collective(kind, dims, size):
     suffix = '' if dims is None else ':'+','.join(str(int(v)) for v in dims)
     return f'{kind}{suffix} {size}'
@@ -100,7 +113,8 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
     if mode_value not in (0,1,2):
         raise ValueError('Unknown model-forward execution mode')
     local, gathered = domain['gate_rows'], domain['expert_rows']
-    routing = ctx.gate.route_ep(layer_num, batch_id, gathered, ctx.ep_total, native=True)
+    routing = ctx.gate.route_ep(layer_num, batch_id, gathered, ctx.ep_total, native=True,
+                                segments=routing_segments(ctx, bctx))
     h, k = expected['hidden_dim'], expected['global_top_k']
     weight_loc = get_device(ctx.placement, layer_num, 'moe', 'weights')
     parts = []
@@ -120,7 +134,16 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
         pairs = routing.local_assignments[table.target.rank]
         active = routing.activated_experts[table.target.rank]
         mode = table.execution_mode(bool(mode_value))
-        times = tuple(table.expert_ns(mode, gathered, active, pairs) if name == 'experts'
+        expert_rows = gathered
+        place = table.placement
+        if (ctx.gate.routing_policy == 'CAPTURED'
+                and place.global_top_k > place.global_experts - len(place.local_global_ids)):
+            # CAPTURED charges only captured rows (gate_function._captured_route_ep):
+            # graph-padding rows carry no local assignment. A placement with
+            # fewer remote experts than top-k (EP1: every expert is local) has
+            # no measured row without one, so price the rows carrying routing.
+            expert_rows = routing.local_tokens[table.target.rank]
+        times = tuple(table.expert_ns(mode, expert_rows, active, pairs) if name == 'experts'
                       else table.local_ns(name, mode, local) for name in components)
         gate_bytes = contract.get('gate_weight_bytes')
         expert_bytes = contract.get('expert_weight_bytes')

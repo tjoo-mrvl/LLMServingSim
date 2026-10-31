@@ -271,6 +271,43 @@ def _resolve_mem_util(instance, cli_default):
     return util
 
 
+def _check_captured_routing(args, instances, runtime_configs, router):
+    """Refuse what CAPTURED routing cannot replay, before the run starts.
+
+    The capture is keyed by dataset row, so it covers a flat dataset replayed
+    exactly as the bench replayed it. Agentic sessions are refused (the bench
+    replays flat datasets only), and so is speculative decoding (its draft
+    tokens are never captured) and sub-batch interleaving (a sub-batch does
+    not carry its token ranges). Each MoE model's shape and every request's
+    processed-token count are checked against the capture here, once. Dense
+    instances route nothing, so none of this applies to them.
+    """
+    from serving.core import captured_routing
+    from serving.core.utils import get_config, num_experts
+    from profiler.core.stack import expert_top_k
+    requests = router.loaded_requests()
+    if not requests:
+        raise SystemExit('--expert-routing-policy CAPTURED needs a dataset (--dataset)')
+    moe_models = set()
+    for instance_id, (inst, cfg) in enumerate(zip(instances, runtime_configs)):
+        if not num_experts(get_config(inst['model_name'])):
+            continue
+        if cfg['num_speculative_tokens']:
+            raise SystemExit(f'Instance {instance_id}: CAPTURED routing cannot replay '
+                             'speculative decoding; draft tokens are never captured')
+        if cfg['enable_sub_batch_interleaving']:
+            raise SystemExit(f'Instance {instance_id}: CAPTURED routing does not support '
+                             'sub-batch interleaving')
+        moe_models.add(inst['model_name'])
+    if moe_models and any('session_id' in req for req in requests):
+        raise SystemExit('--expert-routing-policy CAPTURED replays flat datasets only; '
+                         'this one has agentic sessions')
+    for model in sorted(moe_models):
+        config = get_config(model)
+        captured_routing.load(args.routed_experts, config,
+                              expert_top_k(config)).check_requests(requests)
+
+
 def _build_instance_runtime_configs(instances, args, dtype_to_bits):
     runtime_configs = []
     for instance_id, instance in enumerate(instances):
@@ -537,7 +574,7 @@ def main():
                         'RR (round-robin), RAND (random), CUSTOM (requires implementing '
                         'the shipped NotImplementedError stub in serving/core/router.py)')
     parser.add_argument('--expert-routing-policy', type=str,
-                        choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
+                        choices=['BALANCED', 'RR', 'RAND', 'CUSTOM', 'CAPTURED'],
                         default='BALANCED',
                         help='expert token routing policy for MoE models: '
                         'BALANCED (default; analytical pigeonhole approximation of '
@@ -545,7 +582,8 @@ def main():
                         'RR (round-robin), RAND (uniform random per token), '
                         'CUSTOM (the measured distinct-expert count from '
                         '--gate-stats, falling back to BALANCED when none is '
-                        'given)')
+                        'given), CAPTURED (replay each request\'s own routing '
+                        'from --routed-experts, per token and layer)')
     parser.add_argument('--gate-stats', type=str, default=None,
                         help='path to a gate_stats.json (or the bench run '
                         'directory holding one) recorded by '
@@ -555,6 +593,15 @@ def main():
                         'measured distinct-expert count. A '
                         'missing, unreadable or mismatched file falls back to '
                         'the closed form with a warning.')
+    parser.add_argument('--routed-experts', type=str, default=None,
+                        help='path to a routed_experts.npz (or the bench run '
+                        'directory holding one) recorded by `bench run '
+                        '--record-routed-experts` on this dataset. Required by '
+                        '--expert-routing-policy CAPTURED: simulated request i '
+                        'replays bench-i\'s captured top-k IDs for the token '
+                        'positions each step runs, at every MoE layer. Replay '
+                        'the dataset and --num-reqs of the bench run; a capture '
+                        'that does not match them is refused.')
     parser.add_argument('--enable-block-copy', action=argparse.BooleanOptionalAction,
                         default=True,
                         help='Reuse trace rows across matching resolved block/site '
@@ -656,6 +703,10 @@ def main():
     # they are standing in -- which is ``cwd``, captured before the chdir above.
     if args.gate_stats and not os.path.isabs(args.gate_stats):
         args.gate_stats = os.path.join(cwd, args.gate_stats)
+    if args.routed_experts and not os.path.isabs(args.routed_experts):
+        args.routed_experts = os.path.join(cwd, args.routed_experts)
+    if args.expert_routing_policy == 'CAPTURED' and not args.routed_experts:
+        parser.error('--expert-routing-policy CAPTURED needs --routed-experts')
 
     args.run_id = resolve_run_id(args.run_id)
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
@@ -880,6 +931,8 @@ def main():
         for i in range(16):
             for sched in schedulers:
                 sched.add_request([i, sched.model, 64, 128, 0, i % num_instances])
+    if args.expert_routing_policy == 'CAPTURED':
+        _check_captured_routing(args, instances, instance_runtime_configs, router)
 
     # Simulator start
     current = 0 # current tick of the system
@@ -1134,13 +1187,16 @@ def main():
                                        dp_sum_total_len=sum_total_len,
                                        dp_min_total_len=min_total_len,
                                        dp_token_counts=tuple(round_batches[m][0].total_len for m in dp_groups[dg]),
+                                       dp_routing_segments=tuple(tuple(round_batches[m][0].routing_segments)
+                                                                 for m in dp_groups[dg]),
                                        dp_rank=dp_rank,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
                                        inputs_root=run_paths.inputs_root,
                                    num_speculative_tokens=(
                                        schedulers[instance_id].spec.N
                                        if schedulers[instance_id].spec else 0),
-                                   gate_stats_path=args.gate_stats)
+                                   gate_stats_path=args.gate_stats,
+                                   routed_experts_path=args.routed_experts)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
@@ -1226,13 +1282,16 @@ def main():
                                            dp_sum_total_len=sum_total_len,
                                            dp_min_total_len=min_total_len,
                                            dp_token_counts=tuple(round_batches[m][0].total_len for m in dp_groups[dg]),
+                                           dp_routing_segments=tuple(tuple(round_batches[m][0].routing_segments)
+                                                                     for m in dp_groups[dg]),
                                            dp_rank=dp_rank,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
                                            inputs_root=run_paths.inputs_root,
                                    num_speculative_tokens=(
                                        schedulers[instance_id].spec.N
                                        if schedulers[instance_id].spec else 0),
-                                   gate_stats_path=args.gate_stats)
+                                   gate_stats_path=args.gate_stats,
+                                   routed_experts_path=args.routed_experts)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
@@ -1281,7 +1340,8 @@ def main():
                                    num_speculative_tokens=(
                                        schedulers[instance_id].spec.N
                                        if schedulers[instance_id].spec else 0),
-                                   gate_stats_path=args.gate_stats)
+                                   gate_stats_path=args.gate_stats,
+                                   routed_experts_path=args.routed_experts)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],

@@ -79,7 +79,10 @@ python -m serving \
   trained gate (deterministic, fast)
 - `RR`: per-token round-robin
 - `RAND`: per-token uniform random (seedable)
-- `CUSTOM`: pluggable in `serving/core/gate_function.py`
+- `CUSTOM`: the measured distinct-expert count from `--gate-stats`, or
+  BALANCED without one
+- `CAPTURED`: replays each request's own routing, recorded by
+  `bench run --record-routed-experts`, from `--routed-experts`
 
 ## Expected output
 

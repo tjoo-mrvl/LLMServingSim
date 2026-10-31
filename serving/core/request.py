@@ -181,6 +181,11 @@ class Batch:
         # rewrites the request's own fields for the step it is building.
         self.scheduled_tokens = None
         self.spec_scheduled = {}
+        # ``(request_id, start, end)``: the token positions each request runs
+        # this step, in batch order. Snapshotted for the same reason -- a later
+        # ``schedule()`` advances the request -- and read only by the CAPTURED
+        # expert routing (``captured_routing``). A DP dummy batch has none.
+        self.routing_segments = []
     def log(self):
         print("-------------------------Batch Log------------------------")
         for key in self.__dict__.keys():

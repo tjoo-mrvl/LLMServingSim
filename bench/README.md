@@ -91,8 +91,10 @@ through vLLM's own `enable_return_routed_experts` capture: one array per
 expert IDs of every token the model processed (dense layers stay zero). It works
 with CUDA graphs and needs Model Runner V2 and prefix caching; vLLM refuses it at
 PP > 1 or with a Nixl P/D connector. Routing depends on the tokens and weights,
-not the deployment, so one capture serves every deployment of the workload.
-`meta.json` records the capture under `routed_experts`.
+up to numerical differences between kernels, rather than the deployment.
+`meta.json` records the capture under `routed_experts`. The simulator replays it
+with `--expert-routing-policy CAPTURED --routed-experts <run dir>` on the same
+dataset and `--num-reqs`.
 
 Simulator examples include local CUDA graph padding before DP synchronization.
 Use per-instance `cudagraph` settings to describe the effective target worker

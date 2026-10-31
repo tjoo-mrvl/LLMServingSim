@@ -68,6 +68,7 @@ serving/                        Python package
 │   ├── controller.py           IPC with ASTRA-Sim subprocess
 │   ├── router.py               request routing across instances
 │   ├── gate_function.py        MoE expert token routing (incl. group-limited)
+│   ├── captured_routing.py     a bench run's captured per-token routing (CAPTURED)
 │   ├── spec_decode.py          speculative-decoding acceptance model
 │   ├── cudagraph.py            target graph capture grid and local/DP forward shapes
 │   ├── config_builder.py       cluster config -> ASTRA-Sim input files
@@ -103,7 +104,7 @@ from one list is visible against the other.
 | **batching** | `--max-num-batched-tokens`, `--max-num-seqs`, `--enable-chunked-prefill`, `--long-prefill-token-threshold`, `--reserve-full-isl`, `--async-scheduling` |
 | **memory** | `--block-size`, `--npu-memory-utilization` |
 | **prefix caching** | `--enable-prefix-caching`; run-wide: `--enable-prefix-sharing`, `--prefix-storage` |
-| **routing** *(run-wide)* | `--request-routing-policy`, `--expert-routing-policy`, `--gate-stats` |
+| **routing** *(run-wide)* | `--request-routing-policy`, `--expert-routing-policy`, `--gate-stats`, `--routed-experts` |
 | **speculative decoding** | `--num-speculative-tokens`, `--spec-acceptance-rate`, `--spec-acceptance-policy` |
 | **offloading** | `--enable-attn-offloading`, `--enable-sub-batch-interleaving`, `--enable-local-offloading` |
 | **trace / graph** | `--enable-block-copy`; run-wide: `--save-trace-text`, `--keep-inputs` |
@@ -353,14 +354,25 @@ Handles request transfer in Prefill/Decode disaggregation mode.
 
 ### `gate_function.py`
 
-Routes tokens to MoE experts with `BALANCED` (default), `RR`, `RAND`, or
-`CUSTOM`. Block copy is a separate optimization. `route_ep()` returns
+Routes tokens to MoE experts with `BALANCED` (default), `RR`, `RAND`,
+`CUSTOM` or `CAPTURED`. Block copy is a separate optimization, which
+`CAPTURED` turns off. `route_ep()` returns
 global EP-rank vectors; each DP member reads its own slice using its position
 within the DP group, not its instance ID. `EXPERT {i}` trace markers remain
 local to the instance. See the [routing contract](../docs/docs/simulator/moe-expert-routing.md).
 RR advances through the gathered batch's token positions without restarting
 at each synthetic source partition. It is deterministic at a fixed shape;
 RAND retains its seeded draws, while BALANCED retains its analytical counts.
+
+### `captured_routing.py`
+
+Loads the `routed_experts.npz` that `bench run --record-routed-experts` writes
+and serves `--expert-routing-policy CAPTURED`. Simulated request `i` replays
+`bench-i`, the dataset's row `i`: at each MoE layer, the scheduler's snapshotted
+`Batch.routing_segments` select the token positions that step runs. Startup
+checks the capture against the model and every request's row count, so a
+different dataset or `--num-reqs` is refused. Padding rows carry no captured
+routing; see the [routing contract](../docs/docs/simulator/moe-expert-routing.md).
 
 ### `spec_decode.py`
 

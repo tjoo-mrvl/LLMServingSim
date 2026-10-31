@@ -2086,9 +2086,10 @@ CLI flags follow vLLM naming where applicable:
 - `--skip-prefill` — legacy first-token bookkeeping flag; it does not skip
   prompt computation or prepare cached KV and is not a decode-only generator
 - `--request-routing-policy` (`LOAD`, `RR`, `RAND`, `CUSTOM`) — request routing across instances
-- `--expert-routing-policy` (`BALANCED`, `RR`, `RAND`, `CUSTOM`) — expert token routing for MoE.
+- `--expert-routing-policy` (`BALANCED`, `RR`, `RAND`, `CUSTOM`, `CAPTURED`) — expert token routing for MoE.
   `CUSTOM` reads the measured distinct-expert count from `--gate-stats` rather than
-  deriving it from a uniform gate; see the gate-stats section
+  deriving it from a uniform gate; see the gate-stats section. `CAPTURED` replays
+  each request's own routing from `--routed-experts` and turns block copy off
   (block-copy optimization is controlled separately via `--enable-block-copy`, default on)
 - Reversible boolean flags use `argparse.BooleanOptionalAction` (e.g.,
   `--enable-prefix-caching` / `--no-enable-prefix-caching`). Opt-in `store_true`
@@ -2377,7 +2378,29 @@ file after shutdown, so no I/O delays the arrival-pacing loop. It works with
 CUDA graphs (A10G: identical to eager for every token tested) and is not marked
 diagnostic: an A10G on/off A/B moved mean latencies by under 1%, inside
 run-to-run noise. Recheck that on the target hardware. Routing depends on the
-tokens and weights, so one capture serves every deployment of the workload.
+tokens and weights, up to numerical differences between kernels, so one capture
+can serve other deployments of the same model and workload.
+
+`--expert-routing-policy CAPTURED --routed-experts <run dir or .npz>` replays
+it (`serving/core/captured_routing.py`). Simulated request *i* is dataset row
+*i*, as `bench-i` is. Each MoE layer routes the positions its step schedules
+(`Batch.routing_segments`, snapshotted like `scheduled_tokens`), and a DP+EP
+round routes every member's. Per-rank assignments and distinct experts are
+counted from those rows, as RR/RAND count their draws, so native tables need
+independent N/A/M support; balanced-total tables fall back to legacy. Every
+layer routes differently, so block copy is off. Startup refuses a capture whose
+shape or per-request row counts differ from the dataset, agentic sessions, and
+speculative decoding or sub-batch interleaving on MoE instances.
+
+Padding rows are never captured and are charged no assignments; the other
+policies route the padded count. That matches vLLM 0.31's fused top-k routers,
+which give padding rows expert -1 (`VLLM_MOE_SKIP_PADDING`, on by default).
+Its grouped top-k router (DeepSeek/GLM) masks them only with DeepEP v2
+kernels, so on the modeled allgather_reducescatter backend their padding rows
+route to experts the capture does not record, and that work goes uncharged.
+A placement with fewer remote experts than top-k (EP1) has no measured row
+without a local assignment, so its expert lookup prices the routed rows
+instead of the padded count.
 
 ### MoE dispatch/combine and TP restoration
 
@@ -3158,8 +3181,9 @@ PP 1. Add those scenarios with the first TP > 1 MLA bundle. No shipped native
 MoE table has a shared expert or FP8 experts either, so serving's
 `shared_experts` charge and its FP8 table loading are unguarded too, as are
 the DeepSeek-V3/R1 catalog's rows (`mla_q_b_proj`, `mla_glue`, and `kv_b_proj`'s
-weight on `attention`), because no scenario runs R1. Add scenarios that move
-when any of these is reverted with the first DeepSeek-R1 bundle.
+weight on `attention`), because no scenario runs R1, and CAPTURED routing,
+because no scenario carries a capture. Add scenarios that move when any of
+these is reverted with the first DeepSeek-R1 bundle and its bench capture.
 
 ## Common Pitfalls
 

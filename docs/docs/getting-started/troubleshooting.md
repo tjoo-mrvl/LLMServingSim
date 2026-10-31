@@ -279,7 +279,8 @@ especially with MoE + EP or large prefix caches.
   on (the default) to reuse rows for matching block/site sequences.
   This is exact for deterministic BALANCED/RR routing at a fixed batch shape.
   RAND reuses a draw and suppresses per-layer variation; turn copying off when
-  that variation matters. Contextual profiles disable copying.
+  that variation matters. Contextual profiles and CAPTURED routing disable
+  copying.
 - **Verbose logging.** `--log-level DEBUG` writes a lot. Drop to
   `--log-level INFO` or `WARNING`.
 - **`--log-interval` too small.** Setting it to `0.1` makes the

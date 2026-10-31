@@ -49,15 +49,25 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   overlaps the shared expert. No shipped bundle has such a table yet; its
   regression scenario will come with the first DeepSeek-R1 bundle. See
   [Native MoE components → Shared experts](https://llmservingsim.ai/docs/profiler/native-moe-components#shared-experts-on-the-modular-path).
-- `bench run --record-routed-experts` (`RECORD_ROUTED_EXPERTS=1` in
+- Per-request expert routing, recorded on the bench and replayed by the
+  simulator. `bench run --record-routed-experts` (`RECORD_ROUTED_EXPERTS=1` in
   `bench.sh`) saves every request's routing to `routed_experts.npz`: the top-k
   expert IDs of each processed token at every layer, keyed by `request_id`,
   through vLLM's own `enable_return_routed_experts` capture. It needs no source
   patch and works with CUDA graphs; vLLM requires Model Runner V2 and prefix
   caching and refuses it at PP > 1 or with Nixl P/D. `meta.json` describes the
   capture. Runs stay usable as latency references; an A10G test moved mean
-  latencies by under 1%, and the docs advise rechecking on the target. See
-  [Bench CLI](https://llmservingsim.ai/docs/reference/bench-cli).
+  latencies by under 1%, and the docs advise rechecking on the target.
+  `--expert-routing-policy CAPTURED --routed-experts <run dir>` replays it: each
+  MoE layer routes the token positions its step schedules (every member's in a
+  DP+EP round), with block copy off. A capture that does not match the dataset
+  and `--num-reqs` is refused at startup, as are agentic sessions and
+  speculative decoding or sub-batch interleaving on MoE instances. Padding rows
+  carry no captured routing; vLLM's grouped top-k router (DeepSeek/GLM) still
+  routes them on the modeled backend, and that work is not charged. No
+  regression scenario carries a capture yet; one will come with the first
+  DeepSeek-R1 bundle. See [Bench CLI](https://llmservingsim.ai/docs/reference/bench-cli)
+  and [MoE expert routing → CAPTURED](https://llmservingsim.ai/docs/simulator/moe-expert-routing#captured-the-workloads-own-routing).
 
 ### Changed
 

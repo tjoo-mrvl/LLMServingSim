@@ -15,7 +15,7 @@ With a matching native profile installed, the component consumer uses
 the recorded rank placement. New tables query input rows, distinct active local
 experts and local token-expert assignments from `GateRouter.route_ep(native=True)`.
 BALANCED/CUSTOM retain rounded expected assignment totals; RR/RAND count actual
-selected pairs. Equal coordinates do not imply equal within-rank histograms;
+selected pairs, and CAPTURED the captured pairs of the scheduled tokens. Equal coordinates do not imply equal within-rank histograms;
 that remaining imbalance is approximated by the balanced profiling stimulus. See
 [Native MoE components](../profiler/native-moe-components) for local/gathered
 token domains, supported policies and warnings. The legacy whole-block
@@ -37,7 +37,7 @@ router = GateRouter(
     node_id=0, instance_id=0,
     num_local_experts=N,           # total experts in the model
     num_experts_per_tok=K,         # top-K activations per token
-    routing_policy='BALANCED',     # one of 4 policies, see below
+    routing_policy='BALANCED',     # one of 5 policies, see below
     seed=42,
     block_copy=True,
 )
@@ -58,7 +58,7 @@ historical whole-block callers retain the default mapping.
 The source-token split in this routing result is
 synthetic; actual DP communication sizes come from the scheduled DP round.
 
-## Four policies
+## Five policies
 
 ```mermaid
 flowchart LR
@@ -74,6 +74,9 @@ flowchart LR
     subgraph CST["CUSTOM"]
         TC["8 tokens"] --> ASC["the count a real<br/>gate was measured<br/>to reach"]
     end
+    subgraph CAP["CAPTURED"]
+        TP["8 tokens"] --> ASP["the experts each<br/>of these tokens chose<br/>in a recorded run"]
+    end
 ```
 
 | Policy | Determinism | What it models | When to use |
@@ -82,6 +85,7 @@ flowchart LR
 | **RR** | Deterministic | Pure round-robin assignment | Sanity / null-baseline runs |
 | **RAND** | Seeded random | Uniform random per token | Variation under a uniform gate assumption |
 | **CUSTOM** | Deterministic | The **measured** distinct-expert count of a real trained gate | Comparing against a real vLLM run |
+| **CAPTURED** | Deterministic | The **captured** per-token routing of the replayed workload | Replaying the exact dataset of a recorded vLLM run |
 
 ### BALANCED, closed-form pigeonhole
 
@@ -177,6 +181,58 @@ grouped-GEMM kernel selection. Forced uniform routing therefore does not hold
 everything except the distinct count fixed. Observe counts on the target
 workload, retain their scope and validate latency on an uninstrumented run;
 a count curve alone does not establish the accuracy of an MoE latency table.
+:::
+
+### CAPTURED, the workload's own routing
+
+CUSTOM keeps one count curve for a whole workload. CAPTURED replays what the
+gate chose, token by token and layer by layer. Record it with
+[`bench run --record-routed-experts`](/docs/reference/bench-cli), which turns
+on vLLM's own routed-experts capture and writes `routed_experts.npz` into the
+run directory, then replay the **same dataset and `--num-reqs`**:
+
+```bash
+python -m serving \
+  --cluster-config configs/cluster/single_node_moe_dp_ep_instance.json \
+  --dataset workloads/sharegpt-qwen3-30b-a3b-300-sps10.jsonl \
+  --expert-routing-policy CAPTURED \
+  --routed-experts bench/results/<run_id>
+```
+
+Benchmark request `bench-i` is dataset row `i`, and so is simulated request
+`i`. At each MoE layer of a step, the routed tokens are the positions that step
+schedules for each request: a prefill chunk's positions, or one position per
+decode. A DP+EP round routes every member's positions, since every rank's
+experts run the gathered rows. Each rank's distinct active experts and
+token-expert assignments are counted from those rows. New native component
+tables, which measure assignments independently, price them directly;
+balanced-total tables fall back to the legacy table, as they do for RR/RAND.
+Every layer routes differently, so CAPTURED turns `block_copy` off.
+
+The replay is refused at startup when it cannot be exact:
+
+- The capture's layer count, top-k or expert IDs do not fit the model, or a
+  request's captured row count differs from its prompt plus output minus one
+  (the last sampled token never enters the model). A different dataset or
+  `--num-reqs` fails here.
+- The dataset has agentic sessions (the bench replays flat datasets), or a MoE
+  instance uses speculative decoding (draft tokens are never captured) or
+  sub-batch interleaving.
+
+Routing depends on the tokens and the weights, up to numerical differences
+between kernels, so a capture recorded on one deployment can drive a
+simulation of another deployment of the same model and workload.
+
+:::note[Padding rows carry no captured routing]
+CUDA-graph padding rows and a DP dummy step's rows are never captured, and
+CAPTURED charges them no expert assignments; the other policies route the
+padded count. That matches vLLM 0.31's fused top-k routers, which give padding
+rows expert `-1` (`VLLM_MOE_SKIP_PADDING`, on by default). Its grouped top-k
+router (DeepSeek/GLM) masks them only with DeepEP v2 kernels, so on the modeled
+all-gather/reduce-scatter backend their padding rows reach experts the capture
+does not record, and that work is not charged. At EP1 every expert is local and
+the measured table has no row without a local assignment, so there the expert
+lookup prices the routed rows instead of the padded count.
 :::
 
 ## Group-limited routing
@@ -279,6 +335,9 @@ It's an **approximation** for:
   the batch's token count, so `block_copy` is exact for it, as it is
   for BALANCED.
 
+CAPTURED turns block copy off by itself: every layer replays its own captured
+rows, so a block built for one layer cannot stand in for another.
+
 For research where per-block variance matters, set
 `--no-enable-block-copy` on the simulator. Trace generation runs more slowly and
 every layer is built from its own router draw.
@@ -373,7 +432,9 @@ for the padded row domains and measured coverage limits.
    but won't match the real model's behavior.
 5. **Dummy batches in DP groups still route through the gate.**
    1-token dummy batches go through routing exactly like real
-   batches, so DP+EP results are consistent across waves.
+   batches, so DP+EP results are consistent across waves. Under
+   CAPTURED a dummy step has no captured rows: it adds gathered rows
+   but no expert assignments.
 
 ## What's next
 

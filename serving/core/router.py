@@ -220,6 +220,10 @@ class Router:
 
         return routed
 
+    def loaded_requests(self):
+        """The loaded request rows, in arrival order; read-only."""
+        return tuple(self._pending_requests)
+
     def has_pending_requests(self):
         """Check if there are unrouted requests remaining."""
         return self._pending_idx < len(self._pending_requests)
