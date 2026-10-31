@@ -15,6 +15,8 @@
 #     OUTPUT_SUBDIR=validation
 #     TITLE="vLLM vs LLMServingSim"
 #     LOG_LEVEL=INFO
+#     CLUSTER_CONFIG=configs/cluster/...json   # profile bundles for the kernel
+#                                              # check (default: sim log header)
 
 set -euo pipefail
 
@@ -30,6 +32,7 @@ PREFIX="${4:-}"
 OUTPUT_SUBDIR="${OUTPUT_SUBDIR:-validation}"
 TITLE="${TITLE:-vLLM vs LLMServingSim}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
+CLUSTER_CONFIG="${CLUSTER_CONFIG:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -44,6 +47,7 @@ cmd=(python3 -m bench validate
     --log-level "$LOG_LEVEL"
 )
 [[ -n "$PREFIX" ]] && cmd+=(--prefix "$PREFIX")
+[[ -n "$CLUSTER_CONFIG" ]] && cmd+=(--cluster-config "$CLUSTER_CONFIG")
 
 echo "Running: ${cmd[*]}"
 "${cmd[@]}"

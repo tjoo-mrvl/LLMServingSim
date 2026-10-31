@@ -37,6 +37,11 @@ class Extension:
         from .sampling_runtime import snapshot
         return snapshot(self)
 
+    def kernel_backends(self):
+        """The loaded model's attention backends and MoE kernel classes."""
+        from .kernel_backends import snapshot
+        return snapshot(self.model_runner)
+
     def native_profile_admission(self, architecture, descriptor):
         from profiler.core.callable_profile import profile_for
         profile = profile_for(architecture)

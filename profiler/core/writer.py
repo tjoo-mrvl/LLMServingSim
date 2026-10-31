@@ -1074,6 +1074,10 @@ def _engine_resolved_block(
     model directory is deleted, including consumed nested overrides. It is
     not a complete wrapper, backend or weight-layout description. Missing
     snapshots in older limits/metadata remain missing, never reconstructed.
+
+    ``attention_backends`` lists each attention-like layer class with the
+    backend it resolved to on this engine; ``bench validate`` compares it
+    with a benchmark's own record. It is provenance, never a lookup input.
     """
     prior = _prior_meta(variant_root)
     prior_block = prior.get("engine_resolved")
@@ -1102,6 +1106,9 @@ def _engine_resolved_block(
         preparation = getattr(limits, "dummy_weight_preparation", None)
         if preparation is not None:
             resolved["dummy_weight_preparation"] = preparation
+        attention_backends = getattr(limits, "attention_backends", None)
+        if attention_backends is not None:
+            resolved["attention_backends"] = attention_backends
         merged[str(tp)] = _stringify(resolved)
     return {"per_tp": dict(sorted(merged.items(), key=lambda kv: int(kv[0])))} if merged else None
 

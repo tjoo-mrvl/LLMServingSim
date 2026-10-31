@@ -69,6 +69,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   DeepSeek-R1 bundle. See [Bench CLI](https://llmservingsim.ai/docs/reference/bench-cli)
   and [MoE expert routing → CAPTURED](https://llmservingsim.ai/docs/simulator/moe-expert-routing#captured-the-workloads-own-routing).
 
+- Kernel records on both sides of a benchmark comparison. `bench run` records
+  `kernels` in `meta.json`: each attention-like layer class with the backend it
+  resolved to, and each MoE layer's quant method, experts and prepare/finalize
+  classes. New profiles record `attention_backends` per TP under
+  `engine_resolved`. `bench validate` compares them for every bundle in the
+  cluster config (`--cluster-config`, by default the sim log's header) and
+  warns when the benchmark ran other attention backends or MoE experts than the
+  profile measured; plots and summaries are unchanged. Older runs and bundles
+  are skipped. See
+  [Bench CLI → Kernel check](https://llmservingsim.ai/docs/reference/bench-cli#kernel-check).
+
 ### Changed
 
 - The DeepSeek-R1 cluster configs (`configs/cluster/deepseek_r1_*.json`) state

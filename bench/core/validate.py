@@ -36,6 +36,11 @@ def register_args(p: argparse.ArgumentParser) -> None:
                    help="Simulator per-request CSV output.")
     p.add_argument("--sim-log", required=True, dest="sim_log",
                    help="Simulator log (parsed for per-tick running/waiting).")
+    p.add_argument("--cluster-config", default=None, dest="cluster_config",
+                   help="Cluster config the simulation ran. It names the "
+                        "profile bundles whose recorded kernels are compared "
+                        "with the bench run's; a difference only warns. "
+                        "Default: the path in the sim log's header.")
     p.add_argument("--output-subdir", default="validation",
                    dest="output_subdir",
                    help="Subdirectory under bench-dir to write plots/summary "
@@ -81,6 +86,8 @@ def run(args: argparse.Namespace) -> int:
         sim_ttft, sim_tpot, sim_lat = _sim_latencies(sim_reqs)
     log.info("sim:   %d requests, %d timeseries rows",
              len(sim_reqs), len(sim_ts))
+    _check_kernels(bench_dir, args.cluster_config
+                   or _sim_log_cluster_config(Path(args.sim_log)))
 
     # ------------------------------------------------------------------
     # Plot + summary.
@@ -118,6 +125,119 @@ def run(args: argparse.Namespace) -> int:
     log.success("Wrote plots + summary -> %s", output_dir)
     log.info("Summary: %s", summary_path)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Kernel check
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CLUSTER_CONFIG_LINE = re.compile(r"Cluster config\s*:\s*(\S+)")
+
+
+def _sim_log_cluster_config(path: Path) -> str | None:
+    """The cluster config path the simulator printed in its log header."""
+    try:
+        with path.open() as stream:
+            for _, line in zip(range(40), stream):
+                match = _CLUSTER_CONFIG_LINE.search(line)
+                if match:
+                    return match.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def _short(name: str | None) -> str | None:
+    # Compare class names, not module paths, which can move between versions.
+    return None if name is None else name.rsplit(".", 1)[-1]
+
+
+def _check_kernels(bench_dir: Path, cluster_config: str | None) -> None:
+    """Warn when the bench ran other kernels than the profile measured.
+
+    The bench's ``kernels`` record (meta.json, written by
+    ``execution_metadata.capture_kernels``) is compared with the profile
+    bundle of every (hardware, model) in the cluster config: the backend of
+    each attention-like layer class at the bench's TP
+    (``engine_resolved.per_tp``, written by the profiler's ``probe_limits``),
+    and the experts class of every native MoE contract for the bench's
+    TP/DP/EP. A difference means the simulated latencies describe kernels the
+    benchmark did not run. It only warns: nothing below changes.
+    """
+    meta_path = bench_dir / "meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    kernels = meta.get("kernels") or {}
+    if kernels.get("status") != "observed":
+        log.info("Kernel check skipped: the bench run records no kernels (%s)",
+                 kernels.get("reason", "recorded before they existed"))
+        return
+    if not cluster_config or not Path(cluster_config).is_file():
+        log.info("Kernel check skipped: no cluster config found; pass --cluster-config")
+        return
+    engine = meta.get("engine_kwargs") or {}
+    tp = int(engine.get("tensor_parallel_size") or 1)
+    dp = int(engine.get("data_parallel_size") or 1)
+    ep = tp * dp if engine.get("enable_expert_parallel") else 1
+    cluster = json.loads(Path(cluster_config).read_text())
+    bundles = sorted({(inst["hardware"], inst["model_name"])
+                      for node in cluster.get("nodes", [])
+                      for inst in node.get("instances", [])})
+    for hardware, model in bundles:
+        _check_bundle_kernels(kernels, hardware, model, tp, dp, ep)
+
+
+def _per_tp(block: dict, tp: int) -> dict:
+    # meta.yaml keys a TP as an integer or a string, depending on the writer.
+    per_tp = (block or {}).get("per_tp") or {}
+    return per_tp.get(tp, per_tp.get(str(tp))) or {}
+
+
+def _check_bundle_kernels(kernels: dict, hardware: str, model: str,
+                          tp: int, dp: int, ep: int) -> None:
+    # The bundle the simulator reads for this model (trace_generator._load_perf_db).
+    from profiler.core.bundle_metadata import read_bundle
+    from serving.core.trace_generator import resolve_variant
+    from serving.core.utils import get_config
+
+    label = f"{hardware}/{model}"
+    root = _REPO_ROOT / "profiler" / "perf" / hardware / model / resolve_variant(get_config(model))
+    if not (root / "meta.yaml").is_file():
+        log.info("Kernel check skipped for %s: no profile at %s", label, root)
+        return
+    profile = read_bundle(root)
+
+    # Draft layers belong to a speculator the profile's main engine never builds.
+    ran = {(_short(e["layer"]), e["backend"]) for e in kernels.get("attention", [])
+           if not e.get("draft")}
+    recorded = _per_tp(profile.get("engine_resolved"), tp).get("attention_backends")
+    if recorded is None:
+        log.info("Kernel check: %s records no attention backends at TP=%d", label, tp)
+    else:
+        measured = {(_short(e["layer"]), e["backend"]) for e in recorded if not e.get("draft")}
+        if ran != measured:
+            log.warning("Attention backends differ for %s at TP=%d: the bench ran %s, the "
+                        "profile measured %s. The simulated attention latencies describe "
+                        "other kernels.", label, tp,
+                        ", ".join(f"{l}={b}" for l, b in sorted(ran)) or "none",
+                        ", ".join(f"{l}={b}" for l, b in sorted(measured)) or "none")
+
+    ran = {_short(e.get("experts")) for e in kernels.get("moe", [])}
+    if not ran:
+        return
+    entries = (_per_tp(profile, tp).get("moe_components") or {}).get("entries") or []
+    measured = {_short(entry["contract"]["expert_region"]["expert_class"])
+                for entry in entries
+                if (entry["contract"]["target"]["tp"], entry["contract"]["target"]["dp"],
+                    entry["contract"]["target"]["ep"]) == (tp, dp, ep)}
+    if not measured:
+        log.info("Kernel check: %s has no native MoE contract for TP=%d DP=%d EP=%d",
+                 label, tp, dp, ep)
+    elif ran != measured:
+        log.warning("MoE experts differ for %s at TP=%d DP=%d EP=%d: the bench ran %s, the "
+                    "profile measured %s. The simulated MoE latencies describe other "
+                    "kernels.", label, tp, dp, ep,
+                    ", ".join(sorted(map(str, ran))), ", ".join(sorted(measured)))
 
 
 # ---------------------------------------------------------------------------

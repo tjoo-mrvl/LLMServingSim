@@ -92,7 +92,10 @@ converted from wall-clock epoch seconds to the engine's monotonic domain using
 the run's minimum `queued_ts - arrival_time` offset. Raw timestamps from those
 two domains cannot be subtracted directly. Using `queued_ts` as the arrival
 instead would omit frontend-to-engine waiting from TTFT; legacy records use the
-validator's documented fallback when arrival information is missing.
+validator's documented fallback when arrival information is missing. For runs
+that record their kernels, it first warns when the benchmark ran other attention
+backends or MoE experts than the profile measured; see the
+[kernel check](/docs/reference/bench-cli#kernel-check).
 
 | Metric | Definition in the aligned clock domain |
 | --- | --- |

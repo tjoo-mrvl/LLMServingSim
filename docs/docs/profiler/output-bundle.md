@@ -1011,6 +1011,16 @@ including reduced depth, per-rank fields and consumed nested overrides. The
 snapshot survives deletion of the temporary config directory. It is not the
 multimodal wrapper config, backend selection or a parameter-layout inventory.
 
+New main-engine records also include `attention_backends`: each attention-like
+layer class the engine built (`MLAAttention`, `Attention`, Mamba-style layers)
+with the backend it resolved to, such as `TRITON_MLA` or `FLASHMLA`. It is read
+once from the loaded model and is provenance only; the simulator never reads it.
+[`bench validate`](/docs/reference/bench-cli#kernel-check) compares it with a
+benchmark's own record to flag a run whose attention kernels differ from the
+measured ones. The profile's MoE kernels are recorded per deployment in each
+native component contract (`expert_region.expert_class`) instead, because the
+main engine's own MoE kernel is not the one a distributed target was timed with.
+
 A refresh updates only the recorded TP entries. MTP and non-authoritative
 short-stack engines do not replace main-engine snapshots. Older limits and
 metadata without a snapshot keep that absence; missing values are not

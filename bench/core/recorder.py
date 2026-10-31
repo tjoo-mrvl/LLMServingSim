@@ -56,8 +56,14 @@ def write_meta(output_dir: Path, **fields: Any) -> None:
         ``num_gpu_blocks``) settled. Produced by walking the config's own field
         list, so a vLLM upgrade that adds a knob appears here without a change
         here. Values that are not JSON scalars are replaced by a short type tag.
+    ``kernels``
+        What the workers' models hold, read once at startup: each attention-like
+        layer class with the backend it resolved to, and each MoE layer's quant
+        method, experts and prepare/finalize classes, unique across layers and
+        workers. ``status`` is ``unknown`` with a ``reason`` when any worker
+        could not be read. ``bench validate`` compares it with the profile.
 
-    These three are absent from runs recorded before they existed, and can be
+    These are absent from runs recorded before they existed, and can be
     ``{}`` if collection failed, so read them with ``meta.get(...)`` rather than
     keying off ``schema_version``. The version is bumped only when an existing
     field changes meaning or disappears -- adding keys does not break a reader.

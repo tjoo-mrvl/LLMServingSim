@@ -100,6 +100,10 @@ class RuntimeLimits:
     # Read-only acquisition runtime facts; neither an eager graph mode nor
     # proof that the full serving model completed graph capture.
     sampling_runtime: dict[str, Any] | None = None
+    # The attention backend each attention-like layer class resolved to
+    # (hooks/kernel_backends.py), for ``bench validate`` to compare with a
+    # benchmark's. None when the snapshot was unavailable.
+    attention_backends: list[dict[str, Any]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +544,13 @@ def probe_limits(llm: LLM, args: ProfileArgs | None = None) -> RuntimeLimits:
     engine_msq = cfg.scheduler_config.max_num_seqs
     logical_mnbt = engine_mnbt - engine_msq
     sampling_runtime = llm.collective_rpc('sampling_runtime')[0]
+    # Provenance only: an unreadable snapshot is recorded as unknown rather
+    # than stopping an acquisition whose measurements do not depend on it.
+    try:
+        attention_backends = llm.collective_rpc('kernel_backends')[0]['attention']
+    except Exception as exc:
+        log.warning("attention backends not recorded: %s", exc)
+        attention_backends = None
 
     return RuntimeLimits(
         max_num_batched_tokens=logical_mnbt,
@@ -554,6 +565,7 @@ def probe_limits(llm: LLM, args: ProfileArgs | None = None) -> RuntimeLimits:
         model_text_config=copy.deepcopy(cfg_dict),
         dummy_weight_preparation=copy.deepcopy(getattr(llm, "_profiler_dummy_weight_preparation", None)),
         sampling_runtime=sampling_runtime,
+        attention_backends=attention_backends,
     )
 
 

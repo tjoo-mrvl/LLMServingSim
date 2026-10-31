@@ -9,6 +9,18 @@ class ExecutionObserver:
         except Exception as exc:
             return {'status': 'unknown', 'reason': f'{type(exc).__name__}: {exc}'}
 
+    def serving_kernel_snapshot(self):
+        """The model's attention backends and MoE kernel classes, read once.
+
+        Independent of the graph observation above, which refuses runners and
+        features it does not model: the kernels are worth recording anyway.
+        """
+        try:
+            from profiler.core.hooks.kernel_backends import snapshot
+            return dict(status='observed', **snapshot(self.model_runner))
+        except Exception as exc:
+            return {'status': 'unknown', 'reason': f'{type(exc).__name__}: {exc}'}
+
 
 def snapshot_worker(worker, declared_config=None):
     from profiler.core.execution_metadata import (
@@ -101,9 +113,32 @@ def snapshot_worker(worker, declared_config=None):
     return validate_execution(record)
 
 
+async def _every_worker(engine, method, args=()):
+    """Call a worker method on every worker of every DP engine."""
+    import asyncio
+    client = getattr(engine, 'engine_core', None)
+    identities = getattr(client, 'core_engines', None)
+    call_one = getattr(client, '_call_utility_async', None)
+    if isinstance(identities, (list, tuple)) and len(identities) > 1 and callable(call_one):
+        # The load-balancing client's public collective RPC invokes every
+        # DP engine but returns only the first engine's result. Preserve
+        # each result here; both callers still require global coverage,
+        # so a client managing only some DP engines cannot claim success.
+        workers = await asyncio.gather(*(
+            call_one('collective_rpc', method, 30, args, {}, engine=identity)
+            for identity in tuple(identities)
+        ), return_exceptions=True)
+        for result in workers:
+            if isinstance(result, BaseException):
+                raise result
+        return workers
+    # Single-engine and unsupported client implementations retain the
+    # public API. Partial DP responses fail the same coverage checks.
+    return await engine.collective_rpc(method, timeout=30, args=args)
+
+
 async def capture_execution(engine):
     """Unsupported observations remain unknown without failing a benchmark."""
-    import asyncio
     import json
     from pathlib import Path
     from profiler.core.execution_metadata import merge_workers
@@ -120,26 +155,45 @@ async def capture_execution(engine):
                 if path.is_file():
                     args = (json.loads(path.read_text()),)
                     break
-        client = getattr(engine, 'engine_core', None)
-        identities = getattr(client, 'core_engines', None)
-        call_one = getattr(client, '_call_utility_async', None)
-        if isinstance(identities, (list, tuple)) and len(identities) > 1 and callable(call_one):
-            # The load-balancing client's public collective RPC invokes every
-            # DP engine but returns only the first engine's result. Preserve
-            # each result here; merge_workers still requires global coverage,
-            # so a client managing only some DP engines cannot claim success.
-            workers = await asyncio.gather(*(
-                call_one('collective_rpc', 'serving_execution_snapshot', 30, args, {},
-                         engine=identity)
-                for identity in tuple(identities)
-            ), return_exceptions=True)
-            for result in workers:
-                if isinstance(result, BaseException):
-                    raise result
-        else:
-            # Single-engine and unsupported client implementations retain the
-            # public API. Partial DP responses fail the same coverage checks.
-            workers = await engine.collective_rpc('serving_execution_snapshot', timeout=30, args=args)
+        workers = await _every_worker(engine, 'serving_execution_snapshot', args)
         return merge_workers(workers)
+    except Exception as exc:
+        return {'status': 'unknown', 'reason': f'{type(exc).__name__}: {exc}'}
+
+
+async def capture_kernels(engine):
+    """Every worker's attention backends and MoE kernels, as one record.
+
+    ``bench validate`` compares it with the profile the simulation read. A
+    worker that could not be read leaves the whole record unknown, and so does
+    a DP client that returns fewer workers than the deployment has.
+    """
+    try:
+        workers = []
+        def flatten(value):
+            # A DP client answers once per engine, each with its workers' list.
+            if isinstance(value, list):
+                for item in value:
+                    flatten(item)
+            elif isinstance(value, dict):
+                workers.append(value)
+            else:
+                raise ValueError('Unexpected worker kernel response')
+        flatten(await _every_worker(engine, 'serving_kernel_snapshot'))
+        parallel = engine.vllm_config.parallel_config
+        expected = (parallel.tensor_parallel_size * parallel.pipeline_parallel_size
+                    * parallel.data_parallel_size)
+        if len(workers) != expected:
+            raise ValueError(f'{len(workers)} of {expected} workers answered')
+        for worker in workers:
+            if worker.get('status') != 'observed':
+                return worker
+        attention, moe = set(), set()
+        for worker in workers:
+            attention.update(tuple(sorted(entry.items())) for entry in worker['attention'])
+            moe.update(tuple(sorted(entry.items())) for entry in worker['moe'])
+        return dict(status='observed', workers=len(workers),
+                    attention=sorted((dict(entry) for entry in attention), key=str),
+                    moe=sorted((dict(entry) for entry in moe), key=str))
     except Exception as exc:
         return {'status': 'unknown', 'reason': f'{type(exc).__name__}: {exc}'}

@@ -63,6 +63,7 @@ profiler/                          Python package: python -m profiler
 │       ├── callable_scopes.py     declared function/method ownership and restoration
 │       ├── recurrent_metadata.py  recurrent query/history and state-page checks
 │       ├── attention_lookup.py    inspect selected native sparse backend and storage
+│       ├── kernel_backends.py     attention backends and MoE kernels a model holds
 │       ├── runtime_admission.py   explicit native runtime/configuration admission
 │       ├── tp_shape.py            native config and TP head-width preservation
 │       ├── cache_pages.py         shared physical KV page allocation
@@ -997,6 +998,11 @@ batch.
   short-stack refreshes preserve the main engine's entry; older records without
   a snapshot remain valid but do not gain invented fields. This is not a complete
   wrapper, backend or parameter-layout record.
+
+  New main-engine records also list `attention_backends`: each attention-like
+  layer class with the backend it resolved to. The simulator ignores it;
+  `bench validate` compares it with a benchmark's `kernels` record and warns
+  when they differ. MoE kernels stay in each native component contract.
 
 - `attention_grid` — the 4D attention sweep's caps (`max_kv`),
   geometric factors (`chunk_factor`, `kv_factor`), and compact spec

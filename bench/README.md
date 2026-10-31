@@ -180,19 +180,30 @@ summary into a subdirectory of the bench run.
     [prefix]
 ```
 
-`validate.sh` sets `--output-subdir`, `--title` and `--log-level` from the
-`OUTPUT_SUBDIR` / `TITLE` / `LOG_LEVEL` environment variables. The module
-itself takes all seven directly:
+`validate.sh` sets `--output-subdir`, `--title`, `--log-level` and
+`--cluster-config` from the `OUTPUT_SUBDIR` / `TITLE` / `LOG_LEVEL` /
+`CLUSTER_CONFIG` environment variables. The module itself takes all eight
+directly:
 
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--bench-dir` | required | a finished `bench run` output directory |
 | `--sim-csv` | required | simulator `--output` CSV |
 | `--sim-log` | required | simulator stdout, parsed for per-tick running / waiting |
+| `--cluster-config` | the sim log's `Cluster config` line | cluster config the simulation ran; names the profile bundles for the kernel check |
 | `--output-subdir` | `validation` | subdirectory under `--bench-dir` |
 | `--prefix` | `""` | filename prefix for plots and summary |
 | `--title` | `vLLM vs LLMServingSim` | plot title suffix |
 | `--log-level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+
+Before plotting, `bench validate` checks that the simulation's latencies
+describe the kernels the bench ran. For each hardware/model bundle in the
+cluster config it compares the run's `kernels` record with the profile: the
+backend of each attention-like layer class at the run's TP
+(`engine_resolved.per_tp[tp].attention_backends`), and the experts class of
+the native MoE contracts for its TP/DP/EP. A difference is logged as a warning
+and changes no result. Runs and bundles recorded before these fields existed,
+or without a matching native MoE contract, are skipped with an info line.
 
 ## Output schema
 
@@ -223,6 +234,11 @@ The observer runs before workload submission and changes no sampling or graph
 settings. Capture lists are not truncated by the generic metadata serializer.
 Use `profiler import-execution` to copy a compatible serving observation into a
 profile bundle; this does not change its measured CSVs.
+New runs also record `kernels`, read independently of `execution` at the same
+point: each attention-like layer class with the backend it resolved to (draft
+layers marked), and each MoE layer's quant method, experts and prepare/finalize
+classes, unique across layers and workers. A worker that cannot be read leaves
+it `unknown` with a reason. `bench validate` compares it with the profile.
 For new runs, match each simulator instance to its rank in
 `kv_cache.capacity.per_engine` only when `capacity.status` is `complete`.
 The reviewed vLLM 0.31 client sums connected DP engines in the raw

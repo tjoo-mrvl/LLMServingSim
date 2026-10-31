@@ -35,7 +35,7 @@ from bench.core import gate_stats as gate_stats_mod
 from bench.core import logger as log
 from bench.core import recorder
 from bench.core.kv_cache_metadata import ReadyResponseCapture
-from bench.core.execution_metadata import capture_execution
+from bench.core.execution_metadata import capture_execution, capture_kernels
 
 
 # Observe caller overrides without changing vLLM's communication selection.
@@ -332,11 +332,14 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
     started_at = datetime.datetime.utcnow().isoformat() + "Z"
     try:
         execution = await capture_execution(engine)
+        kernels = await capture_kernels(engine)
     except BaseException:
         engine.shutdown()
         raise
     if execution.get('status') != 'observed':
         log.warning('Serving graph observation unavailable: %s', execution.get('reason'))
+    if kernels.get('status') != 'observed':
+        log.warning('Kernel backends unavailable: %s', kernels.get('reason'))
 
     if args.resolve_only:
         # Snapshot before shutdown, with the startup callback already restored.
@@ -360,6 +363,7 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
             hardware=_hardware_facts(),
             resolved_config=resolved_config,
             execution=execution,
+            kernels=kernels,
             resolve_only=True,
         )
         log.success("resolved config only -> %s  (num_gpu_blocks=%s)",
@@ -380,7 +384,8 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
             dataset_path=str(args.dataset), dataset_hash=_hash_file(Path(args.dataset)),
             num_requests=len(requests),
             engine_kwargs=engine_kwargs_for_meta, kv_cache=kv_cache,
-            resolved_config=resolved_config, execution=execution, **observation_meta)
+            resolved_config=resolved_config, execution=execution, kernels=kernels,
+            **observation_meta)
         if gate_log is not None:
             gate_stats_mod.mark_phase(gate_log, "workload_start")
         with log.stage(f"Submitting {len(requests)} requests"):
@@ -421,6 +426,7 @@ async def _drive(args: argparse.Namespace, requests: list[dict], output_dir: Pat
         hardware=_hardware_facts(),
         resolved_config=resolved_config,
         execution=execution,
+        kernels=kernels,
         **observation_meta,
         **capture_meta,
     )

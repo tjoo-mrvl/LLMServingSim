@@ -293,7 +293,11 @@ Recorded engine kwargs are not a complete resolved model configuration.
 as `engine_resolved.per_tp[tp].model_text_config` only for authoritative main
 engines. Preserve other TP entries and MTP/short-stack refresh semantics. This
 text snapshot does not certify the wrapper, backend or parameter layout, and
-missing historical snapshots must not be reconstructed.
+missing historical snapshots must not be reconstructed. It also records
+`attention_backends` (`hooks/kernel_backends.py`: each attention-like layer class
+with its resolved backend) through the `kernel_backends` RPC; an unreadable
+snapshot is recorded as absent with a warning, never a failed acquisition. It is
+provenance for `bench validate`, never a simulator input.
 Ordinary and skew acquisition metadata record resolved geometry and preparation
 semantics. Remeasure wrongly shaped rows, never restamp them as corrected.
 TP-stable replication applies to every catalog, not only coordinated layouts.
@@ -2782,6 +2786,20 @@ when saved observations do not match. Versions are provenance, not execution loc
 Acquisition metadata stays separate: importing graph settings neither changes
 latency CSVs nor certifies eager measurements as graph measurements. Reduced-stack
 diagnostics must not become full-model serving references.
+
+A second read-only RPC records `kernels` in `engine_start.json` and `meta.json`,
+independently of `execution`: the same `hooks/kernel_backends.py` snapshot (each
+attention-like layer class with its backend, draft layers marked; each MoE
+layer's quant method, experts and prepare/finalize classes), merged across every
+worker. Any unreadable worker, or fewer workers than TP x PP x DP, leaves it
+unknown. `bench validate --cluster-config` (default: the sim log's
+`Cluster config` header line) compares it with each listed bundle: attention
+pairs against `engine_resolved.per_tp[tp].attention_backends`, experts classes
+against the native MoE contracts whose target matches the run's TP/DP/EP, class
+names without module paths, draft layers excluded. A difference only warns;
+plots, summaries and their digests are unchanged. The profile side's MoE record
+is each deployment's contract because the main engine's own MoE kernel is not
+the one a distributed target was timed with.
 
 Padding changes model-forward rows, not requests, query/KV lists, decode counts
 or head rows. Keep those domains separate in trace lookup and completion

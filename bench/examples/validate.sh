@@ -42,9 +42,11 @@ validate_example() {
     local vllm_dir="$SCRIPT_DIR/$model_dir/vllm"
     local sim_csv="$SCRIPT_DIR/$model_dir/outputs/sim.csv"
     local sim_log="$SCRIPT_DIR/$model_dir/outputs/sim.log"
+    local config="$SCRIPT_DIR/$model_dir/config.json"
     local vllm_dir_rel
     local sim_csv_rel
     local sim_log_rel
+    local config_rel
 
     [[ -d "$vllm_dir" ]] || { echo "Missing vLLM bench dir: $vllm_dir" >&2; exit 1; }
     [[ -f "$sim_csv" ]] || { echo "Missing sim CSV: $sim_csv" >&2; exit 1; }
@@ -53,12 +55,14 @@ validate_example() {
     vllm_dir_rel="$(repo_relative_path "$vllm_dir")"
     sim_csv_rel="$(repo_relative_path "$sim_csv")"
     sim_log_rel="$(repo_relative_path "$sim_log")"
+    config_rel="$(repo_relative_path "$config")"
 
     local cmd=(
         "$PYTHON" -m bench validate
         --bench-dir "$vllm_dir_rel"
         --sim-csv "$sim_csv_rel"
         --sim-log "$sim_log_rel"
+        --cluster-config "$config_rel"
         --output-subdir "$OUTPUT_SUBDIR"
         --title "$TITLE_PREFIX - $model_dir"
         --log-level "$LOG_LEVEL"

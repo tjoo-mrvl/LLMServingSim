@@ -154,7 +154,9 @@ is not overwritten. Final results require `meta.json`, `requests.jsonl` and
                      CUDA / torch versions), and
                      resolved_config -- the whole VllmConfig, one key
                      per sub-config; execution -- effective worker graph
-                     policy after capture, or unknown with a reason
+                     policy after capture, or unknown with a reason;
+                     kernels -- attention backends and MoE kernel classes
+                     the workers' models hold, or unknown with a reason
   requests.jsonl     per request: request_id, input_toks, output_toks,
                      arrival_time, queued_ts, scheduled_ts,
                      first_token_ts, last_token_ts
@@ -188,6 +190,18 @@ its full list, but a requested list is not evidence of completed worker capture.
 Use [profiler import-execution](/docs/profiler/output-bundle#serving_execution)
 to explicitly attach a compatible observation to a profile bundle. It changes
 neither recorded timings nor the profiler's acquisition mode.
+
+### Kernel metadata
+
+At the same point, a second read-only worker RPC records `kernels`: each
+attention-like layer class (`MLAAttention`, `Attention`, Mamba-style layers)
+with the backend it resolved to, draft layers marked, and each MoE layer's
+quant method, experts class and prepare/finalize class. Entries are unique
+across layers and workers. It is read independently of the graph observation,
+which refuses runners and features it does not model. If any worker cannot be
+read, or the DP client returns fewer workers than the deployment has, the record
+is `unknown` with a reason. `bench validate` compares it with the profile the
+simulation read.
 
 ### KV capacity metadata
 
@@ -241,9 +255,28 @@ into a subdirectory of the bench run.
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--output-subdir` | string | `validation` | Subdirectory under `--bench-dir` for plots and summary |
+| `--cluster-config` | path | the sim log's `Cluster config` line | Cluster config the simulation ran. Its hardware/model pairs name the profile bundles for the kernel check below |
 | `--prefix` | string | `""` | Filename prefix for the generated files |
 | `--title` | string | `vLLM vs LLMServingSim` | Plot title suffix |
 | `--log-level` | choice | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+
+### Kernel check
+
+Before plotting, the run's `kernels` record is compared with the profile bundle
+the simulator reads for each hardware/model pair in the cluster config:
+
+- **Attention**: the backend of each attention-like layer class at the run's TP,
+  against the bundle's `engine_resolved.per_tp[tp].attention_backends`. Draft
+  layers are left out, since the profile's main engine builds no speculator.
+- **MoE**: the experts class each MoE layer ran, against the
+  `expert_region.expert_class` of every native component contract whose target
+  matches the run's TP, DP and EP.
+
+Class names are compared without their module paths. A difference is logged as a
+warning: the simulated latencies then describe kernels the benchmark did not run.
+It changes no plot or summary. A run without `kernels`, a bundle profiled before
+`attention_backends` existed, or a deployment without a native MoE contract is
+skipped with an info line.
 
 ### Output
 
@@ -331,7 +364,7 @@ forward arbitrary extra positional arguments.
 
 ### `bench/validate.sh`
 
-Positional, with three environment overrides:
+Positional, with four environment overrides:
 
 ```bash
 ./bench/validate.sh <bench_dir> <sim_csv> <sim_log> [prefix]
@@ -346,6 +379,7 @@ Positional, with three environment overrides:
 | `OUTPUT_SUBDIR` | `--output-subdir` | `validation` |
 | `TITLE` | `--title` | `vLLM vs LLMServingSim` |
 | `LOG_LEVEL` | `--log-level` | `INFO` |
+| `CLUSTER_CONFIG` | `--cluster-config`, omitted when blank | blank (the sim log's header) |
 
 ## Committed examples
 
