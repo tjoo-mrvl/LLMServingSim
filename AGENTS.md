@@ -2183,6 +2183,18 @@ they are not interchangeable:
 | + sparse indexer | plus `index_head_dim + index_head_dim//128 * 4` bytes (fp8 keys + fp32 scales, uint8) | replicated |
 | linear attention | 0 per token — the state is per **sequence** | n/a |
 
+Which shape a layer has is `kv_cache_layout(model, spec)`, and the MLA layer
+shapes in `calculate_sizes` and the host copy's replicated layout follow the
+same answer. Its MLA test is vLLM 0.31's `use_mla`: the text tower's
+`model_type` in vLLM's MLA list (read from `get_source_config`, because the
+flattened config keeps the wrapper's type — Kimi-K3 is `kimi_k3` outside,
+`kimi_linear` inside), a causal model, and `kv_lora_rank` — or `head_dim` for
+DeepSeek-V4's `compress_ratios` configs. Do not detect MLA by `kv_lora_rank`
+alone: vLLM serves an unlisted model type carrying it with ordinary attention.
+An MLA config without `kv_lora_rank` (V4's compressed, windowed and indexer
+caches) raises until those shapes are added there. MLA is tested before linear
+attention, as upstream has it, so Kimi-K3's KDA layers report a latent too.
+
 Replicated means across TP only: a pipeline stage still holds just its own layers,
 because vLLM builds the others as `PPMissingLayer`. `get_kv()` divides sharded
 caches by TP × PP and charges the replicated ones of the fullest stage —

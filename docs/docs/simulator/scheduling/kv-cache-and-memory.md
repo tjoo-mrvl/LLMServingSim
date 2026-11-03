@@ -178,6 +178,13 @@ layer has from the checkpoint:
 | **+ sparse indexer** (the same two) | plus `index_head_dim + index_head_dim/128 * 4` — a **second** cache beside the latent, fp8 keys with one fp32 scale per 128 elements | no |
 | **Linear attention** (Qwen3.5/3.8 gated DeltaNet) | 0 — its state is fixed *per sequence*, not per token | n/a |
 
+A model has the MLA shape when vLLM 0.31 serves it with MLA (`use_mla`): its
+text model type is on vLLM's MLA list, the model is causal, and the config
+declares `kv_lora_rank`. A `kv_lora_rank` under another model type is ordinary
+attention, as in vLLM. DeepSeek-V4, which vLLM serves with MLA but whose
+config has no `kv_lora_rank`, is refused at startup: its compressed, windowed
+and indexer caches are not modelled.
+
 A cache TP does not divide is still split by pipeline stage: vLLM builds only
 a stage's own layers, so a GPU holds only their caches. `get_kv()` charges the
 replicated caches of the fullest stage — `ceil(num_layers / pp_size)`

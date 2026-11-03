@@ -406,6 +406,8 @@ Sizes the NPU KV cache the way vLLM does: `npu_mem.mem_size * npu_mem.mem_util -
 divided into blocks. `npu_used` / `cpu_used` are properties derived from the pools, so there
 is exactly one ledger per tier. A host (CPU/CXL) prefix tier holds one copy of the instance's
 cache, sized like vLLM's native offloading: an MLA cache at TP > 1 and PP 1 is stored once.
+Whether a model caches an MLA latent follows vLLM's `use_mla` rule (`kv_cache_layout`), which
+also picks the MLA layer shapes and that replicated host layout.
 
 ### `block_pool.py`
 

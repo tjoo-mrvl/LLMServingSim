@@ -89,7 +89,7 @@ per-rank MoE work and EP collective size. See
 | `mamba_cache_dtype` | string | Conv-state dtype. `auto` (the default) means the weight dtype |
 | `mamba_ssm_dtype` | string | Recurrent-state dtype. `auto` means the **conv** dtype, not the weight dtype. Qwen3.8-27B declares `float32`, and the recurrent state is 98% of the per-sequence state, so reading this wrong halves it |
 | `linear_num_key_heads`, `linear_num_value_heads`, `linear_key_head_dim`, `linear_value_head_dim`, `linear_conv_kernel_dim` | int | Gated-DeltaNet state shape. Per **sequence**, not per token |
-| `kv_lora_rank`, `qk_rope_head_dim` | int | MLA latent shape (DeepSeek, GLM). One latent, no separate V, and **replicated** across TP rather than sharded |
+| `kv_lora_rank`, `qk_rope_head_dim` | int | MLA latent shape (DeepSeek, GLM). One latent, no separate V, and **replicated** across TP rather than sharded. Used only when vLLM serves the model with MLA, i.e. its text `model_type` is on vLLM's MLA list; a DeepSeek-V4 config, MLA without `kv_lora_rank`, is refused |
 | `index_head_dim`, `sparse_attention_config.sparse_index_dim` | int | Sparse-indexer side-cache width. Its dtype is fixed by the model — `uint8` for DeepSeek/GLM, bf16 for M3 — and does **not** follow the KV dtype |
 | `num_nextn_predict_layers` / `num_mtp_modules` / `mtp_num_hidden_layers` | int | MTP module count: the model's own drafter. Each wraps a real decoder layer, so it carries a KV cache of its own |
 | `architectures` | array | First entry's class name is informational; the simulator dispatches via `model_type` |

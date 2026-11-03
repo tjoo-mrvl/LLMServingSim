@@ -3,8 +3,8 @@ import math
 from dataclasses import dataclass
 from functools import lru_cache
 from .utils import (
-    get_architecture, get_config, get_layer_stack, is_moe as _is_moe,
-    num_experts as _num_experts, num_mtp_layers,
+    get_architecture, get_config, get_layer_stack, get_source_config,
+    is_moe as _is_moe, num_experts as _num_experts, num_mtp_layers,
 )
 from profiler.core.stack import LayerSpec
 from .block_pool import Device, BlockPool, PrefixCacheStats
@@ -228,7 +228,7 @@ class MemoryModel():
         # One host (CPU/CXL) copy of the instance's cache, as vLLM's
         # offloading stores it.
         self._cluster_bytes_per_token = host_copy_bytes_per_token(
-            self.config, self._kv_parts, self.tp_size, self.pp_size)
+            self.model, self._kv_parts, self.tp_size, self.pp_size)
 
         # vLLM: requested = total_gpu_memory * gpu_memory_utilization, then
         # subtract the non-KV memory (weights, and the activation peak plus CUDA
@@ -502,10 +502,9 @@ class MemoryModel():
         caches live on other ranks.
         """
         if self._kv_bytes_per_token_per_rank is None:
-            config, kv_fp = self.config, self.kv_fp
             stack = get_layer_stack(self.model) or [None] * self.n_layer
             parts = [
-                kv_bytes_per_token_per_layer(config, kv_fp, spec)
+                kv_bytes_per_token_per_layer(self.model, self.kv_fp, spec)
                 for spec in stack
             ]
             drafter = self._drafter_kv_parts(stack)
@@ -559,7 +558,7 @@ class MemoryModel():
             if base is not None else None
         )
         return [
-            kv_bytes_per_token_per_layer(self.config, self.kv_fp, drafter)
+            kv_bytes_per_token_per_layer(self.model, self.kv_fp, drafter)
         ] * mtp_layers
 
     def get_total_kv(self, req):
@@ -751,7 +750,68 @@ def build_prefix_pool(tier, capacity_bytes, npu_block_size, cluster_bytes_per_to
                      enable_caching=True, node_id=node_id, instance_id=instance_id)
 
 
-def kv_bytes_per_token_per_layer(config, kv_fp, spec=None):
+# vLLM 0.31's MLA model types (``is_deepseek_mla`` in
+# ``transformers_utils/model_arch_config_convertor.py``). vLLM decides MLA by
+# this list, not by the fields alone: a checkpoint carrying ``kv_lora_rank``
+# under another model type is served with ordinary attention.
+_VLLM_MLA_MODEL_TYPES = frozenset((
+    "axk1", "deepseek_v2", "deepseek_v3", "deepseek_v32", "deepseek_v4",
+    "deepseek_v41", "dots3_note", "deepseek_mtp", "k3_dspark", "glm5_next",
+    "glm5_next_text", "glm_moe_dsa", "glm4_moe_lite", "glm4_moe_lite_mtp",
+    "kimi_k2", "kimi_linear", "longcat_flash", "longcat_flash_ngram",
+    "pangu_ultra_moe", "pangu_ultra_moe_mtp", "bailing_hybrid",
+    "bailing_hybrid_mtp", "bailing_hybrid_v3_mtp", "hy_v4", "hy_v4_mtp",
+))
+
+
+@lru_cache(maxsize=None)
+def kv_cache_layout(model, spec=None):
+    """The main KV cache one decoder layer of ``model`` publishes: ``"mla"``,
+    ``"linear"`` (nothing per token) or ``"gqa"``.
+
+    ``"mla"`` is vLLM 0.31's ``ModelConfig.use_mla``: the text tower's
+    ``model_type`` is one of vLLM's MLA types and the model is causal; then a
+    ``compress_ratios`` config (DeepSeek-V4) is MLA when it declares
+    ``head_dim``, any other when it declares ``kv_lora_rank``. It is read off
+    the source config's text tower, as vLLM reads ``hf_text_config``: the
+    flattened config keeps the wrapper's type, and Kimi-K3's wrapper is
+    ``kimi_k3`` while its text tower is ``kimi_linear``. The latent cache
+    shape, the MLA layer shapes and vLLM's replicated offloading layout all
+    follow this one answer.
+
+    An MLA config without ``kv_lora_rank`` -- DeepSeek-V4's compressed,
+    windowed and indexer caches -- raises rather than being sized as GQA.
+
+    MLA is checked before linear attention, as upstream has it, so a hybrid
+    MLA stack's linear-attention layers (Kimi-K3's KDA) report the latent too.
+    ``spec`` is the layer's :class:`LayerSpec`; ``None`` answers for a
+    uniform stack.
+    """
+    source = get_source_config(model)
+    text = source.get("text_config")
+    if not (isinstance(text, dict) and text):
+        text = source
+    # A text tower declaring no model_type (MiniMax-M3's) falls back to the
+    # wrapper's; neither is an MLA type.
+    model_type = text.get("model_type", source.get("model_type"))
+    mla = model_type in _VLLM_MLA_MODEL_TYPES and bool(text.get("is_causal", True))
+    if mla:
+        if "compress_ratios" in text:
+            mla = text.get("head_dim") is not None
+        else:
+            mla = text.get("kv_lora_rank") is not None
+    if mla and text.get("kv_lora_rank") is None:
+        raise NotImplementedError(
+            f"{model}: vLLM serves it with MLA, but its config has no kv_lora_rank "
+            "(DeepSeek-V4's compressed caches), whose KV shapes are not modelled")
+    if mla:
+        return "mla"
+    if spec is not None and spec.attn == "linear_attention":
+        return "linear"
+    return "gqa"
+
+
+def kv_bytes_per_token_per_layer(model, kv_fp, spec=None):
     """KV bytes one token occupies in one decoder layer, as ``(sharded, replicated)``.
 
     Two numbers rather than one because a layer can hold both, and they divide
@@ -779,18 +839,21 @@ def kv_bytes_per_token_per_layer(config, kv_fp, spec=None):
     * **Linear attention** (gated DeltaNet) — nothing per token; the state is
       fixed per sequence.
 
+    Which shape a layer has is ``kv_cache_layout``'s answer.
+
     ``spec`` is the layer's :class:`LayerSpec`; ``None`` answers for a uniform
     stack.
     """
+    config = get_config(model)
+    layout = kv_cache_layout(model, spec)
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
     head_dim = config.get('head_dim', n_embd // n_head)
     kv_head = config.get('num_key_value_heads', n_head)
 
-    kv_lora_rank = config.get('kv_lora_rank')
-    if kv_lora_rank is not None:
+    if layout == "mla":
         # MLA: one replicated latent, and no GQA cache at all.
-        replicated = (kv_lora_rank + (config.get('qk_rope_head_dim') or 0)) * kv_fp
+        replicated = (config['kv_lora_rank'] + (config.get('qk_rope_head_dim') or 0)) * kv_fp
         idx_head_dim = config.get('index_head_dim') or 0
         sparse = True if spec is None else spec.sparse
         if sparse and idx_head_dim and 'index_topk' in config:
@@ -800,7 +863,7 @@ def kv_bytes_per_token_per_layer(config, kv_fp, spec=None):
             replicated += idx_head_dim * idx_b + (idx_head_dim // 128) * 4
         return 0, replicated
 
-    if spec is not None and spec.attn == 'linear_attention':
+    if layout == "linear":
         # Gated DeltaNet caches nothing per token: a fixed conv state plus a
         # fixed recurrent state **per sequence**, which is what makes its cost
         # independent of context length. See ``state_bytes_per_sequence``.
@@ -1105,7 +1168,7 @@ def kv_element_bytes(config, fp, kv_cache_dtype='auto'):
     return fp
 
 
-def host_copy_bytes_per_token(config, parts, tp_size=1, pp_size=1):
+def host_copy_bytes_per_token(model, parts, tp_size=1, pp_size=1):
     """KV bytes per token one host (CPU/CXL) copy of an instance's cache holds.
 
     ``parts`` is every cached layer's ``(sharded, replicated)`` bytes per
@@ -1121,7 +1184,7 @@ def host_copy_bytes_per_token(config, parts, tp_size=1, pp_size=1):
     """
     sharded = sum(a for a, _ in parts)
     replicated = sum(b for _, b in parts)
-    if config.get('kv_lora_rank') is not None and tp_size > 1 and pp_size == 1:
+    if kv_cache_layout(model) == "mla" and tp_size > 1 and pp_size == 1:
         return sharded + replicated
     return sharded + tp_size * replicated
 
@@ -1138,8 +1201,8 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto', tp_size=1,
     config = get_config(model)
     kv_fp = kv_element_bytes(config, fp // 8, kv_cache_dtype)
     stack = get_layer_stack(model) or [None] * config['num_hidden_layers']
-    parts = [kv_bytes_per_token_per_layer(config, kv_fp, spec) for spec in stack]
-    return host_copy_bytes_per_token(config, parts, tp_size, pp_size)
+    parts = [kv_bytes_per_token_per_layer(model, kv_fp, spec) for spec in stack]
+    return host_copy_bytes_per_token(model, parts, tp_size, pp_size)
 
 
 # calculate the per-rank input, weight, output size of each layer
@@ -1217,10 +1280,10 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     num_shared_experts = int(config.get("n_shared_experts") or 0)
 
     # --- MLA (DeepSeek-V3.2, GLM-5) ---------------------------------------
-    # Present only on an MLA checkpoint; ``kv_lora_rank`` is the discriminator
-    # because it is the one field the latent cache cannot do without.
+    # vLLM's ``use_mla`` decides it (``kv_cache_layout``), the same answer the
+    # KV cache shape follows.
     kv_lora_rank = config.get("kv_lora_rank")
-    is_mla = kv_lora_rank is not None
+    is_mla = kv_cache_layout(model) == "mla"
     q_lora_rank = config.get("q_lora_rank") or 0
     qk_nope_dim = config.get("qk_nope_head_dim") or 0
     qk_rope_dim = config.get("qk_rope_head_dim") or 0

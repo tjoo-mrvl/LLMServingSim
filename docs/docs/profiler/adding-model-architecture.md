@@ -969,11 +969,15 @@ to clip `kv_decode` at the window size, and update
 
 DeepSeek V3 compresses KV into a small latent and decompresses on
 attention. KV size is much smaller than `num_heads * head_dim *
-seq_len` would suggest.
+seq_len` would suggest. This is implemented: `memory_model.py::kv_cache_layout`
+answers vLLM 0.31's `use_mla` for the model, and the latent cache, the MLA
+layer shapes in `calculate_sizes` and the host copy's layout follow it.
 
-Where: extend `memory_model.py::calculate_sizes` with an MLA case
-that uses the latent dim (`kv_lora_rank`) instead of
-`num_kv_heads * head_dim`.
+Where: a new MLA family needs its text `model_type` on vLLM's MLA list, which
+`_VLLM_MLA_MODEL_TYPES` mirrors; copy vLLM's list rather than detecting MLA by
+`kv_lora_rank`. A new MLA cache shape, such as DeepSeek-V4's compressed and
+windowed caches, goes in `kv_cache_layout` and `kv_bytes_per_token_per_layer`;
+until then `kv_cache_layout` refuses an MLA config without `kv_lora_rank`.
 
 ### Dual MLP decoders
 

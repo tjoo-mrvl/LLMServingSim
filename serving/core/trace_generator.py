@@ -1486,7 +1486,7 @@ def _pd_kv_send_bytes(ctx, bctx, layer_num):
     if tokens <= 0:
         return 0
     sharded, replicated = kv_bytes_per_token_per_layer(
-        ctx.config, ctx.kv_fp, _layer_spec(ctx.perf_db, layer_num))
+        ctx.model, ctx.kv_fp, _layer_spec(ctx.perf_db, layer_num))
     return sharded * tokens // max(ctx.tp_size, 1) + replicated * tokens
 
 

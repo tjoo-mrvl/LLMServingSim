@@ -79,6 +79,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
 
 ### Changed
 
+- Detect MLA with vLLM 0.31's own `use_mla` rule — the text tower's model type
+  on vLLM's MLA list, a causal model, and `kv_lora_rank` — instead of
+  `kv_lora_rank` alone. One helper, `kv_cache_layout`, now decides the latent
+  cache shape, the MLA layer shapes and the host copy's replicated layout
+  together. A DeepSeek-V4 config, which vLLM serves with MLA but which has no
+  `kv_lora_rank`, is refused at startup instead of being sized as
+  grouped-query attention. Every shipped model keeps its cache shape, and no
+  regression clock or example moves. See
+  [KV cache & memory → KV is not one shape](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory#kv-is-not-one-shape).
 - The DeepSeek-R1 cluster configs (`configs/cluster/deepseek_r1_*.json`) state
   their H200 memory and model runner. `npu_mem.mem_size` is 140.4 GiB, the
   total `nvidia-smi` lists for an H200, until an H200 profile records CUDA's
