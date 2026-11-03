@@ -779,8 +779,15 @@ def kv_cache_layout(model, spec=None):
     shape, the MLA layer shapes and vLLM's replicated offloading layout all
     follow this one answer.
 
-    An MLA config without ``kv_lora_rank`` -- DeepSeek-V4's compressed,
-    windowed and indexer caches -- raises rather than being sized as GQA.
+    Where the rule and ``kv_lora_rank`` disagree, the simulator cannot size
+    the cache, so it raises rather than guess. An MLA config without
+    ``kv_lora_rank`` is DeepSeek-V4's compressed, windowed and indexer caches.
+    A ``kv_lora_rank`` that vLLM does not serve as MLA -- an unlisted model
+    type or a non-causal model -- is either an MLA family missing from
+    ``_VLLM_MLA_MODEL_TYPES``, which the GQA formula would oversize 25x on
+    DeepSeek-V3.2, or ordinary attention over the up-projected heads
+    (vLLM's MiniCPM3: K and V per head at ``qk_nope_head_dim +
+    qk_rope_head_dim``), whose head size the GQA formula does not read.
 
     MLA is checked before linear attention, as upstream has it, so a hybrid
     MLA stack's linear-attention layers (Kimi-K3's KDA) report the latent too.
@@ -804,6 +811,12 @@ def kv_cache_layout(model, spec=None):
         raise NotImplementedError(
             f"{model}: vLLM serves it with MLA, but its config has no kv_lora_rank "
             "(DeepSeek-V4's compressed caches), whose KV shapes are not modelled")
+    if not mla and text.get("kv_lora_rank") is not None:
+        raise NotImplementedError(
+            f"{model}: its config has kv_lora_rank, but vLLM 0.31 would not serve "
+            f"model_type {model_type!r} with MLA (not on its MLA list, or not causal). "
+            "If vLLM lists the type, add it to _VLLM_MLA_MODEL_TYPES; otherwise its "
+            "cache is per-head K and V, which the simulator does not size")
     if mla:
         return "mla"
     if spec is not None and spec.attn == "linear_attention":

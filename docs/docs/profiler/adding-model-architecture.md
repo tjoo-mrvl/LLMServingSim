@@ -975,7 +975,8 @@ layer shapes in `calculate_sizes` and the host copy's layout follow it.
 
 Where: a new MLA family needs its text `model_type` on vLLM's MLA list, which
 `_VLLM_MLA_MODEL_TYPES` mirrors; copy vLLM's list rather than detecting MLA by
-`kv_lora_rank`. A new MLA cache shape, such as DeepSeek-V4's compressed and
+`kv_lora_rank`, and refresh it on a vLLM upgrade. A config with `kv_lora_rank`
+whose type is missing is refused, not sized as grouped-query attention. A new MLA cache shape, such as DeepSeek-V4's compressed and
 windowed caches, goes in `kv_cache_layout` and `kv_bytes_per_token_per_layer`;
 until then `kv_cache_layout` refuses an MLA config without `kv_lora_rank`.
 

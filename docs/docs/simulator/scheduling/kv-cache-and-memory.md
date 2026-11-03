@@ -180,10 +180,15 @@ layer has from the checkpoint:
 
 A model has the MLA shape when vLLM 0.31 serves it with MLA (`use_mla`): its
 text model type is on vLLM's MLA list, the model is causal, and the config
-declares `kv_lora_rank`. A `kv_lora_rank` under another model type is ordinary
-attention, as in vLLM. DeepSeek-V4, which vLLM serves with MLA but whose
-config has no `kv_lora_rank`, is refused at startup: its compressed, windowed
-and indexer caches are not modelled.
+declares `kv_lora_rank`. Where vLLM's rule and `kv_lora_rank` disagree, the
+model is refused at startup, because neither formula fits it:
+
+- DeepSeek-V4, which vLLM serves with MLA but whose config has no
+  `kv_lora_rank`: its compressed, windowed and indexer caches are not modelled.
+- A `kv_lora_rank` under a model type vLLM does not serve with MLA, or on a
+  non-causal model. Either the MLA list the simulator copies from vLLM is
+  missing that family, or vLLM caches per-head K and V of the up-projected
+  heads (MiniCPM3), which the grouped-query formula does not size.
 
 A cache TP does not divide is still split by pipeline stage: vLLM builds only
 a stage's own layers, so a GPU holds only their caches. `get_kv()` charges the

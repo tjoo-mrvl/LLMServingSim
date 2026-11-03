@@ -2194,9 +2194,12 @@ same answer. Its MLA test is vLLM 0.31's `use_mla`: the text tower's
 flattened config keeps the wrapper's type — Kimi-K3 is `kimi_k3` outside,
 `kimi_linear` inside), a causal model, and `kv_lora_rank` — or `head_dim` for
 DeepSeek-V4's `compress_ratios` configs. Do not detect MLA by `kv_lora_rank`
-alone: vLLM serves an unlisted model type carrying it with ordinary attention.
-An MLA config without `kv_lora_rank` (V4's compressed, windowed and indexer
-caches) raises until those shapes are added there. MLA is tested before linear
+alone. Where the rule and `kv_lora_rank` disagree it raises, because neither
+formula fits: an MLA config without `kv_lora_rank` (V4's compressed, windowed
+and indexer caches) until those shapes are added, and a `kv_lora_rank` the rule
+does not call MLA — an unlisted type, which is either an MLA family missing
+from `_VLLM_MLA_MODEL_TYPES` (refresh it from vLLM on an upgrade) or ordinary
+attention over up-projected heads (vLLM's MiniCPM3), or a non-causal model. MLA is tested before linear
 attention, as upstream has it, so Kimi-K3's KDA layers report a latent too.
 
 Replicated means across TP only: a pipeline stage still holds just its own layers,

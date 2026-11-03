@@ -40,7 +40,7 @@ configuration through a temporary model directory during profiling:
 | `linear_num_key_heads`, `linear_num_value_heads`, `linear_key_head_dim`, `linear_value_head_dim`, `linear_conv_kernel_dim` | Gated-DeltaNet state shape. It is per **sequence**, not per token, so it bounds concurrency |
 | `mamba_cache_dtype`, `mamba_ssm_dtype` | Conv and recurrent state dtypes. `auto` on the conv means the weight dtype; `auto` on the recurrent one means the **conv** dtype, not the weight dtype |
 | `quantization_config.kv_cache_scheme` / `kv_cache_quant_algo` | Declares an fp8 KV cache for simulation. The simulator has no `--kv-cache-dtype` override; the profiler and bench have their own acquisition options |
-| `kv_lora_rank`, `qk_rope_head_dim`, `index_head_dim` | MLA latent and sparse-indexer cache shapes (DeepSeek, GLM), used when the text `model_type` is on vLLM's MLA list |
+| `kv_lora_rank`, `qk_rope_head_dim`, `index_head_dim` | MLA latent and sparse-indexer cache shapes (DeepSeek, GLM). The text `model_type` must be on vLLM's MLA list; a `kv_lora_rank` under any other type is refused |
 | `num_nextn_predict_layers` / `num_mtp_modules` / `mtp_num_hidden_layers` | MTP module count — the model's own drafter, for speculative decoding |
 
 Preserve the selected config class's structure and fields rather than reducing
