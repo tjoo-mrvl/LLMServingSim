@@ -1021,6 +1021,16 @@ measured ones. The profile's MoE kernels are recorded per deployment in each
 native component contract (`expert_region.expert_class`) instead, because the
 main engine's own MoE kernel is not the one a distributed target was timed with.
 
+New main-engine records also include `kv_cache_dtype`, the KV cache dtype the
+engine settled on. It is read in the worker after the model is built, because
+an attention backend rewrites the worker's own cache config: on vLLM 0.31,
+sparse MLA turns `auto` into `fp8_ds_mla` under `FLASHINFER_MLA_SPARSE_SM120`
+and keeps `auto` under `FLASHMLA_SPARSE`. Unlike `attention_backends` it is a
+simulator input: the simulator sizes the KV cache from it, `auto` as the
+floating dtype and any `fp8*` format as one byte per element. Records without
+it keep the simulator's config-derived rule; an unreadable value is recorded
+as absent with a warning.
+
 A refresh updates only the recorded TP entries. MTP and non-authoritative
 short-stack engines do not replace main-engine snapshots. Older limits and
 metadata without a snapshot keep that absence; missing values are not

@@ -212,6 +212,29 @@ def _resolve_instance_dtypes(instance, dtype_to_bits):
     return dtype, config_kv_cache_dtype(config)
 
 
+def _resolve_kv_cache_dtype(instance, declared):
+    """The KV cache dtype this instance's cache is sized at.
+
+    The profile bundle's record when it has one
+    (``engine_resolved.per_tp[tp].kv_cache_dtype``): vLLM picks the format per
+    attention backend, so it belongs to the GPU the bundle was measured on as
+    much as to the checkpoint. A recorded ``auto`` is vLLM's model dtype, the
+    floating dtype. A bundle without the field leaves ``declared``, the
+    checkpoint's own setting, to ``memory_model.kv_element_bytes``. ``declared``
+    stays the instance's ``kv_cache_dtype``: it is the requested precision a
+    serving observation is matched on.
+    """
+    config = get_config(instance["model_name"])
+    tp = int(instance.get("tp_size") or 1)
+    recorded = profiled_kv_cache_dtype(
+        instance["hardware"], instance["model_name"], resolve_variant(config), tp)
+    if recorded is None:
+        return declared
+    if recorded == "auto":
+        return config.get("torch_dtype") or config.get("dtype") or "bfloat16"
+    return recorded
+
+
 _DEFAULT_BLOCK_SIZE = 16
 
 
@@ -343,6 +366,7 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "dtype": dtype,
             "fp": dtype_to_bits[dtype],
             "kv_cache_dtype": kv_cache_dtype,
+            "resolved_kv_cache_dtype": _resolve_kv_cache_dtype(instance, kv_cache_dtype),
             "enable_chunked_prefill": instance.get(
                 "enable_chunked_prefill", args.enable_chunked_prefill),
             "enable_prefix_caching": instance.get(
@@ -810,7 +834,7 @@ def main():
                 (
                     instances[i]["model_name"],
                     instance_runtime_configs[i]["fp"],
-                    instance_runtime_configs[i]["kv_cache_dtype"],
+                    instance_runtime_configs[i]["resolved_kv_cache_dtype"],
                 )
                 for i in inst_ids
             }
@@ -826,7 +850,7 @@ def main():
             # copy has to come out the same size.
             per_token = {
                 full_cluster_kv_bytes_per_token(
-                    model, cfg["fp"], cfg["kv_cache_dtype"],
+                    model, cfg["fp"], cfg["resolved_kv_cache_dtype"],
                     instances[i]["tp_size"], instances[i]["pp_size"])
                 for i in inst_ids
             }
@@ -893,7 +917,7 @@ def main():
             inst_cfg["long_prefill_token_threshold"],
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
-            kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+            kv_cache_dtype=inst_cfg["resolved_kv_cache_dtype"],
             npu_memory_utilization=inst_cfg["npu_memory_utilization"],
             reserve_full_isl=inst_cfg["reserve_full_isl"],
             async_scheduling=inst_cfg["async_scheduling"],
@@ -1189,7 +1213,7 @@ def main():
                                        inst_cfg["enable_attn_offloading"],
                                        power_model, pim_models[nid],
                                        inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
-                                       dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+                                       dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["resolved_kv_cache_dtype"],
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                        dp_sum_total_len=sum_total_len,
                                        dp_min_total_len=min_total_len,
@@ -1284,7 +1308,7 @@ def main():
                                            inst_cfg["enable_attn_offloading"],
                                            power_model, pim_models[nid],
                                            inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
-                                           dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+                                           dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["resolved_kv_cache_dtype"],
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                            dp_sum_total_len=sum_total_len,
                                            dp_min_total_len=min_total_len,
@@ -1340,7 +1364,7 @@ def main():
                                    expert_routing_policy, inst_cfg["enable_prefix_caching"],
                                    inst_cfg["enable_attn_offloading"], power_model, pim_models[node_id],
                                    inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
-                                   dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+                                   dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["resolved_kv_cache_dtype"],
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"],
                                    inputs_root=run_paths.inputs_root,

@@ -558,6 +558,45 @@ def _check_tp_coverage(perf_db, tp_needed, hardware, model, variant):
         )
 
 
+def _profiled_engine_resolved(hardware, model, variant):
+    """The bundle's ``engine_resolved`` block, or ``{}`` when it cannot be read.
+
+    Tries both the cwd-relative root (the simulator chdirs into astra-sim/
+    before this normally runs) and one derived from __file__. A silent miss
+    hands every caller its fallback with no signal, which is the failure the
+    profiled readers below exist to prevent.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    roots = [
+        _variant_root(hardware, model, variant),
+        os.path.join(repo_root, "profiler", "perf", hardware, model, variant),
+    ]
+    for root in roots:
+        try:
+            meta = _load_meta(root)
+        except (FileNotFoundError, OSError):
+            continue
+        return (meta or {}).get("engine_resolved") or {}
+    return {}
+
+
+def profiled_kv_cache_dtype(hardware, model, variant, tp=1):
+    """KV cache dtype the engine settled on when this bundle was profiled at
+    ``tp``, or ``None`` when the bundle predates the field.
+
+    vLLM decides it per attention backend and writes the answer back into its
+    cache config: for sparse MLA, ``FLASHINFER_MLA_SPARSE_SM120`` turns
+    ``auto`` into ``fp8_ds_mla`` while ``FLASHMLA_SPARSE`` keeps ``auto``
+    (``mla_attention.py``). The checkpoint alone cannot say which, so the
+    bundle, measured on one GPU, records it.
+    """
+    per_tp = _profiled_engine_resolved(hardware, model, variant).get("per_tp") or {}
+    raw = per_tp.get(tp, per_tp.get(str(tp))) if isinstance(per_tp, dict) else None
+    value = raw.get("kv_cache_dtype") if isinstance(raw, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
 def profiled_block_size(hardware, model, variant, tp=1):
     """KV block size the engine settled on when this bundle was profiled at
     ``tp``.
@@ -572,26 +611,7 @@ def profiled_block_size(hardware, model, variant, tp=1):
     vLLM's backend selection, and it is model-and-backend specific, which is
     exactly what determines it.
     """
-    # Both the cwd-relative root (the simulator chdirs into astra-sim/ before
-    # this normally runs) and one derived from __file__. A silent miss here
-    # would hand back the fallback block size with no signal, which is the
-    # failure this function exists to prevent.
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))))
-    roots = [
-        _variant_root(hardware, model, variant),
-        os.path.join(repo_root, "profiler", "perf", hardware, model, variant),
-    ]
-    meta = None
-    for root in roots:
-        try:
-            meta = _load_meta(root)
-            break
-        except (FileNotFoundError, OSError):
-            continue
-    if meta is None:
-        return None
-    resolved = (meta or {}).get("engine_resolved") or {}
+    resolved = _profiled_engine_resolved(hardware, model, variant)
     # Per-TP since the resolved size is a per-rank fact: both the mamba page
     # and the attention page scale with the shard. A bundle written before the
     # split carries one flat value, which is whichever TP ran last -- read it

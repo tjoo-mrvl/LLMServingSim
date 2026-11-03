@@ -22,7 +22,10 @@ the full table.
 For the KV cache specifically, the rule is vLLM's own
 (`attention.py:281`): a checkpoint whose `quantization_config` declares
 `kv_cache_scheme` (compressed-tensors) or `kv_cache_quant_algo`
-(ModelOpt) gets an fp8 cache; anything else inherits the weight dtype.
+(ModelOpt) gets an fp8 cache; anything else takes the floating dtype
+(`torch_dtype` / `dtype`), except sparse-MLA models, which keep the weight
+dtype. When the profile bundle records the cache dtype vLLM resolved on its
+GPU, that record wins.
 vLLM's source states this as the direction it is heading in as well —
 *"kv cache dtype should be specified in the FP8 checkpoint config and
 become the 'auto' behavior"*.

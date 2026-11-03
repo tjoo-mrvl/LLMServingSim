@@ -1147,7 +1147,15 @@ def _ceil_div(n, d):
 def kv_element_bytes(config, fp, kv_cache_dtype='auto'):
     """Bytes per element of the main KV cache.
 
-    ``fp`` is the weight dtype in bytes. A declared KV scheme
+    ``kv_cache_dtype`` is what vLLM resolved when the profile bundle recorded
+    it (``engine_resolved.per_tp[tp].kv_cache_dtype``, a recorded ``auto``
+    already turned into the floating dtype), and the checkpoint's own
+    ``auto`` / ``fp8`` otherwise. A recorded ``fp8*`` is one byte, including
+    the packed ``fp8_ds_mla`` record: 512 fp8 latent values, four fp32 scales
+    and 64 bf16 rope values, 656 bytes per token on DeepSeek-V3.2, which the
+    MLA formula approximates as one byte per element (576).
+
+    Without a record, ``fp`` is the weight dtype in bytes. A declared KV scheme
     (``kv_cache_dtype='fp8'``) is one byte. Otherwise vLLM's ``auto`` resolves
     to the *model* dtype (vLLM 0.31 ``platforms/interface.py``:
     ``kv_cache_dtype = model_config.dtype``), and on a quantized checkpoint
@@ -1160,12 +1168,18 @@ def kv_element_bytes(config, fp, kv_cache_dtype='auto'):
     the checkpoint alone does not decide it. Unquantized checkpoints are
     unchanged either way, since their weight and activation dtypes agree.
     """
-    if kv_cache_dtype == 'fp8':
+    if kv_cache_dtype == 'auto':
+        quant = config.get('quantization_config')
+        if isinstance(quant, dict) and quant.get('quant_method') and 'index_topk' not in config:
+            return activation_element_bytes(config, fp)
+        return fp
+    if str(kv_cache_dtype).startswith('fp8'):
         return 1
-    quant = config.get('quantization_config')
-    if isinstance(quant, dict) and quant.get('quant_method') and 'index_topk' not in config:
-        return activation_element_bytes(config, fp)
-    return fp
+    from .communication import dtype_bytes
+    try:
+        return dtype_bytes(kv_cache_dtype)
+    except ValueError:
+        raise ValueError(f"Cannot size a {kv_cache_dtype!r} KV cache") from None
 
 
 def host_copy_bytes_per_token(model, parts, tp_size=1, pp_size=1):

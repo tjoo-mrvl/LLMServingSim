@@ -42,6 +42,14 @@ class Extension:
         from .kernel_backends import snapshot
         return snapshot(self.model_runner)
 
+    def kv_cache_dtype(self):
+        """The KV cache dtype this worker settled on, read after the model is
+        built: an attention backend may rewrite the requested one in the
+        worker's own ``cache_config`` (vLLM 0.31's sparse MLA turns ``auto``
+        into ``fp8_ds_mla`` on SM120, ``mla_attention.py``), which the
+        frontend's copy of the config never sees."""
+        return str(self.model_runner.vllm_config.cache_config.cache_dtype)
+
     def native_profile_admission(self, architecture, descriptor):
         from profiler.core.callable_profile import profile_for
         profile = profile_for(architecture)

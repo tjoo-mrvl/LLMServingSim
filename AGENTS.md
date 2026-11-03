@@ -297,7 +297,11 @@ missing historical snapshots must not be reconstructed. It also records
 `attention_backends` (`hooks/kernel_backends.py`: each attention-like layer class
 with its resolved backend) through the `kernel_backends` RPC; an unreadable
 snapshot is recorded as absent with a warning, never a failed acquisition. It is
-provenance for `bench validate`, never a simulator input.
+provenance for `bench validate`, never a simulator input. `kv_cache_dtype` is
+read the same way, through the worker's `kv_cache_dtype` RPC after the model is
+built: an attention backend rewrites the worker's `cache_config` (sparse MLA's
+`fp8_ds_mla` on SM120), which the frontend's copy never sees. Unlike the
+backends it **is** a simulator input; unreadable means unrecorded.
 Ordinary and skew acquisition metadata record resolved geometry and preparation
 semantics. Remeasure wrongly shaped rows, never restamp them as corrected.
 TP-stable replication applies to every catalog, not only coordinated layouts.
@@ -2052,7 +2056,7 @@ holds the whole table; every rule below is vLLM's, verified against its source:
 | Cache | Source | vLLM |
 |-------|--------|------|
 | weights | `quantization_config.quant_method`, then `torch_dtype` / `dtype` | on a quantized checkpoint the dtype fields are the *activation* dtype |
-| KV cache | `quantization_config.kv_cache_scheme` / `kv_cache_quant_algo` → fp8, otherwise `torch_dtype` / `dtype` on a quantized checkpoint | `attention.py:281` promotes a declared scheme when the flag is `auto`; otherwise `auto` is `model_config.dtype` (`platforms/interface.py`), so DeepSeek-R1's fp8 weights keep a bf16 cache. Sparse-MLA models (`index_topk`) keep the weight dtype: vLLM picks their format per backend (`fp8_ds_mla` on SM120) |
+| KV cache | the bundle's `engine_resolved.per_tp[tp].kv_cache_dtype` when recorded; otherwise `quantization_config.kv_cache_scheme` / `kv_cache_quant_algo` → fp8, otherwise `torch_dtype` / `dtype` on a quantized checkpoint | vLLM picks the format per attention backend and writes it back to `cache_config.cache_dtype` (`mla_attention.py`: sparse MLA's `auto` becomes `fp8_ds_mla` under `FLASHINFER_MLA_SPARSE_SM120`, stays `auto` under `FLASHMLA_SPARSE`), so a recorded value wins: `auto` is the floating dtype, `fp8*` one byte (`fp8_ds_mla`'s 656-byte packed record approximated as 576). Without one, `attention.py:281` promotes a declared scheme when the flag is `auto`; otherwise `auto` is `model_config.dtype` (`platforms/interface.py`), so DeepSeek-R1's fp8 weights keep a bf16 cache, and sparse-MLA models (`index_topk`) keep the weight dtype, the SM120 answer the shipped bundles were measured with. The instance's requested `kv_cache_dtype` stays the checkpoint's, which serving observations are matched on |
 | mamba conv state | `mamba_cache_dtype`, `auto` → weight dtype | `mamba_utils.py::_mamba_state_dtype` |
 | mamba recurrent state | `mamba_ssm_dtype`, `auto` → **conv** dtype (not the weight dtype) | same, plus `models/config.py::Qwen3_5ForConditionalGenerationConfig` bridging the HF field |
 | sparse-indexer side cache | fixed by the model | DeepSeek/GLM `torch.uint8`, M3 `resolve_indexer_kv_dtype("bf16")` — neither follows the KV dtype |

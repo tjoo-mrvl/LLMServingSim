@@ -104,6 +104,10 @@ class RuntimeLimits:
     # (hooks/kernel_backends.py), for ``bench validate`` to compare with a
     # benchmark's. None when the snapshot was unavailable.
     attention_backends: list[dict[str, Any]] | None = None
+    # The KV cache dtype the worker resolved after building the model, which
+    # an attention backend may have rewritten (``fp8_ds_mla``). The simulator
+    # sizes the KV cache from it. None when it could not be read.
+    kv_cache_dtype: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +555,14 @@ def probe_limits(llm: LLM, args: ProfileArgs | None = None) -> RuntimeLimits:
     except Exception as exc:
         log.warning("attention backends not recorded: %s", exc)
         attention_backends = None
+    # Read in the worker, not from ``cfg``: the backend rewrites the worker's
+    # cache_config, and this process holds a separate copy. Unreadable means
+    # unrecorded, and the simulator then keeps its config-derived rule.
+    try:
+        kv_cache_dtype = llm.collective_rpc('kv_cache_dtype')[0]
+    except Exception as exc:
+        log.warning("resolved KV cache dtype not recorded: %s", exc)
+        kv_cache_dtype = None
 
     return RuntimeLimits(
         max_num_batched_tokens=logical_mnbt,
@@ -566,6 +578,7 @@ def probe_limits(llm: LLM, args: ProfileArgs | None = None) -> RuntimeLimits:
         dummy_weight_preparation=copy.deepcopy(getattr(llm, "_profiler_dummy_weight_preparation", None)),
         sampling_runtime=sampling_runtime,
         attention_backends=attention_backends,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 

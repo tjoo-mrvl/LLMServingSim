@@ -1004,6 +1004,11 @@ batch.
   `bench validate` compares it with a benchmark's `kernels` record and warns
   when they differ. MoE kernels stay in each native component contract.
 
+  They also record `kv_cache_dtype`, the KV cache dtype the worker settled on
+  after an attention backend's own rewrite (`fp8_ds_mla` for sparse MLA on
+  SM120). The simulator sizes the KV cache from it; records without it keep
+  the config-derived rule.
+
 - `attention_grid` — the 4D attention sweep's caps (`max_kv`),
   geometric factors (`chunk_factor`, `kv_factor`), and compact spec
   strings for the `chunks` / `n_decode` / `kv` axes, plus the separate

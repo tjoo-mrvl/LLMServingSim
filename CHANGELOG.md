@@ -7,6 +7,16 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
 
 ### Added
 
+- Profiles record the KV cache dtype vLLM resolved,
+  `engine_resolved.per_tp[tp].kv_cache_dtype`, read in the worker after the
+  model is built, and the simulator sizes the KV cache from it. vLLM picks the
+  format per attention backend: sparse MLA (DeepSeek-V3.2, GLM-5) caches
+  `fp8_ds_mla` under `FLASHINFER_MLA_SPARSE_SM120` but bf16 (`auto`) under
+  `FLASHMLA_SPARSE`, which the checkpoint alone cannot tell apart. A recorded
+  `auto` is the floating dtype and any `fp8*` format one byte per element.
+  Bundles without the field, every shipped one included, keep the
+  config-derived rule, so no regression clock or example moves. See
+  [Output bundle → engine_resolved](https://llmservingsim.ai/docs/profiler/output-bundle#engine_resolved).
 - Regression scenarios that move when the MLA sizing, host-copy, P/D and
   runner fixes below are reverted. `saturated_mla` and `saturated_mla_pp` fill
   the KV cache of the reduced 16-layer DeepSeek-V3.2 checkpoint at PP1 and PP4,

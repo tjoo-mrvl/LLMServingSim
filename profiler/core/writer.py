@@ -1078,6 +1078,10 @@ def _engine_resolved_block(
     ``attention_backends`` lists each attention-like layer class with the
     backend it resolved to on this engine; ``bench validate`` compares it
     with a benchmark's own record. It is provenance, never a lookup input.
+
+    ``kv_cache_dtype`` is the cache dtype the engine settled on, after an
+    attention backend's own rewrite (``fp8_ds_mla`` for sparse MLA on SM120).
+    Unlike the backends it is a simulator input: the KV cache is sized from it.
     """
     prior = _prior_meta(variant_root)
     prior_block = prior.get("engine_resolved")
@@ -1109,6 +1113,9 @@ def _engine_resolved_block(
         attention_backends = getattr(limits, "attention_backends", None)
         if attention_backends is not None:
             resolved["attention_backends"] = attention_backends
+        kv_cache_dtype = getattr(limits, "kv_cache_dtype", None)
+        if kv_cache_dtype is not None:
+            resolved["kv_cache_dtype"] = kv_cache_dtype
         merged[str(tp)] = _stringify(resolved)
     return {"per_tp": dict(sorted(merged.items(), key=lambda kv: int(kv[0])))} if merged else None
 
