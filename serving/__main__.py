@@ -198,10 +198,17 @@ def _resolve_instance_dtypes(instance, dtype_to_bits):
     than the weights (DeepSeek-V3.2-Exp is FP8 with ``torch_dtype: bfloat16``).
     ``config_kv_cache_dtype`` follows vLLM's own promotion at
     ``attention.py:281``.
+
+    A quantization the weight sizing cannot describe raises here, at startup
+    (``memory_model.weight_formats``), instead of being sized as bf16. Only a
+    config declaring no dtype at all falls back to bf16.
     """
     config = get_config(instance["model_name"])
-    declared = config_weight_dtype(config)
-    dtype = declared if declared in dtype_to_bits else "bfloat16"
+    weight_formats(config)
+    dtype = config_weight_dtype(config) or "bfloat16"
+    if dtype not in dtype_to_bits:
+        raise ValueError(
+            f"{instance['model_name']}: cannot size weights of dtype {dtype!r}")
     return dtype, config_kv_cache_dtype(config)
 
 

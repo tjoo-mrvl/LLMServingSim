@@ -399,8 +399,9 @@ Static sizing math plus a byte-level view over the block pools. Contains
 `calculate_sizes(parallel=)` and `get_weight` for per-layer tensor size computation — the
 `parallel` parameter is TP degree for dense layers and EP degree for MoE experts, and MoE
 expert weights are sharded by `ep_size` (a shared expert by `tp_size`). Weights are sized as
-vLLM stores them: layers it never quantizes stay at the floating dtype on a quantized
-checkpoint. Modify these when adding a new model architecture.
+vLLM stores them, per role and scales included (`weight_formats`): layers it never quantizes
+stay at the floating dtype on a quantized checkpoint, and a quantization other than `fp8` is
+refused at startup. Modify these when adding a new model architecture.
 Sizes the NPU KV cache the way vLLM does: `npu_mem.mem_size * npu_mem.mem_util - weight`, then
 divided into blocks. `npu_used` / `cpu_used` are properties derived from the pools, so there
 is exactly one ledger per tier. A host (CPU/CXL) prefix tier holds one copy of the instance's

@@ -89,7 +89,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   simulator's 0.9, and is not fitted to a benchmark; and
   `cudagraph.runner: "v2"` makes graph padding and pipeline admission follow
   the Model Runner V2 that vLLM 0.31 serves R1 with. R1's KV pool at TP8/EP8
-  grows from 47.4 to 49.7 GiB per GPU. No regression scenario uses these
+  grows from 47.4 to 49.6 GiB per GPU. No regression scenario uses these
   configs.
 - `profiler/profile-deepseek-h200.sh` acquires the TP8/EP8 MoE tables.
   `STAGE=moe` runs `slice --group moe --moe-ranks r` for EP ranks 0-7, one
@@ -117,17 +117,26 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   DeepSeek-V3.2's FP8 pipeline-stage transfers double; the
   DeepSeek-V3.2-Exp-16L64E example moves by at most 3.4 µs per request. See
   [CLI flags → Precision](https://llmservingsim.ai/docs/reference/cli-flags#precision).
-- Size per-GPU weights as vLLM stores them. On a quantized checkpoint the
-  layers vLLM never quantizes — embeddings, the LM head, norms and the MoE
-  router gate — keep the floating dtype; a shared expert is TP-sharded under
+- Size per-GPU weights as vLLM stores them, per role and with their
+  quantization scales. On a quantized checkpoint the layers vLLM never
+  quantizes — embeddings, the LM head, norms, the MoE router gate and linears
+  it builds without a quant config, such as DeepSeek-V3.2's indexer key
+  projection — keep the floating dtype; FP8 linears and experts add one fp32
+  scale per `weight_block_size` block; a shared expert is TP-sharded under
   expert parallelism too (replicated only under sequence-parallel MoE) instead
   of held whole on every rank; and an MLA layer also holds the `W_UK` / `W_UV`
-  copies vLLM derives from `kv_b_proj`. DeepSeek-R1 at TP8/EP8 comes to
-  79.51 GiB per GPU instead of 81.04 GiB. Unquantized checkpoints without MLA
-  or a shared expert are unchanged. No regression clock or example output
-  moves; the DeepSeek-V3.2-Exp-16L64E example's KV pool shrinks from 48,802 to
-  45,496 blocks without saturating. See
+  copies vLLM derives from `kv_b_proj`. DeepSeek-V4's MXFP4 routed experts
+  (`expert_dtype`) are sized at 4 bits plus one 1-byte scale per 32 values.
+  DeepSeek-R1 at TP8/EP8 comes to 79.53 GiB per GPU instead of 81.04 GiB.
+  Unquantized checkpoints without MLA or a shared expert are unchanged, and no
+  example output moves: the DeepSeek-V3.2-Exp-16L64E example's KV pool shrinks
+  from 48,802 to 45,452 blocks without saturating. See
   [KV cache & memory → Model weights](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory#1-model-weights-per-gpu).
+- Refuse, at startup, a checkpoint whose weight quantization cannot be sized
+  — any `quant_method` other than `fp8`, or an `fp8` ignore list — instead of
+  sizing it as bf16. Kimi-K3 (compressed-tensors) is unaffected: it runs only
+  through its native duration-only trace replay, which sizes weights from the
+  observed native layouts.
 - Follow the instance's declared or observed `cudagraph.runner` in the
   scheduler's async-scheduling rule at `pp_size > 1`. vLLM 0.31 runs Model
   Runner V2 for every model unless an unsupported feature forces V1, but the
@@ -174,8 +183,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   reported that shared CUDA activity in prefill and mixed batches, and
   acquisition rejects it. The wrapper's write of the rotated query half back
   into `q` was CUDA work no entry measured. `kv_b_proj`'s weight moves to the
-  `attention` row, so DeepSeek-R1's per-GPU weight is unchanged (79.51 GiB at
-  TP8/EP8). The DeepSeek-V3.2 and GLM-5 catalog keeps vLLM 0.28's merged
+  `attention` row, so this leaves DeepSeek-R1's per-GPU weight unchanged. The
+  DeepSeek-V3.2 and GLM-5 catalog keeps vLLM 0.28's merged
   `mla_b_proj`, and no regression clock moves. See
   [KV cache & memory → Model weights](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory#1-model-weights-per-gpu).
 

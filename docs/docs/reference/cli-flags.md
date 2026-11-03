@@ -73,8 +73,10 @@ sized at 2 bytes per element, while quantized weights keep the weight dtype.
 Token IDs are the exception: vLLM holds them as int32 in both model runners, so
 the embedding's input is 4 bytes per token whatever the model's dtype.
 The layers vLLM never quantizes — embeddings, the LM head, norms and the MoE
-router gate — are stored at the floating dtype too, and so is the per-GPU
-weight that bounds the KV cache (see
+router gate — are stored at the floating dtype too. The per-GPU weight that
+bounds the KV cache is sized per role as vLLM stores it, quantization scales
+included. Only unquantized and `fp8` checkpoints can be sized: any other
+quantization method, or an `fp8` ignore list, is refused at startup (see
 [KV cache and memory](../simulator/scheduling/kv-cache-and-memory.md#1-model-weights-per-gpu)).
 
 A dtype is a property of the checkpoint, and once a model carries five of

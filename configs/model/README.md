@@ -31,7 +31,7 @@ configuration through a temporary model directory during profiling:
 | `rope_theta`, `rope_scaling` | Rotary embedding setup (critical for Llama 3's rope_type) |
 | `tie_word_embeddings` | Whether lm_head shares weights with embedding |
 | `attention_bias`, `mlp_bias` | Linear layer biases |
-| `torch_dtype` / `dtype` | Floating dtype, read legacy spelling first. `quantization_config.quant_method` wins for weight precision and the default variant — on a quantized checkpoint the floating fields describe the *activations* |
+| `torch_dtype` / `dtype` | Floating dtype, read legacy spelling first. `quantization_config.quant_method` wins for weight precision and the default variant — on a quantized checkpoint the floating fields describe the *activations*. `python -m serving` can size only unquantized and `fp8` checkpoints and refuses any other method at startup; Kimi-K3's compressed-tensors config is sized only by its native duration-only trace replay |
 | `num_local_experts` or `num_experts` or `n_routed_experts`, `num_experts_per_tok` / `num_experts_per_token` / `moe_k`, `moe_intermediate_size` | MoE count, top-k and expert width. Declared top-k aliases must be positive integers and agree |
 | `n_group`, `topk_group` | Group-limited expert routing (DeepSeek-V3/V3.2, GLM). Restricts a token's experts to `topk_group` of `n_group` groups, which narrows the EP ranks it reaches |
 | `layer_types`, `full_attention_interval` | Which layers are linear attention vs full attention on a hybrid stack |

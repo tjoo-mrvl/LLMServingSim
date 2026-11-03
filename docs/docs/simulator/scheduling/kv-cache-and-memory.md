@@ -66,25 +66,42 @@ count divided by `tp_size` (and for MoE: routed experts further divided by
 `ep_size`), times each tensor's stored byte size:
 
 ```
-weight_bytes_per_gpu ≈ (
-    dense_params / tp_size
-    + moe_params / ep_size  # if MoE
-) * fp
+weight_bytes_per_gpu ≈ sum over tensors (
+    payload: rows × cols × element_bits / 8
+    + scales: ceil(rows / group_rows) × ceil(cols / group_cols) × scale_bytes
+)
 ```
 
-`fp` is 2 bytes for `bfloat16` / `float16`, 4 for `float32`,
-1 for `int8` and `fp8`. The width follows how vLLM stores each tensor:
+Each tensor is one rank's shard: dense layers divided by `tp_size`, routed
+experts by `ep_size`. Its format comes from the role vLLM gives the layer
+(`memory_model.weight_formats`):
 
-- On a quantized checkpoint, the layers vLLM never quantizes — embeddings,
-  the LM head, norms and the MoE router gate — keep the floating dtype
-  (`torch_dtype`): DeepSeek-R1's fp8 checkpoint stores them in bf16.
+| Checkpoint | Linears and shared experts | Routed experts |
+| --- | --- | --- |
+| Unquantized | floating dtype (`torch_dtype` / `dtype`) | floating dtype |
+| `quant_method: fp8` (vLLM's `Fp8Config`) | FP8, one fp32 scale per `weight_block_size` block (one per tensor without a block size) | the same, or MXFP4 with `store_dtype: mxfp4` |
+| DeepSeek-V4, `quant_method: fp8` (vLLM's `DeepseekV4FP8Config`) | FP8 block; scales are 1-byte e8m0 with FP4 experts | `expert_dtype` (default `fp4`): MXFP4, 4-bit values plus one 1-byte scale per 32; or `fp8`, FP8 block with fp32 scales |
+
+- The layers vLLM never quantizes — embeddings, the LM head, norms, the MoE
+  router gate, and linears it builds without a quant config, such as
+  DeepSeek-V3.2's indexer key projection — keep the floating dtype:
+  DeepSeek-R1's fp8 checkpoint stores them in bf16.
 - A shared expert is a TP-sharded MLP whatever the expert parallelism, so it
   is divided by `tp_size`; only sequence-parallel MoE replicates it.
 - An MLA layer also holds the `W_UK` / `W_UV` copies vLLM derives from
   `kv_b_proj` at the floating dtype for the absorbed decode path, beside
   `kv_b_proj` itself.
 
-DeepSeek-R1 at TP8/EP8 comes to 79.51 GiB per GPU this way.
+Any other quantization is refused at startup rather than sized as bf16:
+another `quant_method` (compressed-tensors, MXFP4, NVFP4, AWQ, GPTQ, ...), or
+an `fp8` ignore list (`ignored_layers` / `modules_to_not_convert`), which
+names modules by path and cannot be mapped onto these roles. Kimi-K3's
+compressed-tensors checkpoint is not sized here: it runs only through its
+native duration-only trace replay, which sizes weights from the observed
+native layouts.
+
+DeepSeek-R1 at TP8/EP8 comes to 79.53 GiB per GPU this way, 19.7 MiB of it
+block scales.
 
 `get_weight()` gets this total by **walking the architecture yaml's
 blocks and the checkpoint's own per-layer composition**, summing

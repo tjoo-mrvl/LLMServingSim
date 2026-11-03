@@ -2144,10 +2144,25 @@ window of layers, since the first window is the light one on a stack whose
 leading layers are dense.
 
 Weights are sized as vLLM stores them, not at one width for the whole
-checkpoint. On a quantized checkpoint the layers vLLM never quantizes —
-embeddings, the LM head, norms and the MoE router gate (`Fp8Config` quantizes
-linear layers and routed experts only) — keep the floating dtype
-(`activation_element_bytes`). A shared expert is a TP-sharded MLP whatever the
+checkpoint. `memory_model.weight_formats` gives each role — `linear`,
+`routed_expert`, `shared_expert`, `unquantized` — a payload width and a scale
+layout, following vLLM's per-layer-class `get_quant_method`; `weight_bytes`
+counts every format's scales with one formula,
+`ceil(rows / group_rows) * ceil(cols / group_cols) * scale_bytes`, over each
+rank's shard. It covers unquantized checkpoints, `Fp8Config` (block or
+per-tensor fp32 scales, `store_dtype: mxfp4` experts) and DeepSeek-V4's
+`DeepseekV4FP8Config` (`expert_dtype`, default `fp4`: MXFP4 experts and 1-byte
+e8m0 linear scales). Any other quant method, NVFP4 V4 experts, or an
+`ignored_layers` / `modules_to_not_convert` list raises at startup in
+`_resolve_instance_dtypes`; never restore the silent bf16 fallback, and add a
+format by mirroring vLLM's quant method for it. Native and contextual profiles
+(Kimi-K3's compressed-tensors checkpoint) size weights in `component_sizes.py`
+and never reach this check. On a quantized checkpoint the
+layers vLLM never quantizes — embeddings, the LM head, norms, the MoE router
+gate and linears built with `quant_config=None` (DeepSeek's indexer
+`wk_weights_proj`) — keep the floating dtype. Assign a layer's role from the
+vLLM class and quant config it is built with, not from its name. A shared
+expert is a TP-sharded MLP whatever the
 expert parallelism, so it is divided by TP; only sequence-parallel MoE
 (TP > 1 in a DP > 1 group whose catalog declares it) replicates it. An MLA
 `attention` layer holds the `W_UK` / `W_UV` copies
@@ -2156,7 +2171,7 @@ activation dtype. It also holds `kv_b_proj` itself when the catalog binds
 `q_b_proj` alone (`mla_q_b_proj`, the DeepSeek-V3/R1 catalog), because vLLM 0.31
 calls `kv_b_proj` only inside `MLAAttention`; the V3.2 catalog's merged
 `mla_b_proj` (vLLM 0.28's tree) carries it there instead. Never count it in both.
-DeepSeek-R1 at TP8/EP8 comes to 79.51 GiB per GPU.
+DeepSeek-R1 at TP8/EP8 comes to 79.53 GiB per GPU, 19.7 MiB of it block scales.
 
 `kv_bytes_per_token_per_layer()` is the one place that knows the KV shapes, and
 they are not interchangeable:

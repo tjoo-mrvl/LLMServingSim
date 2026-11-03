@@ -1,5 +1,7 @@
 import os
 import math
+from dataclasses import dataclass
+from functools import lru_cache
 from .utils import (
     get_architecture, get_config, get_layer_stack, is_moe as _is_moe,
     num_experts as _num_experts, num_mtp_layers,
@@ -960,6 +962,125 @@ def activation_element_bytes(config, fp):
     return dtype_bytes(config.get('torch_dtype', config.get('dtype')), fp)
 
 
+# The weight roles a quantization method can store differently. vLLM picks a
+# quant method per layer class (``QuantizationConfig.get_quant_method``): one
+# for ``LinearBase``, one for ``RoutedExperts``, and nothing for the rest.
+# The shared expert is an MLP of linears in vLLM; it is a role of its own so a
+# format that treats it apart has one place to say so.
+WEIGHT_ROLES = ("linear", "routed_expert", "shared_expert", "unquantized")
+
+
+@dataclass(frozen=True)
+class WeightFormat:
+    """How vLLM stores one role's weights.
+
+    ``element_bits`` is the payload width, 4 for MXFP4. One scale of
+    ``scale_bytes`` covers each ``scale_group`` ``(rows, cols)`` block, where
+    ``None`` means the whole dimension; 0 bytes means no scales.
+    """
+    element_bits: int
+    scale_group: tuple = (None, None)
+    scale_bytes: int = 0
+
+
+def weight_formats(config):
+    """Each weight role's storage format as vLLM 0.31 builds it, or raise.
+
+    - Unquantized: every role at the floating dtype (``torch_dtype`` /
+      ``dtype``, bf16 when neither is declared), no scales.
+    - ``quant_method: fp8`` (``Fp8Config``): linears and routed experts are
+      FP8, with one fp32 scale per ``weight_block_size`` block, or one per
+      tensor without a block size (``Fp8LinearMethod`` /
+      ``Fp8MoEMethod.create_weights``). ``store_dtype: mxfp4`` makes the
+      routed experts MXFP4 (``Mxfp4MoEMethod``): 4-bit values plus one 1-byte
+      e8m0 scale per 32 along the input dim. Embeddings, the LM head, norms
+      and the router gate are not quantized, and neither is a linear built
+      without a quant config.
+    - DeepSeek-V4 (``model_type`` ``deepseek_v4`` / ``deepseek_v41`` with
+      ``quant_method: fp8``): vLLM swaps in ``DeepseekV4FP8Config``
+      (``model_executor/models/config.py``). ``expert_dtype``, ``fp4`` when
+      absent, picks the routed experts: ``fp4`` is MXFP4, and the linears'
+      block scales are then 1-byte e8m0; ``fp8`` is block FP8 with fp32
+      scales.
+
+    Anything else raises rather than being sized as bf16: another quant method
+    (compressed-tensors, MXFP4, NVFP4, AWQ, GPTQ, ...), NVFP4 V4 experts, or a
+    non-empty ignore list, which names modules by path and cannot be mapped
+    onto these roles.
+    """
+    from .communication import dtype_bytes
+    floating = config.get("torch_dtype") or config.get("dtype")
+    try:
+        unquantized = WeightFormat(8 * dtype_bytes(floating, 2))
+    except ValueError:
+        raise ValueError(f"Cannot size weights stored as {floating!r}") from None
+    quant = config.get("quantization_config")
+    method = quant.get("quant_method") if isinstance(quant, dict) else None
+    if not method:
+        return {role: unquantized for role in WEIGHT_ROLES}
+    if method != "fp8":
+        raise ValueError(
+            f"Cannot size weights quantized with quant_method={method!r}: only "
+            "unquantized and fp8 (vLLM's Fp8Config) checkpoints are supported")
+    ignored = quant.get("ignored_layers") or quant.get("modules_to_not_convert")
+    if ignored:
+        raise ValueError(
+            f"Cannot size an fp8 checkpoint that leaves modules unquantized "
+            f"({ignored!r}): the ignore list names modules by path, which does "
+            "not map onto the simulator's weight roles")
+    block = quant.get("weight_block_size")
+    if block is None:
+        group = (None, None)
+    elif (isinstance(block, (list, tuple)) and len(block) == 2
+          and all(type(n) is int and n > 0 for n in block)):
+        group = tuple(block)
+    else:
+        raise ValueError(f"Invalid fp8 weight_block_size {block!r}")
+    mxfp4 = WeightFormat(4, (1, 32), 1)
+    linear_scale_bytes = 4
+    routed = WeightFormat(8, group, 4)
+    if config.get("model_type") in ("deepseek_v4", "deepseek_v41"):
+        expert_dtype = config.get("expert_dtype", "fp4")
+        if expert_dtype not in ("fp4", "fp8"):
+            raise ValueError(f"Unsupported DeepSeek-V4 expert_dtype {expert_dtype!r}")
+        if expert_dtype == "fp4":
+            if (quant.get("moe_quant_algo") or "").upper() == "NVFP4":
+                raise ValueError("Cannot size NVFP4 DeepSeek-V4 routed experts")
+            routed = mxfp4
+            linear_scale_bytes = 1
+    if quant.get("store_dtype") == "mxfp4":
+        routed = mxfp4
+    linear = WeightFormat(8, group, linear_scale_bytes)
+    return {"linear": linear, "routed_expert": routed,
+            "shared_expert": linear, "unquantized": unquantized}
+
+
+@lru_cache(maxsize=None)
+def _model_weight_formats(model):
+    """``weight_formats`` per model, cached: ``calculate_sizes`` asks per layer."""
+    return weight_formats(get_config(model))
+
+
+def weight_bytes(fmt, rows, cols, count=1):
+    """Bytes of ``count`` ``rows x cols`` weight tensors stored as ``fmt``.
+
+    The payload is rounded up to a whole byte per tensor. Scales use one
+    formula for every format, as vLLM allocates them:
+    ``ceil(rows / group_rows) * ceil(cols / group_cols) * scale_bytes``.
+    """
+    if rows <= 0 or cols <= 0 or count <= 0:
+        return 0
+    group_rows, group_cols = fmt.scale_group
+    payload = _ceil_div(rows * cols * fmt.element_bits, 8)
+    scales = (_ceil_div(rows, group_rows or rows) * _ceil_div(cols, group_cols or cols)
+              * fmt.scale_bytes)
+    return count * (payload + scales)
+
+
+def _ceil_div(n, d):
+    return -(-n // d)
+
+
 def kv_element_bytes(config, fp, kv_cache_dtype='auto'):
     """Bytes per element of the main KV cache.
 
@@ -1054,14 +1175,21 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         return component_sizes.sizes(layer_name, length, parallel=parallel, pim=pim)
     config = get_config(model)
     # Activations (layer inputs and outputs) take the checkpoint's floating
-    # dtype; weights keep ``fp``, the weight dtype. The two differ only on a
-    # quantized checkpoint (``activation_element_bytes``). Cache reads (KV,
-    # recurrent state) keep their existing sizing. Weights vLLM's FP8 path
-    # never quantizes -- embeddings, the LM head, norms and the MoE router
-    # gate (``Fp8Config.get_quant_method`` covers linear layers and routed
-    # experts only; DeepSeek builds its gate without a quant config) -- stay
-    # at the floating dtype too, so they are sized at ``afp``.
+    # dtype (``activation_element_bytes``). Weights are sized per role, as
+    # vLLM stores them, scales included (``weight_formats``): ``linear`` for
+    # a linear built with the quant config, ``routed_expert`` /
+    # ``shared_expert`` for the MoE experts, and ``unquantized`` for what
+    # vLLM never quantizes -- embeddings, the LM head, norms, the router gate
+    # and a linear built without a quant config. Cache reads (KV, recurrent
+    # state) keep their existing sizing at ``fp``.
     afp = activation_element_bytes(config, fp)
+
+    def weights(role, rows, cols, count=1):
+        # ``rows x cols`` is one rank's tensor, output dim first, as vLLM
+        # lays out a linear's weight; scales are counted over that shard.
+        # Resolved here rather than up front so a caller asking only for
+        # activation sizes never needs a weight format.
+        return weight_bytes(_model_weight_formats(model)[role], rows, cols, count)
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
     head_dim = config.get('head_dim', n_embd // n_head)
@@ -1186,17 +1314,17 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
             local_vocab = vocab_shard_size(config, p)
         else:
             local_vocab = vocab_size // p
-        weight_size = local_vocab * n_embd * afp
+        weight_size = weights("unquantized", local_vocab, n_embd)
         output_size = length * n_embd * afp
 
     elif layer_name in ["input_layernorm", "post_layernorm", "final_layernorm", "layernorm"]:
         input_size = length * n_embd * afp
-        weight_size = 1 * n_embd * afp  # scale only
+        weight_size = weights("unquantized", 1, n_embd)  # scale only
         output_size = length * n_embd * afp
 
     elif layer_name == "qk_norm":
         input_size = length * (q_dim + kv_dim) // p * afp
-        weight_size = 2 * head_dim * afp
+        weight_size = weights("unquantized", 2, head_dim)
         output_size = length * (q_dim + kv_dim) // p * afp
 
     # ----------------- RoPE & Attention Core -----------------
@@ -1229,14 +1357,16 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
             # decode path: ``MLAAttention.process_weights_after_loading``
             # builds ``W_UK_T`` and ``W_UV`` at the activation dtype beside
             # kv_b_proj itself, so they are this layer's resident weight.
-            weight_size = (n_head // p) * kv_lora_rank * (qk_nope_dim + v_head_dim) * afp
-            # kv_b_proj itself, at the weight dtype. vLLM 0.31 calls it only
+            weight_size = weights("unquantized", (n_head // p) * (qk_nope_dim + v_head_dim),
+                                  kv_lora_rank)
+            # kv_b_proj itself, a quantized linear. vLLM 0.31 calls it only
             # inside MLAAttention (its prefill up-projection), so a catalog
             # whose b-projection entry is q_b alone (``mla_q_b_proj``) leaves
             # its weight to this layer. A merged ``mla_b_proj`` entry -- vLLM
             # 0.28's tree, kept by the V3.2 catalog -- already carries it.
             if not _catalog_merges_mla_b_proj(model):
-                weight_size += kv_lora_rank * ((n_head * (qk_nope_dim + v_head_dim)) // p) * fp
+                weight_size += weights("linear", (n_head * (qk_nope_dim + v_head_dim)) // p,
+                                       kv_lora_rank)
             output_size = (n_head // p) * length * v_head_dim * afp
         elif not pim:
             input_size = (
@@ -1256,7 +1386,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     # ----------------- QKV Projection (fused) -----------------
     elif layer_name == "qkv_proj":
         input_size = length * n_embd * afp
-        weight_size = n_embd * ((q_out_dim + 2 * kv_dim) // p) * fp
+        weight_size = weights("linear", (q_out_dim + 2 * kv_dim) // p, n_embd)
         output_size = length * ((q_out_dim + 2 * kv_dim) // p) * afp
 
     elif layer_name == "o_proj":
@@ -1265,12 +1395,12 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # Q -- 128 x 128 on DeepSeek-V3.2, 64 x 256 on GLM-5 -- and
         # ``n_head * head_dim`` everywhere else.
         input_size = length * (o_in_dim // p) * afp
-        weight_size = (o_in_dim // p) * n_embd * fp
+        weight_size = weights("linear", n_embd, o_in_dim // p)
         output_size = length * n_embd * afp
 
     elif layer_name == "gate_up_proj":
         input_size = length * n_embd * afp
-        weight_size = n_embd * 2 * (ffn_dim // p) * fp
+        weight_size = weights("linear", 2 * (ffn_dim // p), n_embd)
         output_size = length * 2 * (ffn_dim // p) * afp
 
     elif layer_name == "act_fn":
@@ -1280,7 +1410,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
 
     elif layer_name == "down_proj":
         input_size = length * (ffn_dim // p) * afp
-        weight_size = (ffn_dim // p) * n_embd * fp
+        weight_size = weights("linear", n_embd, ffn_dim // p)
         output_size = length * n_embd * afp
 
     # ----------------- MLA (DeepSeek-V3.2, GLM-5) -----------------
@@ -1296,7 +1426,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # 2112 x 7168 on V3.2, i.e. (1536 + 512 + 64) x hidden.)
         latent_out = q_lora_rank + kv_lora_rank + qk_rope_dim
         input_size = length * n_embd * afp
-        weight_size = n_embd * latent_out * fp
+        weight_size = weights("linear", latent_out, n_embd)
         output_size = length * latent_out * afp
 
     elif layer_name == "mla_a_layernorm":
@@ -1304,7 +1434,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # bias) inside ``DeepseekV2MLAAttention``, so the profiler reports them
         # as one merged node and this entry carries their **sum**.
         input_size = length * (q_lora_rank + kv_lora_rank) * afp
-        weight_size = (q_lora_rank + kv_lora_rank) * afp
+        weight_size = weights("unquantized", 1, q_lora_rank + kv_lora_rank)
         output_size = length * (q_lora_rank + kv_lora_rank) * afp
 
     elif layer_name == "mla_b_proj":
@@ -1313,8 +1443,8 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         q_b_out = n_head * qk_head_dim
         kv_b_out = n_head * (qk_nope_dim + v_head_dim)
         input_size = length * (q_lora_rank + kv_lora_rank) * afp
-        weight_size = (q_lora_rank * (q_b_out // p)
-                       + kv_lora_rank * (kv_b_out // p)) * fp
+        weight_size = (weights("linear", q_b_out // p, q_lora_rank)
+                       + weights("linear", kv_b_out // p, kv_lora_rank))
         output_size = length * ((q_b_out + kv_b_out) // p) * afp
 
     elif layer_name == "mla_q_b_proj":
@@ -1324,7 +1454,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # its weight (see that branch).
         q_b_out = n_head * qk_head_dim
         input_size = length * q_lora_rank * afp
-        weight_size = q_lora_rank * (q_b_out // p) * fp
+        weight_size = weights("linear", q_b_out // p, q_lora_rank)
         output_size = length * (q_b_out // p) * afp
 
     elif layer_name == "mla_glue":
@@ -1342,23 +1472,26 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # literally "no tensor parallel, just replicated".
         idx_q = idx_heads * idx_head_dim
         input_size = length * q_lora_rank * afp
-        weight_size = q_lora_rank * idx_q * fp
+        weight_size = weights("linear", idx_q, q_lora_rank)
         output_size = length * idx_q * afp
 
     elif layer_name == "indexer_wk_proj":
         # ``wk_weights_proj``: one MergedColumnParallelLinear with
         # ``disable_tp=True``, producing [index_head_dim | index_n_heads] --
-        # the index key and the per-head weights -- in a single GEMM.
+        # the index key and the per-head weights -- in a single GEMM. Built
+        # with ``quant_config=None`` (``deepseek_v2.py``,
+        # ``deepseek_v32/attention.py``), so an FP8 checkpoint keeps it at the
+        # floating dtype.
         idx_kw = idx_head_dim + idx_heads
         input_size = length * n_embd * afp
-        weight_size = n_embd * idx_kw * fp
+        weight_size = weights("unquantized", idx_kw, n_embd)
         output_size = length * idx_kw * afp
 
     elif layer_name == "indexer_k_norm":
         # A bare ``nn.LayerNorm``, not RMSNorm, so it carries weight **and**
         # bias.
         input_size = length * idx_head_dim * afp
-        weight_size = 2 * idx_head_dim * fp
+        weight_size = weights("unquantized", 2, idx_head_dim)
         output_size = length * idx_head_dim * afp
 
     elif layer_name == "indexer_rope_emb":
@@ -1428,7 +1561,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # their parameters live -- ``head_dim`` each. The gate has none: it is
         # fused into the Q half of ``qkv_proj``.
         input_size = length * ((q_out_dim + 2 * kv_dim) // p) * afp
-        weight_size = 2 * head_dim * afp
+        weight_size = weights("unquantized", 2, head_dim)
         output_size = input_size
 
     elif layer_name == "sparse_qkv_proj":
@@ -1441,7 +1574,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
                  + (kv_head // p) * m3_idx_dim
                  + m3_idx_dim)
         input_size = length * n_embd * afp
-        weight_size = n_embd * fused * fp
+        weight_size = weights("linear", fused, n_embd)
         output_size = length * fused * afp
 
     elif layer_name == "sparse_qk_norm_rope":
@@ -1455,14 +1588,14 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
                  + (kv_head // p) * m3_idx_dim
                  + m3_idx_dim)
         input_size = length * fused * afp
-        weight_size = (2 * head_dim + 2 * m3_idx_dim) * afp
+        weight_size = weights("unquantized", 1, 2 * head_dim + 2 * m3_idx_dim)
         output_size = input_size
 
     elif layer_name == "sparse_o_proj":
         # Same shape as ``o_proj``; a separate canonical name only because the
         # profiler must not merge the sparse layers' timing with the others'.
         input_size = length * (q_dim // p) * afp
-        weight_size = (q_dim // p) * n_embd * fp
+        weight_size = weights("linear", n_embd, q_dim // p)
         output_size = length * n_embd * afp
 
     elif layer_name == "sparse_attention":
@@ -1524,14 +1657,16 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         qkvz = 2 * gdn_key_dim + 2 * gdn_value_dim
         ba = 2 * gdn_v_heads
         input_size = length * n_embd * afp
-        weight_size = n_embd * ((qkvz + ba) // p) * fp
+        weight_size = (weights("linear", qkvz // p, n_embd)
+                       + weights("linear", ba // p, n_embd))
         output_size = length * ((qkvz + ba) // p) * afp
 
     elif layer_name == "gdn_conv_prefill":
         # Depthwise causal conv over the whole chunk. vLLM stores the weight as
-        # ``ColumnParallelLinear(conv_kernel_size -> conv_dim)``.
+        # ``ColumnParallelLinear(conv_kernel_size -> conv_dim)``, built without
+        # a quant config.
         input_size = length * (gdn_conv_dim // p) * afp
-        weight_size = gdn_conv_kernel * (gdn_conv_dim // p) * fp
+        weight_size = weights("unquantized", gdn_conv_dim // p, gdn_conv_kernel)
         output_size = length * (gdn_conv_dim // p) * afp
 
     elif layer_name == "gdn_conv_decode":
@@ -1554,12 +1689,12 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # ``RMSNormGated(head_v_dim)`` -- one scale shared across value heads,
         # applied to the recurrence output.
         input_size = length * (gdn_value_dim // p) * afp
-        weight_size = gdn_v_dim * afp
+        weight_size = weights("unquantized", 1, gdn_v_dim)
         output_size = length * (gdn_value_dim // p) * afp
 
     elif layer_name == "gdn_out_proj":
         input_size = length * (gdn_value_dim // p) * afp
-        weight_size = (gdn_value_dim // p) * n_embd * fp
+        weight_size = weights("linear", n_embd, gdn_value_dim // p)
         output_size = length * n_embd * afp
 
     elif layer_name == "gdn_prefill":
@@ -1569,7 +1704,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # kernels read but must not re-count.
         state = (gdn_v_heads // p) * gdn_v_dim * gdn_k_dim * fp
         input_size = length * (gdn_conv_dim // p) * afp + state
-        weight_size = (gdn_v_heads // p) * fp + (gdn_v_heads // p) * 4
+        weight_size = weights("unquantized", 1, gdn_v_heads // p) + (gdn_v_heads // p) * 4
         output_size = length * (gdn_value_dim // p) * afp + state
 
     elif layer_name in ("gdn_decode", "gdn_decode_mixed"):
@@ -1612,10 +1747,18 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # keep 1/moe_tp of their width.
         shared_split = moe_tp if shared_tp is None else shared_tp
         experts_per_rank = num_local_experts // p
+        # Per expert, vLLM holds w13 as two [width, hidden] shards with their
+        # own scale rows (``w13_num_shards``) and w2 as [hidden, width].
+        expert_width = moe_ffn_dim // moe_tp
+        # The shared experts are one MLP of their summed width: a merged
+        # gate/up linear and a down linear.
+        shared_width = num_shared_experts * (shared_ffn_dim // shared_split)
         input_size = length * n_embd * afp
-        weight_size = (n_embd * num_local_experts * afp  # gate (replicated, unquantized)
-                     + experts_per_rank * 3 * n_embd * (moe_ffn_dim // moe_tp) * fp
-                     + num_shared_experts * 3 * n_embd * (shared_ffn_dim // shared_split) * fp)
+        weight_size = (weights("unquantized", num_local_experts, n_embd)  # gate (replicated)
+                       + weights("routed_expert", expert_width, n_embd, 2 * experts_per_rank)
+                       + weights("routed_expert", n_embd, expert_width, experts_per_rank)
+                       + weights("shared_expert", 2 * shared_width, n_embd)
+                       + weights("shared_expert", n_embd, shared_width))
         output_size = length * n_embd * afp
 
     # ----------------- LM Head -----------------
@@ -1623,7 +1766,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         from .communication import dtype_bytes, vocab_shard_size
         local_vocab = vocab_shard_size(config, p)
         input_size = length * n_embd * afp
-        weight_size = n_embd * local_vocab * afp
+        weight_size = weights("unquantized", local_vocab, n_embd)
         output_size = length * local_vocab * dtype_bytes(config.get("head_dtype"), afp)
 
     # ----------------- MTP (the model's own drafter) -----------------
@@ -1638,7 +1781,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # divisor -- which is why they are separate names rather than one.
         shard = p if layer_name == "mtp_fc" else 1
         input_size = length * 2 * n_embd * afp
-        weight_size = (2 * n_embd) * (n_embd // shard) * fp
+        weight_size = weights("linear", n_embd // shard, 2 * n_embd)
         output_size = length * (n_embd // shard) * afp
 
     elif layer_name in ("mtp_enorm_hnorm", "mtp_norms"):
@@ -1648,14 +1791,15 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # matters, but it is the honest shape.
         count = 2 if layer_name == "mtp_enorm_hnorm" else 3
         input_size = length * n_embd * afp
-        weight_size = count * n_embd * afp
+        weight_size = weights("unquantized", 1, n_embd, count)
         output_size = length * n_embd * afp
 
     elif layer_name == "mtp_shared_head":
         # DeepSeek/GLM's SharedHead: a norm plus the LM head. Reported under
         # the wrapper, so its size is the pair's.
         input_size = length * n_embd * afp
-        weight_size = (n_embd + n_embd * (vocab_size // p)) * afp
+        weight_size = (weights("unquantized", 1, n_embd)
+                       + weights("unquantized", vocab_size // p, n_embd))
         output_size = length * (vocab_size // p) * afp
 
     elif layer_name == "mtp_glue":
