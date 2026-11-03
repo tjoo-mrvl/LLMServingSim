@@ -106,13 +106,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
 
 - Size tensors between layers at the checkpoint's floating (activation) dtype
   instead of its weight dtype: layer inputs and outputs, pipeline-stage
-  transfers, TP collectives, MoE dispatch, combine and restore payloads, the
-  token-id input and, on a quantized checkpoint without a KV scheme, the KV
-  cache. A quantized checkpoint such as DeepSeek-R1 (FP8 weights, W8A8 GEMMs,
-  bf16 between layers) had all of these at 1 byte per element, and the native
-  MoE check refused its bf16 component tables. Unquantized checkpoints are
-  unchanged. `sparse_mla` (+0.025%) and `spec_sparse_mla` (+0.055%) move
-  because DeepSeek-V3.2's FP8 pipeline-stage transfers double; the
+  transfers, TP collectives, MoE dispatch, combine and restore payloads and,
+  on a quantized checkpoint without a KV scheme, the KV cache. A quantized
+  checkpoint such as DeepSeek-R1 (FP8 weights, W8A8 GEMMs, bf16 between layers)
+  had all of these at 1 byte per element, and the native MoE check refused its
+  bf16 component tables. The token-id input is now a fixed 4 bytes per token,
+  vLLM's int32 input-ID buffer, instead of a multiple of a dtype width, which
+  gave FP8 checkpoints 2 bytes. Unquantized checkpoints are unchanged.
+  `sparse_mla` (+0.025%) and `spec_sparse_mla` (+0.055%) move because
+  DeepSeek-V3.2's FP8 pipeline-stage transfers double; the
   DeepSeek-V3.2-Exp-16L64E example moves by at most 3.4 µs per request. See
   [CLI flags → Precision](https://llmservingsim.ai/docs/reference/cli-flags#precision).
 - Size per-GPU weights as vLLM stores them. On a quantized checkpoint the

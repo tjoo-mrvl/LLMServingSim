@@ -70,6 +70,8 @@ in. DeepSeek-R1 runs W8A8 FP8 GEMMs, converting each layer's input to FP8 inside
 the layer, but every tensor between layers is bf16: a layer's input and output
 sizes, TP collectives, pipeline-stage transfers and MoE dispatch payloads are all
 sized at 2 bytes per element, while quantized weights keep the weight dtype.
+Token IDs are the exception: vLLM holds them as int32 in both model runners, so
+the embedding's input is 4 bytes per token whatever the model's dtype.
 The layers vLLM never quantizes — embeddings, the LM head, norms and the MoE
 router gate — are stored at the floating dtype too, and so is the per-GPU
 weight that bounds the KV cache (see

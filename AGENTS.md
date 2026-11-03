@@ -2070,7 +2070,9 @@ pipeline-stage transfer, an MoE dispatch or restore -- is bf16 (`torch_dtype`).
 `memory_model.activation_element_bytes` is that width; `calculate_sizes` uses it
 for input and output sizes and the weight dtype for weights. Its KV-cache read
 and recurrent-state terms keep their existing sizing. Unquantized checkpoints
-are unchanged, because their weight and activation dtypes agree.
+are unchanged, because their weight and activation dtypes agree. Token IDs
+follow neither: vLLM 0.31's input-ID buffer is int32 in both model runners, so
+the embedding's input is 4 bytes per token. Do not derive it from a dtype width.
 
 Profiler `--dtype auto` uses the omitted-dtype naming path. An explicit BF16/FP16
 matching a quantized checkpoint's declared activation dtype keeps the quantization

@@ -1177,7 +1177,10 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         # ``mtp_embed`` is the drafter's own embed_tokens -- the same shape as
         # the target's, and a separate table: vLLM's MTP wrappers build one
         # rather than sharing.
-        input_size = length * afp * 2  # token_ids are int32 or int64
+        # Token IDs are int32 whatever the model's dtype: vLLM 0.31 allocates
+        # its input-ID buffer that way in both model runners
+        # (``v1/worker/gpu_model_runner.py``, ``v1/worker/gpu/input_batch.py``).
+        input_size = length * 4
         if layer_name == "embedding":
             from .communication import vocab_shard_size
             local_vocab = vocab_shard_size(config, p)
