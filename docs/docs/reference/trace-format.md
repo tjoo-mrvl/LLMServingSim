@@ -257,9 +257,14 @@ by exactly this pair, `comm_type` `NONE` with `comm_size` greater than
 `0`, not by its name.
 
 The carrier is `qkv_proj` where the block has one (every GQA family).
-A block without it carries the send on the attention row that writes
-the cache, `attention` or `sparse_attention`: an MLA block (DeepSeek,
-GLM) projects its latent in `mla_qkv_a_proj` and has no `qkv_proj`.
+A block without it carries the send on its last row in the catalog's
+`attention` category, the kernel that runs once the cache is written:
+`attention` for an MLA block (DeepSeek, GLM), which projects its latent
+in `mla_qkv_a_proj` and has no `qkv_proj`; `sparse_attention` for
+MiniMax-M3's sparse layers; `dsa_attention_tail` for DeepSeek-V3.2's
+native layout. The category decides, not a list of names, so a new
+attention kernel needs nothing added. A prefill layer that caches KV but
+has no such row stops the simulator rather than shipping nothing.
 
 The value is the layer's **per-rank KV** byte count, from its own
 cache shape and honouring `kv_cache_dtype`: GQA ships its share of K

@@ -1695,13 +1695,19 @@ sampler_291  25933        LOCAL        2565120       LOCAL         0            
 - On a prefill instance (`pd_type == "prefill"`) one row per block carries the **P/D KV
   transfer**: its `comm_size` holds the layer's per-rank KV bytes while `comm_type` stays
   `NONE`, since a SEND/RECV pair only needs comm_size/src/dst/tag. The carrier is
-  `qkv_proj` where the block has one, otherwise its `attention` / `sparse_attention` row
-  (`_pd_kv_carrier`): MLA blocks (DeepSeek, GLM) have no `qkv_proj` and used to ship
-  nothing. The bytes follow the layer's cache shape (`kv_bytes_per_token_per_layer`:
+  `qkv_proj` where the block has one, otherwise the block's **last** entry in the
+  catalog's `attention` category (`_pd_kv_carrier`): `attention` for MLA (DeepSeek,
+  GLM, which have no `qkv_proj` and used to ship nothing), `sparse_attention` for
+  MiniMax-M3's sparse layers, `dsa_attention_tail` for V3.2's native layout. Choose it by
+  category, never by a name list: a name list gave the native layout no carrier, so it
+  would have shipped nothing silently. `_require_pd_kv_carrier` refuses a prefill layer
+  that caches KV but has no carrier, and `_emit_layer` takes the choice as
+  `pd_kv_carrier`. Kimi-K3's KDA blocks trip that refusal, through the upstream MLA
+  ordering in `kv_cache_layout`; Kimi-K3 runs no P/D. The bytes follow the layer's cache shape (`kv_bytes_per_token_per_layer`:
   sharded ÷ TP + replicated, honouring `kv_cache_dtype`), so GQA ships its K+V share and
   MLA its whole latent. `convert_prefill` sends after any row with `comm_type NONE` and
   `comm_size > 0` — the name no longer matters — and `_emit_layer` refuses that pair on
-  any other row, so a stray value cannot become a send. It used to read the layer's
+  any row that is not the chosen carrier, so a stray value cannot become a send. It used to read the layer's
   `output_size`, i.e. the whole QKV activation, which shipped Q as well and overstated
   the transfer by `(q_dim + 2*kv_dim) / (2*kv_dim)` — 3x for Llama-3.1-8B
 - `misc`: `NONE` or batch tag for sub-batch interleaving (`BATCH_1`, `BATCH_2`)

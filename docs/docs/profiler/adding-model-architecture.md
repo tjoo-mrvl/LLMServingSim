@@ -268,6 +268,13 @@ linear-attention block runs several non-interchangeable kernels on the same
 axes. `attention` may also hold more than one entry now — a sparse-attention
 model runs an indexer kernel alongside the attention kernel on the same axes.
 
+The `attention` category also places a P/D prefill instance's KV send: it rides
+on a block's `qkv_proj`, or, where the block has none, on its last entry in this
+category, after which the layer's cache is complete. List a block's entries in
+execution order so that holds. A block whose layer caches KV but has neither is
+refused on a prefill instance; see
+[Trace format](/docs/reference/trace-format#comm_size-without-a-collective).
+
 ### How finely to divide: the granularity rule
 
 The entry *set* is not a style choice. A `catalog` entry exists iff the profile
