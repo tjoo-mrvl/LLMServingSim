@@ -197,7 +197,9 @@ infer TP/DP values or enable tensor-sharded experts. A MoE slice matches only
 Each rank is emulated on one physical GPU, with communication modeled separately.
 `slice --group moe` also accepts `--moe-ranks` to measure only some EP ranks, so
 one process per GPU can acquire a target in parallel and a rank cross-check is
-logged once every rank is published; see
+logged once every rank is published; `profiler/profile-moe-ranks.sh` runs those
+processes for one deployment
+([Multi-GPU MoE ranks](#multi-gpu-moe-ranks-profile-moe-rankssh)). See
 [native components](./native-moe-components#acquire-a-deployment-matched-table).
 In either shell template, `DP_DEGREES="1,2"` selects local and DP+EP targets,
 `EP_DEGREES` forwards `--ep`, and `MOE_ROUNDS` controls repeated contexts.
@@ -1020,6 +1022,28 @@ ATTENTION_CHUNK_FACTOR=1.5 \
 To change models or their TP/DP settings, edit the `JOBS=( ... )` array at the top
 of the script. This file is meant to be copied or tweaked in-place,
 not treated as a stable CLI.
+
+## Multi-GPU MoE ranks: `profile-moe-ranks.sh`
+
+Acquires one native MoE deployment's components, every EP rank of TP × DP
+(EP = TP × DP), on one output root:
+
+```bash
+MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 HARDWARE=RTXPRO6000 TP=2 \
+    ./profiler/profile-moe-ranks.sh
+```
+
+Each visible GPU (`CUDA_VISIBLE_DEVICES`, else every GPU `nvidia-smi` lists)
+runs one `slice --group moe --moe-ranks` process. With G GPUs and more ranks,
+GPU i measures ranks i, i+G, … in turn, so a single GPU measures them all.
+Never place two processes on one GPU: they disturb each other's timings and
+the expert conditioning gate refuses to publish. `DP` defaults to 1, and `EP`,
+if set, must equal TP × DP. `OUT_ROOT`, `MOE_ROUNDS` and `MOE_GRID_FACTOR`
+forward the matching flags; arguments after the script name reach every slice
+unchanged, so engine limits such as `--max-num-batched-tokens` go there.
+Per-process logs land in `LOG_DIR` (default `outputs/profile-moe-ranks/`), and
+the log that finished last ends with the rank cross-check. Ordinary categories
+are not measured; run `profile.sh` for those.
 
 ## Resource safety
 

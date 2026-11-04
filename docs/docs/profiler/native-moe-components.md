@@ -79,6 +79,12 @@ done
 wait
 ```
 
+`profiler/profile-moe-ranks.sh` runs that loop for any MoE model and target:
+`MODEL=... HARDWARE=... TP=2 ./profiler/profile-moe-ranks.sh`, with `DP`
+(default 1), `OUT_ROOT`, `MOE_ROUNDS` and `MOE_GRID_FACTOR`, and further slice
+flags after the script name. It runs one process per visible GPU; with fewer
+GPUs than ranks, each GPU measures several ranks in turn.
+
 Each rank keeps its own table folder and writer lock, and every process
 replaces only its own entry in the locked `meta.yaml`. Processes with disjoint
 ranks can therefore share one output root. Give each process its own GPU.

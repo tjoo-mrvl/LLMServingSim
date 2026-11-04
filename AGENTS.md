@@ -67,7 +67,8 @@ LLMServingSim/
 │   ├── v0/                     # Legacy (pre-rewrite) profiler, kept for reference
 │   ├── profile.sh              # Editable user template (MODEL / HARDWARE / TP_DEGREES / …)
 │   ├── profile-all.sh          # Helper: sweeps several MODELs × TP degrees
-│   └── profile-deepseek-h200.sh # Staged DeepSeek-R1 driver; STAGE=moe runs one EP rank per GPU
+│   ├── profile-moe-ranks.sh    # One native MoE deployment, one slice process per GPU
+│   └── profile-deepseek-h200.sh # Staged DeepSeek-R1 driver; STAGE=moe calls profile-moe-ranks.sh
 ├── bench/                      # vLLM end-to-end benchmark + sim validation (`python -m bench`)
 │   ├── __main__.py             # CLI dispatch (run / validate)
 │   ├── core/                   # internals
@@ -2509,9 +2510,13 @@ EP degrees filter the supported TP/DP targets; they never change expert sharding
 or infer additional TP/DP degrees. Omitted EP keeps every target. Reject unmatched
 EP degrees before any engine starts; a slice matches only `--tp-refresh`.
 The filter affects only MoE components, not ordinary categories at the other TPs.
-`moe_ranks` (`--moe-ranks`, `slice --group moe` only, no shell variable) measures
-only those EP ranks of the selected targets; reject a rank outside every target
-before any engine starts. Disjoint ranks may run as concurrent processes on one
+`moe_ranks` (`--moe-ranks`, `slice --group moe` only, no `profile.sh` variable)
+measures only those EP ranks of the selected targets; reject a rank outside every
+target before any engine starts. `profiler/profile-moe-ranks.sh` takes MODEL,
+HARDWARE, TP, DP and EP (which must equal TP*DP) and runs one slice process per
+visible GPU, GPU i measuring ranks i, i+G, ... in turn, so one GPU measures them
+all; it holds no model-specific setting, and `profile-deepseek-h200.sh` STAGE=moe
+calls it with TP=EP=8. Disjoint ranks may run as concurrent processes on one
 variant root: each rank has its own folder lock and replaces only its own locked
 `meta.yaml` entry. `profile` refuses the option, because ordinary categories need
 one writer. Once every rank of a deployment is published, `rank_cross_check` logs

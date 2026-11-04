@@ -85,6 +85,7 @@ profiler/                          Python package: python -m profiler
 ├── v0/                            archived profiler, not current simulator inputs
 ├── profile.sh                     editable single-model template
 ├── profile-all.sh                 explicit multi-model campaign template
+├── profile-moe-ranks.sh           one native MoE deployment, one process per GPU
 └── profile-deepseek-h200.sh       staged DeepSeek-R1 driver (TP1/TP8, EP8 MoE)
 ```
 
@@ -631,6 +632,25 @@ To change the model list or deployment degrees, edit the `JOBS=( ... )` array at
 of the script. This file is meant to be copied or tweaked in-place,
 not treated as a stable CLI.
 
+### One MoE deployment across GPUs: `profiler/profile-moe-ranks.sh`
+
+Measures every EP rank of one native MoE target, TP × DP with EP = TP × DP,
+as `slice --group moe --moe-ranks` processes on one output root:
+
+```bash
+MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 HARDWARE=RTXPRO6000 TP=2 \
+    ./profiler/profile-moe-ranks.sh
+```
+
+Each visible GPU (`CUDA_VISIBLE_DEVICES`, else every GPU `nvidia-smi` lists)
+runs one process. With G GPUs and more ranks, GPU i measures ranks i, i+G, …
+in turn, so `CUDA_VISIBLE_DEVICES=0` measures every rank on one GPU. `DP`
+defaults to 1; `OUT_ROOT`, `MOE_ROUNDS` and `MOE_GRID_FACTOR` forward the
+matching flags, and arguments after the script name reach every slice
+unchanged. Per-process logs go to `LOG_DIR` (default
+`outputs/profile-moe-ranks/`); the one that finished last ends with the rank
+cross-check. Ordinary categories are not measured here.
+
 ### DeepSeek-R1 on H200: `profiler/profile-deepseek-h200.sh`
 
 A staged driver for DeepSeek-R1 at TP1 and TP8. Run the stages in order, or
@@ -644,10 +664,10 @@ STAGE=moe ./profiler/profile-deepseek-h200.sh        # TP8/EP8 MoE components, o
 STAGE=skew ./profiler/profile-deepseek-h200.sh       # the skew sweep
 ```
 
-`STAGE=moe` runs `slice --group moe --moe-ranks r` for EP ranks 0-7, rank r on
-the r-th visible GPU, with per-rank logs in `MOE_LOG_DIR`
-(default `outputs/profile-deepseek-h200/`). `MOE_PARALLEL=0` measures every
-rank in one process instead. `SMOKE=1` writes `outputs/profile-deepseek-h200/smoke/`
+`STAGE=moe` runs `profile-moe-ranks.sh` with TP = EP = `EP` (default 8) and
+DP 1, one process per visible GPU, with per-process logs in `MOE_LOG_DIR`
+(default `outputs/profile-deepseek-h200/`). `CUDA_VISIBLE_DEVICES=0` measures
+every rank on that one GPU. `SMOKE=1` writes `outputs/profile-deepseek-h200/smoke/`
 unless `OUT_ROOT` is set, so its tiny grid never mixes with the real bundle.
 
 ## Measurement behavior

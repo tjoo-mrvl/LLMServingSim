@@ -44,7 +44,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   target fails before engine startup. Once every rank of a deployment is
   published, a CPU-only rank cross-check logs each rank's time ratio to the
   other ranks at the same points; it reports and changes no data. The default
-  remains one process measuring every rank in turn. See
+  remains one process measuring every rank in turn.
+  `profiler/profile-moe-ranks.sh` runs one deployment's ranks for any MoE
+  model (`MODEL`, `HARDWARE`, `TP`, `DP`; EP is TP×DP), one process per
+  visible GPU, each GPU taking several ranks in turn when there are fewer GPUs
+  than ranks. See
   [Native MoE components → Acquire](https://llmservingsim.ai/docs/profiler/native-moe-components#acquire-a-deployment-matched-table).
 - Native MoE component acquisition for the shared expert of an EP > 1 target.
   A model with a shared expert, such as DeepSeek-V3/R1, gets a `shared_experts`
@@ -121,15 +125,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   grows from 47.4 to 49.6 GiB per GPU. No regression scenario uses these
   configs.
 - `profiler/profile-deepseek-h200.sh` acquires the TP8/EP8 MoE tables.
-  `STAGE=moe` runs `slice --group moe --moe-ranks r` for EP ranks 0-7, one
-  process per GPU (`MOE_PARALLEL=0` measures every rank in one process), and
-  fails if any rank fails; `STAGE=full` now runs fast, moe and skew in turn.
+  `STAGE=moe` runs them through `profiler/profile-moe-ranks.sh` (`EP`,
+  default 8), one process per visible GPU (`CUDA_VISIBLE_DEVICES=0` measures
+  every rank on one GPU), and fails if any rank fails; `STAGE=full` now runs
+  fast, moe and skew in turn.
   `SMOKE=1` also measures EP8 rank 0's MoE components and writes a scratch
   output root, so its tiny grid no longer blocks the real run from resuming.
   `STAGE=skew` no longer passes `--ep 1`, which the CLI refuses with
   `--only-skew`. The attention chunk factor returns to the profiler default
   2.0, and the script's comments no longer describe nearest-neighbour lookup
-  or MoE priced from an EP1 table.
+  or MoE priced from an EP1 table. The untested `TARGET=v4flash` branch is
+  removed.
 
 ### Fixed
 
