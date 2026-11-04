@@ -118,8 +118,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
 - The DeepSeek-R1 cluster configs (`configs/cluster/deepseek_r1_*.json`) state
   their H200 memory and model runner. `npu_mem.mem_size` is 140.4 GiB, the
   total `nvidia-smi` lists for an H200, until an H200 profile records CUDA's
-  own total; `mem_util` is 0.92, vLLM 0.31's default, instead of the
-  simulator's 0.9, and is not fitted to a benchmark; and
+  own total; `mem_util` is 0.92, vLLM's default since 0.20, instead of the
+  simulator's 0.9, and is not fitted to a benchmark (the cluster-config guide
+  now says to state 0.92 for any vLLM 0.20+ deployment); and
   `cudagraph.runner: "v2"` makes graph padding and pipeline admission follow
   the Model Runner V2 that vLLM 0.31 serves R1 with. R1's KV pool at TP8/EP8
   grows from 47.4 to 49.6 GiB per GPU. No regression scenario uses these

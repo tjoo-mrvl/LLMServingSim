@@ -2261,7 +2261,9 @@ Cluster configs in `configs/cluster/` define hardware topology. Key instance fie
   experts across the group. Works for dense models too (plain DP replicas)
 - `npu_mem.mem_bw`: NPU memory bandwidth (also set as `local-mem-bw` in system.json)
 - `npu_mem.mem_util`: fraction of `mem_size` usable for weights plus KV cache (optional,
-  default from `--npu-memory-utilization`, itself `0.9`). KV capacity is
+  default from `--npu-memory-utilization`, itself `0.9`, vLLM 0.19's default; vLLM 0.20+
+  defaults to `0.92`, so configs for those versions state 0.92 unless matched to a
+  measured run; the CLI default stays `0.9`). KV capacity is
   `mem_size * mem_util - weight`. Sits inside `npu_mem` because its only job is to
   scale `mem_size`, and it follows that block's `mem_*` naming
 - `cpu_mem.mem_bw`: CPU memory bandwidth (set as remote memory in memory_expansion.json)

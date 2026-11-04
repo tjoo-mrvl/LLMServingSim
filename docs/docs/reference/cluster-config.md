@@ -427,7 +427,11 @@ The scheduler overrides are plain keys on the instance object. `mem_util` sits
 ```
 
 It must be a number in `(0, 1]` — it is a *fraction*, so `0.9`, never
-`90`. Anything else raises at startup rather than being clamped.
+`90`. Anything else raises at startup rather than being clamped. The default
+`0.9` is vLLM 0.19's `gpu_memory_utilization`; vLLM 0.20 and later default to
+`0.92`, so a config for a deployment on those versions should state
+`mem_util: 0.92`, as the RTXPRO6000 Llama-3.1-8B and Qwen3-32B examples and the
+DeepSeek-R1 configs do, unless it is matched to a measured run (below).
 
 :::caution[Match it to a measured run when the KV cache saturates]
 `mem_util` sizes the KV cache, and that only shows up in the results once a run

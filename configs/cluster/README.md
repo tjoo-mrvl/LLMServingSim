@@ -153,7 +153,10 @@ model*. Serving two precisions of one model is two **model configs**.
 
 **`npu_mem.mem_util` is the nested CLI override.** The other runtime overrides are plain instance keys;
 `mem_util` lives inside `npu_mem` because its only job is to scale `mem_size`. It must be a
-number in `(0, 1]` — a fraction, so `0.9`, never `90`.
+number in `(0, 1]` — a fraction, so `0.9`, never `90`. The default `0.9` is vLLM 0.19's
+`gpu_memory_utilization`; vLLM 0.20 and later default to `0.92`, so a config for a deployment
+on those versions should state `mem_util: 0.92`, as the RTXPRO6000 Llama-3.1-8B and Qwen3-32B
+examples and the DeepSeek-R1 configs do, unless it is matched to a measured run as above.
 
 **Validation gates:**
 
