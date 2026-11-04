@@ -200,6 +200,21 @@ preparations, because the input quantization is already inside the timed
 `experts` with `identity`, and `prepare` with `timed_input_quantization`.
 Serving refuses quantized tables at DP > 1.
 
+### Expert formats
+
+Each format the modular path supports is one class in
+`profiler/core/hooks/moe_quant.py`: unquantized and FP8 today. A format mirrors
+vLLM 0.31's own per-format steps in `fused_moe/oracle/` (select the backend,
+convert the checkpoint layout, build the quantization config) and supplies the
+seeded checkpoint, its fp32 dequantization for the output check, its contract
+fields and its DP1 prepare step, plus the linear methods a rebuilt shared expert
+may use. The format is chosen by the routed experts' own vLLM quant method, not
+the checkpoint's quantization config: experts a quantized checkpoint leaves
+unquantized (`Fp8Config`'s ignore list gives them `UnquantizedFusedMoEMethod`)
+take the unquantized modular path. A quant method no format matches keeps the
+live path. The FP8 dtype is the platform's (`current_platform.fp8_dtype()`), as
+vLLM's own weight casting writes it.
+
 ## Shared experts on the modular path
 
 A model with a shared expert, such as DeepSeek-V3/R1, runs it beside the

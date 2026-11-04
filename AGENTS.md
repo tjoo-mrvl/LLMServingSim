@@ -2549,7 +2549,23 @@ Weight banks clone the scales with the weights. EP1 keeps the live path;
 per-tensor or static FP8, other quantization methods and FP8 at DP>1 are
 refused. Serving loads both preparations; the label must match
 `expert_region.input_quantization` (`experts` with `identity`, `prepare` with
-`timed_input_quantization`). Quantized tables at DP>1 are refused.
+`timed_input_quantization`), through `_DP1_PREPARE` in `serving/core/moe_components.py`.
+Quantized tables at DP>1 are refused.
+
+Expert formats live in `profiler/core/hooks/moe_quant.py`, one class per format
+(`UnquantizedExperts`, `Fp8Experts`), each mirroring vLLM 0.31's per-format oracle
+steps (`select_<fmt>_moe_backend`, `convert_to_<fmt>_moe_kernel_format`,
+`make_<fmt>_moe_quant_config`) plus checkpoint seeding, the fp32 dequantization
+for the output check, contract fields, the DP1 prepare and, for a rebuilt shared
+expert, linear admission, seeding and loading. `NativeExpertRegion`, the
+component measurement, the bank rebuild and the shared expert hold no
+format-specific branch. The format is chosen by the routed experts' own vLLM
+quant method (`runner.routed_experts.quant_method`), never the model-level quant
+config: `Fp8Config` gives an ignored expert `UnquantizedFusedMoEMethod`, and such
+experts take the unquantized modular path. The FP8 dtype is
+`current_platform.fp8_dtype()`, as vLLM's `per_block_cast_to_fp8` writes it. Add a
+format (DeepSeek-V4's MXFP4 experts) as one class in `FORMATS` plus its
+`_DP1_PREPARE` rows; a method no format matches keeps the live path.
 
 An EP>1 target's shared expert (`runner._shared_experts`) is measured as a
 `shared_experts` component on local rows, placed after the other components.

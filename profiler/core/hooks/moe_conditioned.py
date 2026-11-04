@@ -42,10 +42,10 @@ def measure_experts(owner, point, iterations, failure_dir=None):
                 raise MemoryError('Native processed weight bank plus workspace reserve exceeds free GPU memory')
             owner.expert_banks.append(owner.expert.clone())
         else:
-            # (w13, w2), plus their Fp8Scales for FP8 experts: every bank is
-            # rebuilt from its own copy of the checkpoint, scales included.
+            # Every bank is rebuilt from its own copy of the checkpoint, scales
+            # included (moe_quant.ExpertWeights), through the same format.
             owner.expert_banks.append(NativeExpertRegion(
-                owner.cfg,*(v.clone() for v in owner.checkpoint_weights)))
+                owner.cfg, owner.checkpoint_weights.clone(), owner.format))
     generator = torch.Generator(device=owner.device).manual_seed(n)
     hidden = torch.randn((n,owner.cfg.hidden_dim),device=owner.device,
                          dtype=owner.cfg.in_dtype,generator=generator)

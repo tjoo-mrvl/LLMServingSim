@@ -89,6 +89,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
 
 ### Changed
 
+- Native MoE component acquisition picks the expert format from the routed
+  experts' own vLLM quant method instead of the checkpoint's quantization
+  config, so experts a quantized checkpoint leaves unquantized (on
+  `Fp8Config`'s ignore list) take the unquantized modular path rather than the
+  live one. Each format is one class in `profiler/core/hooks/moe_quant.py`
+  (unquantized and FP8), mirroring vLLM's per-format oracle steps, and FP8
+  weights use the platform's FP8 dtype. Unquantized contracts are unchanged,
+  so existing tables stay valid. See
+  [Native MoE components → Expert formats](https://llmservingsim.ai/docs/profiler/native-moe-components#expert-formats).
 - Detect MLA with vLLM 0.31's own `use_mla` rule — the text tower's model type
   on vLLM's MLA list, a causal model, and `kv_lora_rank` — instead of
   `kv_lora_rank` alone. One helper, `kv_cache_layout`, now decides the latent

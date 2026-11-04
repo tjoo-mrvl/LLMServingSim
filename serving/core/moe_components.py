@@ -23,6 +23,18 @@ from .communication import dtype_bytes
 from .memory_model import tensor_nbytes
 
 
+# The DP1 ``local_execution.prepare`` label each admitted expert format records,
+# keyed by the expert region's ``(quantization.method, input_quantization)``
+# (profiler/core/hooks/moe_quant.py). Experts that quantize their own input
+# leave vLLM's prepare an identity; otherwise the prepare quantizes it and is
+# timed inside ``experts``. A new format adds its rows here.
+_DP1_PREPARE = {
+    (None, None): 'identity',
+    ('fp8', 'experts'): 'identity',
+    ('fp8', 'prepare'): 'timed_input_quantization',
+}
+
+
 class MoeCoverageError(ValueError):
     pass
 
@@ -262,19 +274,17 @@ class MoeComponentTable:
                     or region.get('intermediate_size') != contract['expert_intermediate_size']):
                 raise ValueError('Live expert tensor geometry differs from the component contract')
         elif target.dp == 1:
-            # The DP1 prepare either hands the input through or, for FP8 experts
-            # that take quantized input, quantizes it inside the timed experts
-            # call (profiler/core/hooks/moe_components.py:_verify_local_boundary).
-            # Neither adds a phase; the label must match the recorded quantizer.
+            # The DP1 prepare either hands the input through or, for quantized
+            # experts that take quantized input, quantizes it inside the timed
+            # experts call (profiler/core/hooks/moe_components.py
+            # :_verify_local_boundary). Neither adds a phase; the label must
+            # match the recorded quantizer (_DP1_PREPARE).
             quantization = region.get('quantization')
-            if quantization is None:
-                prepare = 'identity'
-            elif (quantization.get('method') == 'fp8'
-                    and region.get('input_quantization') in ('experts', 'prepare')):
-                prepare = ('identity' if region['input_quantization'] == 'experts'
-                           else 'timed_input_quantization')
-            else:
+            key = (None if quantization is None else quantization.get('method'),
+                   region.get('input_quantization'))
+            if key not in _DP1_PREPARE:
                 raise ValueError('Unknown native expert quantization contract')
+            prepare = _DP1_PREPARE[key]
             if contract.get('local_execution') != dict(
                     prepare=prepare, finalize='output_alias_noop', expert_output_alias=True):
                 raise ValueError('DP1 requires a verified preparation and aliased no-op finalization')

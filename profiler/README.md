@@ -70,6 +70,7 @@ profiler/                          Python package: python -m profiler
 │       ├── moe_live_components.py native local gate/expert/wrapper boundaries
 │       ├── moe_live_region.py     processed native expert state and bank cloning
 │       ├── moe_shared_expert.py   EP-rank shared expert rebuilt at TP width
+│       ├── moe_quant.py           per-format expert weights (unquantized, FP8)
 │       └── moe_hook.py            native MoE runner discovery
 ├── models/                        architecture catalogs and model-type aliases
 │   ├── llama.yaml
@@ -183,6 +184,8 @@ target also take the modular path: seeded weights in the checkpoint's FP8 block
 layout, the backend vLLM selects for that target, a one-time fp32 output check
 and the DP1 input quantization timed inside `experts`
 ([details](../docs/docs/profiler/native-moe-components.md#fp8-experts-on-the-modular-path)).
+Each expert format is one class in `core/hooks/moe_quant.py`, chosen by the
+routed experts' own vLLM quant method.
 The separately admitted
 [live local path](../docs/docs/profiler/native-moe-components.md#live-local-boundaries)
 retains native expert prepare/finalize and adds measured wrapper work.

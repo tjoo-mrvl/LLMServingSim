@@ -17,9 +17,11 @@ Admission goes by structure, never by model family. Required: a
 ``gate_up_proj`` ``MergedColumnParallelLinear`` with two equal halves, an
 ``act_fn`` without weights, and a ``down_proj`` ``RowParallelLinear`` over one
 half that leaves the reduction to the runner. Nothing else may hold weights,
-and there is no bias. Both linears must be TP-sharded and unquantized, or
-block-FP8 with dynamic activations. Anything else raises with the mismatch
-named. Sequence-parallel MoE replicates the shared expert and is refused.
+and there is no bias. Both linears must be TP-sharded, in a linear format
+``moe_quant`` admits: unquantized, or block-FP8 with dynamic activations.
+Each linear's format seeds, loads and dequantizes its checkpoint. Anything
+else raises with the mismatch named. Sequence-parallel MoE replicates the
+shared expert and is refused.
 """
 import copy
 import logging
@@ -27,26 +29,19 @@ import math
 
 import torch
 
-from .moe_components import FP8_OUTPUT_TOLERANCE, _dequantize
+from .moe_quant import FORMATS, OUTPUT_TOLERANCE, linear_format
 
 
 def _qualname(cls):
     return f'{cls.__module__}.{cls.__qualname__}'
 
 
-def _quantization(linear, problems):
-    """The linear's FP8 method, None when unquantized, or a recorded problem."""
-    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-    from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
-
+def _admit_linear(linear, problems):
+    """Record a problem unless a ``moe_quant`` format admits the linear's method."""
     method = linear.quant_method
-    if isinstance(method, UnquantizedLinearMethod):
-        return None
-    if isinstance(method, Fp8LinearMethod) and method.block_quant and not method.act_q_static:
-        return method
-    problems.append(f'{linear.prefix} uses {type(method).__name__}; only unquantized and '
-                    'block-FP8 linears with dynamic activations are admitted')
-    return None
+    if not any(fmt.matches_linear(method) for fmt in FORMATS):
+        problems.append(f'{linear.prefix} uses {type(method).__name__}; only unquantized and '
+                        'block-FP8 linears with dynamic activations are admitted')
 
 
 def admit(runner, target, hidden_dim):
@@ -88,7 +83,7 @@ def admit(runner, target, hidden_dim):
                     problems.append(f'{linear.prefix} has a bias')
                 if linear.disable_tp:
                     problems.append(f'{linear.prefix} is replicated across TP (disable_tp)')
-                _quantization(linear, problems)
+                _admit_linear(linear, problems)
             if gate_up.output_sizes[0] % target.tp:
                 problems.append(f'its intermediate size {gate_up.output_sizes[0]} does not '
                                 f'divide by TP={target.tp}')
@@ -106,7 +101,7 @@ class SharedExpertCopy:
     so here it is a zero tensor of the right shape.
     """
 
-    def __init__(self, vllm_config, runner, target, device, ue8m0):
+    def __init__(self, vllm_config, runner, target, device):
         from vllm.config import set_current_vllm_config
 
         self.runner = runner
@@ -141,6 +136,9 @@ class SharedExpertCopy:
         self.module._parameters = type(layer._parameters)(layer._parameters)
         self.module._buffers = type(layer._buffers)(layer._buffers)
         self.module.gate_up_proj, self.module.down_proj = new_gate_up, new_down
+        # Each linear's own format: its method class is the engine's (above).
+        self.formats = dict(gate_up_proj=linear_format(new_gate_up.quant_method, vllm_config),
+                            down_proj=linear_format(new_down.quant_method, vllm_config))
 
         gen = torch.Generator(device=device).manual_seed(0)
         h, dtype = gate_up.input_size, gate_up.params_dtype
@@ -150,18 +148,17 @@ class SharedExpertCopy:
 
         # Checkpoint layout: gate and up are separate tensors, each with its own
         # scale grid, loaded as shards 0 and 1 of gate_up_proj.
+        gate_up_fmt, down_fmt = self.formats['gate_up_proj'], self.formats['down_proj']
         self.checkpoint = dict(
-            gate_up_proj=[self._checkpoint(new_gate_up, values(width, h), ue8m0),
-                          self._checkpoint(new_gate_up, values(width, h), ue8m0)],
-            down_proj=[self._checkpoint(new_down, values(h, width), ue8m0)])
+            gate_up_proj=[gate_up_fmt.linear_checkpoint(new_gate_up, values(width, h)),
+                          gate_up_fmt.linear_checkpoint(new_gate_up, values(width, h))],
+            down_proj=[down_fmt.linear_checkpoint(new_down, values(h, width))])
         for name, linear in (('gate_up_proj', new_gate_up), ('down_proj', new_down)):
             shards = self.checkpoint[name]
             for shard_id, (weight, scale) in enumerate(shards):
-                # vLLM's own loaders place each shard and its scale block rows.
+                # vLLM's own loaders place each shard (and its scale block rows).
                 ids = (shard_id,) if len(shards) > 1 else ()
-                linear.weight.weight_loader(linear.weight, weight, *ids)
-                if scale is not None:
-                    linear.weight_scale_inv.weight_loader(linear.weight_scale_inv, scale, *ids)
+                self.formats[name].linear_load(linear, weight, scale, ids)
             # What vLLM's model loader does once every weight is in place.
             linear.quant_method.process_weights_after_loading(linear)
             if hasattr(linear, 'update_param_tp_status'):
@@ -191,20 +188,7 @@ class SharedExpertCopy:
             boundary='shared_mlp_routed_scale_and_add',
             weight_recipe=dict(values='seeded_randn_0.01', loading='native_weight_loader',
                                output_check=dict(reference='fp32_dequantized_weights',
-                                                 relative_frobenius_tolerance=FP8_OUTPUT_TOLERANCE)))
-
-    @staticmethod
-    def _checkpoint(linear, weight, ue8m0):
-        """``(values, scale)`` as a checkpoint stores this linear's weight.
-
-        Block-FP8 values carry one ``amax / 448`` dequantization scale per
-        block, written by vLLM's ``per_block_cast_to_fp8`` (power-of-two for
-        ``scale_fmt: ue8m0``), as for the routed experts.
-        """
-        if _quantization(linear, []) is None:
-            return weight, None
-        from vllm.utils.deep_gemm import per_block_cast_to_fp8
-        return per_block_cast_to_fp8(weight, list(linear.weight_block_size), use_ue8m0=ue8m0)
+                                                 relative_frobenius_tolerance=OUTPUT_TOLERANCE)))
 
     @torch.inference_mode()
     def check_output(self, hidden):
@@ -214,24 +198,21 @@ class SharedExpertCopy:
         the reference does not, so a few percent is expected; a wrong layout,
         scale or shard placement is of order one.
         """
-        def dense(weight, scale, block):
-            return weight.float() if scale is None else _dequantize(weight, scale, block)
-
         def matrix(name, linear):
-            block = getattr(linear, 'weight_block_size', None)
-            return torch.cat([dense(w, s, block) for w, s in self.checkpoint[name]])
+            fmt = self.formats[name]
+            return torch.cat([fmt.linear_dense(w, s, linear) for w, s in self.checkpoint[name]])
 
         act = self.module.act_fn
         native = getattr(act, 'forward_native', act)
         gate_up = hidden.float() @ matrix('gate_up_proj', self.module.gate_up_proj).T
         reference = native(gate_up) @ matrix('down_proj', self.module.down_proj).T
         error = ((self.module(hidden).float() - reference).norm() / reference.norm()).item()
-        if not math.isfinite(error) or error > FP8_OUTPUT_TOLERANCE:
+        if not math.isfinite(error) or error > OUTPUT_TOLERANCE:
             raise ValueError(f'Shared-expert output differs from the fp32 reference by {error:.4f} '
-                             f'(relative Frobenius norm, tolerance {FP8_OUTPUT_TOLERANCE})')
+                             f'(relative Frobenius norm, tolerance {OUTPUT_TOLERANCE})')
         logging.getLogger(__name__).info(
             'Shared-expert output check: relative error %.4f (tolerance %s)',
-            error, FP8_OUTPUT_TOLERANCE)
+            error, OUTPUT_TOLERANCE)
         return error
 
     def bind(self, hidden):
