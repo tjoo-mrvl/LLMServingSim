@@ -122,3 +122,12 @@ catalog:
   moe:
     moe:
       vllm: DeepseekV2MoE
+      # Audited against vLLM 0.31 deepseek_v2.py: DeepseekV2MoE reads
+      # use_sequence_parallel_moe (:312), replicating the shared expert
+      # (disable_tp, :266/:275), and at PP1 the decoder keeps tokens sharded
+      # through attention as well -- o_proj skips its AllReduce (:1324) for a
+      # ReduceScatter, and the next layer AllGathers back (:1299-1303,
+      # :1371-1409). Serving refuses that attention-wide layout until it is
+      # implemented.
+      sequence_parallel: true
+      attention_sequence_parallel: true

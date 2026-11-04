@@ -121,6 +121,18 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
 
 ### Fixed
 
+- Decide sequence-parallel MoE with one rule,
+  `moe_deployment.sequence_parallel_moe`, shared by the memory model, the native
+  MoE tables and the profiler. The memory model used to read a missing catalog
+  flag as "not sequence-parallel" while the other two refused it; a TP>1 × DP>1
+  MoE deployment without an audited `sequence_parallel` flag is now refused
+  everywhere. DeepSeek-V3/R1's catalog declares `sequence_parallel` and
+  `attention_sequence_parallel`, as vLLM 0.31's `deepseek_v2.py` runs it, so
+  R1 at TP8 × DP2 holds its shared expert whole (43.54 GiB per GPU, not 41.46)
+  and is refused before its first trace: attention-wide sequence parallelism is
+  not implemented yet. `deepseek_r1_dp_ep.json` is kept for when it is. No
+  regression clock or example moves. See
+  [Parallelism mechanics](https://llmservingsim.ai/docs/simulator/parallelism-mechanics#attention-wide-sequence-parallelism).
 - Size tensors between layers at the checkpoint's floating (activation) dtype
   instead of its weight dtype: layer inputs and outputs, pipeline-stage
   transfers, TP collectives, MoE dispatch, combine and restore payloads and,

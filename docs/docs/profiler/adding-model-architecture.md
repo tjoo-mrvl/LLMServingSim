@@ -347,7 +347,7 @@ share a granularity.
 | `not_within` | optional | Ancestor class(es) that **disqualify** a node. For when one class plays two roles that `within` cannot separate because it is the immediate parent in both — DeepSeek's shared expert is a `DeepseekV2MLP`, exactly like a dense layer's own `mlp`, and is 9x narrower. Accepts a list |
 | `tp_stable` | optional (default `false`) | `true` if the layer's latency doesn't depend on TP degree (layernorms, sampler). Profiled once at TP=1; the writer replicates stable `dense`/`per_sequence` rows, while stable MTP rows are read directly at TP1 |
 | `tp_output_reduction` | optional | `all_reduce` on a `dense` row-output projection; emits a TP reduction of its full output at activation dtype |
-| `sequence_parallel` | optional | Whether a MoE wrapper sequence-shards inputs under DP+TP |
+| `sequence_parallel` | optional | Whether a MoE wrapper sequence-shards inputs under DP+TP, i.e. whether the family's vLLM model code reads `use_sequence_parallel_moe` (Qwen3-MoE and DeepSeek do; Mixtral and PhiMoE do not). Audit it from that code: a TP>1 × DP>1 deployment of a MoE entry without it is refused by the profiler and the simulator alike |
 | `attention_sequence_parallel` | optional | Declares attention-wide sequence shards; requires `sequence_parallel: true` on a MoE entry and triggers the unsupported-deployment guard described in [parallelism mechanics](../simulator/parallelism-mechanics#attention-wide-sequence-parallelism) |
 
 Each entry requires exactly one of `vllm`, `operator` or `callable`.

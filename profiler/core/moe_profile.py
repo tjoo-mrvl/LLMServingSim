@@ -11,7 +11,7 @@ import statistics
 import time
 
 from .config import HOST_ENGINE_DEFAULTS, load_architecture, probe_moe_params
-from .moe_deployment import MoeTarget, component_names
+from .moe_deployment import MoeTarget, component_names, sequence_parallel_moe
 from .moe_geometry import ExpertPlacement
 from .moe_conditioning import expert_conditioning
 from .bundle_metadata import read_tp, update_tp, update_bundle
@@ -419,13 +419,13 @@ def resolve_targets(arch, args, tps):
                 "Only full expert parallelism (EP=TP*DP) is supported.")
         pairs = [(tp, dp) for tp, dp in pairs if tp*dp in requested]
     entry = next(iter(arch.catalog.moe.values()))
-    if (any(tp > 1 and dp > 1 for tp, dp in pairs)
-            and entry.sequence_parallel is None):
-        raise ValueError("TP+DP requires an audited MoE sequence_parallel catalog binding")
+    # Resolved for every pair before any probing, so an unaudited flag stops
+    # the request before work starts.
+    sp = {(tp, dp): sequence_parallel_moe(entry.sequence_parallel, tp, dp) for tp, dp in pairs}
     experts, _ = probe_moe_params(text_config(args.model_config))
     if any(tp*dp > experts for tp, dp in pairs):
         raise ValueError("Requested EP degree exceeds the global expert count")
-    targets = [MoeTarget(tp, dp, tp*dp, rank, bool(entry.sequence_parallel and tp>1 and dp>1))
+    targets = [MoeTarget(tp, dp, tp*dp, rank, sp[(tp, dp)])
                for tp, dp in pairs for rank in range(tp*dp)]
     ranks = getattr(args, 'moe_ranks', None)
     if ranks is not None:

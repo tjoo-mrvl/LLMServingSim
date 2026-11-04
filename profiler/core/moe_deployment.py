@@ -30,6 +30,28 @@ def component_names(contract):
     return expected
 
 
+def sequence_parallel_moe(declared, tp, dp):
+    """Whether a TP x DP deployment runs this MoE block sequence-parallel.
+
+    vLLM 0.31's switch is deployment-wide (``ParallelConfig
+    .use_sequence_parallel_moe``: an EP all2all backend such as the default
+    allgather_reducescatter, expert parallelism, TP > 1 and DP > 1), but only
+    a family whose model code reads it shards its MoE input across TP
+    (Qwen3-MoE, DeepSeek); Mixtral's and PhiMoE's never do. The catalog's
+    ``sequence_parallel`` (``declared``) records which kind a family is, so
+    a TP > 1, DP > 1 deployment without that audited flag raises rather than
+    guess. Elsewhere the switch is off whatever the catalog says.
+    """
+    if tp <= 1 or dp <= 1:
+        return False
+    if type(declared) is not bool:
+        raise ValueError(
+            "TP>1 + DP>1 MoE needs an audited sequence_parallel catalog flag: vLLM "
+            "turns sequence-parallel MoE on for the deployment, but only some "
+            "families' model code uses it")
+    return declared
+
+
 @dataclass(frozen=True)
 class MoeTarget:
     tp: int

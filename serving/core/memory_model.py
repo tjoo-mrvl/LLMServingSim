@@ -6,6 +6,7 @@ from .utils import (
     get_architecture, get_config, get_layer_stack, get_source_config,
     is_moe as _is_moe, num_experts as _num_experts, num_mtp_layers,
 )
+from profiler.core.moe_deployment import sequence_parallel_moe
 from profiler.core.stack import LayerSpec
 from .block_pool import Device, BlockPool, PrefixCacheStats
 from .kv_cache_manager import TieredKVCacheManager, request_block_hashes
@@ -476,14 +477,17 @@ class MemoryModel():
         return weight
 
     def _sequence_parallel_moe(self):
-        """vLLM's sequence-parallel MoE: TP > 1 inside a DP > 1 group whose
-        catalog declares it, the rule ``moe_execution`` applies to the native
-        tables. ``ep_size`` is the whole group's EP degree, TP times DP."""
+        """vLLM's sequence-parallel MoE, by ``moe_deployment
+        .sequence_parallel_moe``, the rule the native tables and the profiler
+        apply too: TP > 1 inside a DP > 1 group whose catalog says the
+        family's model code uses it, and an unaudited catalog at that
+        deployment raises. ``ep_size`` is the whole group's EP degree, TP
+        times DP."""
         dp = self.ep_size // self.tp_size if self.ep_size > self.tp_size else 1
-        if self.tp_size <= 1 or dp <= 1:
-            return False
         entries = (get_architecture(self.model).get("catalog") or {}).get("moe") or {}
-        return any(bool((entry or {}).get("sequence_parallel")) for entry in entries.values())
+        return any([sequence_parallel_moe((entry or {}).get("sequence_parallel"),
+                                          self.tp_size, dp)
+                    for entry in entries.values()])
 
     # -------------------- KV sizing math --------------------
 

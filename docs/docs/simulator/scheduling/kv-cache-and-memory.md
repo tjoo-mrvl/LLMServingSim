@@ -87,7 +87,10 @@ experts by `ep_size`. Its format comes from the role vLLM gives the layer
   DeepSeek-V3.2's indexer key projection — keep the floating dtype:
   DeepSeek-R1's fp8 checkpoint stores them in bf16.
 - A shared expert is a TP-sharded MLP whatever the expert parallelism, so it
-  is divided by `tp_size`; only sequence-parallel MoE replicates it.
+  is divided by `tp_size`; only sequence-parallel MoE replicates it. That is
+  TP > 1 inside a DP > 1 group whose catalog declares `sequence_parallel:
+  true` (DeepSeek-R1 at TP8 × DP2 holds 43.54 GiB per GPU, its shared expert
+  whole); a MoE catalog without the flag is refused at that deployment.
 - An MLA layer also holds the `W_UK` / `W_UV` copies vLLM derives from
   `kv_b_proj` at the floating dtype for the absorbed decode path, beside
   `kv_b_proj` itself.

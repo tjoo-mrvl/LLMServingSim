@@ -1,7 +1,7 @@
 """Native MoE component ordering and deployment-aware table selection."""
 from pathlib import Path
 
-from profiler.core.moe_deployment import MoeTarget
+from profiler.core.moe_deployment import MoeTarget, sequence_parallel_moe
 from .communication import dtype_bytes
 from .config_builder import get_device
 from .logger import get_logger
@@ -78,9 +78,7 @@ def emit_native_components(ctx, bctx, lines, power_acc, layer_num, batch_id, bat
     if len(entries) != 1:
         raise ValueError('Native MoE needs one unambiguous catalog component binding')
     entry = next(iter(entries.values()))
-    if ctx.tp_size > 1 and dp > 1 and type(entry.get('sequence_parallel')) is not bool:
-        raise ValueError('TP+DP MoE needs an audited sequence-parallel catalog flag')
-    sp = bool(ctx.tp_size > 1 and dp > 1 and entry.get('sequence_parallel'))
+    sp = sequence_parallel_moe(entry.get('sequence_parallel'), ctx.tp_size, dp)
     expected = dict(model=ctx.model, hardware=ctx.hardware, variant=ctx.perf_db['variant'],
                     global_experts=ctx.gate.E, global_top_k=ctx.gate.k,
                     hidden_dim=ctx.config['hidden_size'],

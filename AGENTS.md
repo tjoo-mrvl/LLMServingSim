@@ -2313,6 +2313,19 @@ An MoE entry's `attention_sequence_parallel: true` requires `sequence_parallel: 
 Serving refuses its TP>1, PP1, DP+EP-spanning deployment before trace emission:
 attention-wide sequence shards need different gathers/scatters and local row counts,
 not a wrapper-only restore. The guard is not certification of every other topology.
+Qwen3.5 and DeepSeek-V3/R1 declare it, so R1 at TP8 × DP2 is refused this way.
+
+Whether a MoE block is sequence-parallel is one rule,
+`profiler/core/moe_deployment.sequence_parallel_moe(declared, tp, dp)`, used by the
+memory model (the shared expert is held whole, not divided by TP), the native tables
+(`moe_execution`) and the profiler (`moe_profile`). vLLM's
+`use_sequence_parallel_moe` is deployment-wide, but only a family whose model code
+reads it shards the MoE input (Qwen3-MoE, DeepSeek; not Mixtral or PhiMoE), so the
+catalog's `sequence_parallel` must be an audited bool at TP>1 × DP>1 and is refused
+when missing. Audit it from the family's vLLM model file. The whole-block `moe.csv`
+fallback (`_emit_moe_block`'s `sp_moe`) still decides from the deployment alone and
+has only the sequence-parallel layout; it agrees for every family with a bundle, and
+a flag-false family there would need the native path's DP-dimension dispatch.
 
 ### Multi-dimensional topology and `involved_dim`
 For DP configurations the network topology is multi-dimensional, innermost dimension

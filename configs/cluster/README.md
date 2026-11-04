@@ -341,7 +341,7 @@ TP because only `tp1` is profiled for those three — see
 | `deepseek_r1_single_instance.json` | DeepSeek-R1 on 8×H200 at TP=8 with EP=8 |
 | `deepseek_r1_tp8_ep1_single_instance.json` | DeepSeek-R1 at TP=8 with expert parallelism off: every rank holds every expert at 1/8 width, and the MoE block closes with a TP all-reduce |
 | `deepseek_r1_tp1_pp8_single_instance.json` | DeepSeek-R1 at TP=1 × PP=8 |
-| `deepseek_r1_dp_ep.json` | DeepSeek-R1 on two 8×H200 nodes, two TP=8 instances in one DP group over EP=16 |
+| `deepseek_r1_dp_ep.json` | DeepSeek-R1 on two 8×H200 nodes, two TP=8 instances in one DP group over EP=16. **Refused until attention-wide sequence parallelism is implemented**: at TP>1 × DP>1, vLLM keeps R1's tokens sharded across TP through attention as well as the MoE (`attention_sequence_parallel`), and the simulator stops before its first trace rather than model only the MoE half. Kept as the layout to run once it is |
 | `deepseek_r1_pd_p5en_2node.json` | DeepSeek-R1 P/D disaggregation across two 8×H200 nodes, TP=8 with EP=8 on each side |
 
 The DeepSeek-R1 configs read `hardware: H200`, so they run once an H200 profile

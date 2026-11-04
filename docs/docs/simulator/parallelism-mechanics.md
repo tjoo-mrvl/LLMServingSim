@@ -68,6 +68,16 @@ AllGather/ReduceScatter, local norm/MoE rows and a final AllGather, not the
 wrapper-only MoE restore implemented by the simulator. Such deployments are
 refused before trace emission. Use TP1 for DP+EP or DP1 for ordinary TP work;
 those alternatives still require matching profile coverage and validation.
+Qwen3.5 and DeepSeek-V3/R1 declare it, so `deepseek_r1_dp_ep.json` (TP8 × DP2)
+is refused this way.
+
+Whether a MoE block is sequence-parallel at all is one rule,
+`profiler/core/moe_deployment.sequence_parallel_moe`, shared by the memory
+model (a sequence-parallel shared expert is held whole on every rank, not
+divided by TP), the native component tables and the profiler: TP > 1 and
+DP > 1 with the catalog's audited `sequence_parallel`, which must be present
+at that deployment. The whole-block `moe.csv` fallback still decides from the
+deployment alone; that agrees for every family with a shipped bundle.
 
 ### Once-per-forward vocab-parallel endpoints
 
