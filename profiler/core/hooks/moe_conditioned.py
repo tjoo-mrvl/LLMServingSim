@@ -1,4 +1,4 @@
-"""Measure complete native expert reuse cycles and retain both controls."""
+"""Measure complete native expert reuse cycles, timed once per point."""
 from collections import Counter
 import hashlib
 from pathlib import Path
@@ -20,10 +20,10 @@ def measure_experts(owner, point, iterations, failure_dir=None):
 
     n, active, pairs = (point[k] for k in ('tokens','activated_experts','local_assignments'))
     plan = expert_conditioning(owner.contract, active, iterations)
-    maximum = max(plan['bank_counts'])
+    banks = plan['banks']
     # The allocation guard includes one extra conversion-sized buffer and
     # an independent output reference. Never relax it after an OOM.
-    additional = maximum-len(owner.expert_banks)
+    additional = banks-len(owner.expert_banks)
     reserve = max(2**30, 8*n*owner.cfg.experts_per_token*owner.cfg.hidden_dim*4)
     free, total = torch.cuda.mem_get_info(owner.device)
     live = owner.contract['expert_region']['schema'] == 'native-live-expert-region'
@@ -63,7 +63,7 @@ def measure_experts(owner, point, iterations, failure_dir=None):
     # caller's output. A distinct final buffer would add a non-native copy.
     output_alias = torch.empty_like(hidden) if owner.target.dp == 1 and not live else None
     calls = [[ProfileCall(bank.bind(hidden,route,weights,output_alias=output_alias)) for route in ids]
-             for bank in owner.expert_banks[:maximum]]
+             for bank in owner.expert_banks[:banks]]
     for bank_calls in calls:
         for r,call in enumerate(bank_calls):
             # Clone before another bank reuses the native output workspace.
@@ -74,38 +74,34 @@ def measure_experts(owner, point, iterations, failure_dir=None):
             if not torch.isfinite(reference).all().item():
                 raise ValueError('Non-finite native expert reference')
             torch.testing.assert_close(result,reference,atol=0,rtol=0)
-    results=[]
-    for arm,banks in enumerate(plan['bank_counts']):
-        cycle = plan['cycles'][arm]
-        count = plan['forward_counts'][arm]
-        def choose(index):
-            position=index%cycle
-            return calls[position%banks][position//banks]
-        for j in range(plan['warmup_forwards']): choose(j)()
-        torch.cuda.synchronize()
-        context=torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                 torch.profiler.ProfilerActivity.CUDA])
-        with context as hook:
-            for j in range(count):
-                with torch.profiler.record_function(MARKER+str(j)):
-                    choose(j)()
-        torch.cuda.synchronize()
-        try:
-            raw=extract_eager_forwards(hook.profiler.kineto_results,count)
-        except Exception as exc:
-            if failure_dir is not None:
-                import tempfile
-                Path(failure_dir).mkdir(parents=True,exist_ok=True)
-                path=Path(tempfile.mkdtemp(prefix='conditioned-',dir=failure_dir))/'trace.json'
-                hook.export_chrome_trace(str(path))
-                if hasattr(exc,'audit'):
-                    import json
-                    path.with_name('native_ownership.json').write_text(json.dumps(exc.audit,indent=2))
-                raise ValueError(f'{exc}; original CUDA trace: {path}') from exc
-            raise
-        results.append(dict(raw,verified=True))
+    cycle, count = plan['cycle'], plan['forwards']
+    def choose(index):
+        position=index%cycle
+        return calls[position%banks][position//banks]
+    for j in range(plan['warmup_forwards']): choose(j)()
+    torch.cuda.synchronize()
+    context=torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+             torch.profiler.ProfilerActivity.CUDA])
+    with context as hook:
+        for j in range(count):
+            with torch.profiler.record_function(MARKER+str(j)):
+                choose(j)()
+    torch.cuda.synchronize()
+    try:
+        raw=extract_eager_forwards(hook.profiler.kineto_results,count)
+    except Exception as exc:
+        if failure_dir is not None:
+            import tempfile
+            Path(failure_dir).mkdir(parents=True,exist_ok=True)
+            path=Path(tempfile.mkdtemp(prefix='conditioned-',dir=failure_dir))/'trace.json'
+            hook.export_chrome_trace(str(path))
+            if hasattr(exc,'audit'):
+                import json
+                path.with_name('native_ownership.json').write_text(json.dumps(exc.audit,indent=2))
+            raise ValueError(f'{exc}; original CUDA trace: {path}') from exc
+        raise
     geometry=dict(global_top_k=owner.cfg.experts_per_token,
         local_histogram=[histogram[e] for e in owner.place.local_global_ids],
         routing_sha256=hashlib.sha256(base_ids.cpu().numpy().tobytes()).hexdigest(),
         conditioning=plan,independent_outputs_verified=True)
-    return dict(results[1],geometry=geometry,conditioning_control=results[0])
+    return dict(raw,verified=True,geometry=geometry)

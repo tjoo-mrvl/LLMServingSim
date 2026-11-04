@@ -15,7 +15,7 @@
 # writes only its own table and meta.yaml entry, so the processes share one
 # output root, and the one that publishes the last rank logs the rank
 # cross-check. Do not run two of these processes on one GPU: they disturb each
-# other's timings and the conditioning gate refuses to publish.
+# other's timings, and every point is published as measured.
 #
 # Arguments after the script name are passed to every slice unchanged, e.g.
 # --max-num-batched-tokens 4096 or --variant <label>. Ordinary categories are

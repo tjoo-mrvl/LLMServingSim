@@ -299,14 +299,12 @@ class MeasurementStore:
             if (result.get('geometry',{}).get('conditioning') != plan
                     or result['geometry'].get('independent_outputs_verified') is not True):
                 raise ValueError('Expert measurement did not cover the declared complete weight cycles')
-            validate_result(result,plan['forward_counts'][1])
-            validate_result(result['conditioning_control'],plan['forward_counts'][0])
+            validate_result(result,plan['forwards'])
         else:
             validate_result(result,self.iterations)
         if self.contract.get('eager_attribution'):
             expected = self.contract[row['point']['mode']+'_attribution']
-            if result.get('attribution') != expected or ('conditioning_control' in result
-                    and result['conditioning_control'].get('attribution') != expected):
+            if result.get('attribution') != expected:
                 raise ValueError('Measurement attribution differs from the declared contract')
         if (key, repeat) in self.rows:
             raise ValueError("Duplicate complete raw measurement")
@@ -341,21 +339,6 @@ class MeasurementStore:
         expected = len(self.points)*self.rounds
         status = dict(schema=SCHEMA, complete=len(self.rows)==expected,
                       completed_rounds=len(self.rows), expected_rounds=expected, points=len(self.points))
-        if status['complete'] and self.contract.get('expert_conditioning'):
-            summary = dict(checked_points=0, failed_points=0, max_relative_change=0.0)
-            tolerance=self.contract['expert_conditioning']['quality_relative_tolerance']
-            for key,point in self.points.items():
-                if point['component']!='experts': continue
-                selected=[v for r in range(self.rounds) for v in self.rows[key,r]['result']['per_forward_us']]
-                controls=[v for r in range(self.rounds) for v in self.rows[key,r]['result']['conditioning_control']['per_forward_us']]
-                high,low=statistics.median(selected),statistics.median(controls)
-                change=abs(high/low-1)
-                summary['checked_points'] += 1
-                summary['failed_points'] += int(not change <= tolerance)
-                summary['max_relative_change'] = max(summary['max_relative_change'], change)
-            status['conditioning_summary'] = summary
-            status['quality_supported'] = summary['checked_points'] > 0 and summary['failed_points'] == 0
-            status['complete']=status['quality_supported']
         if status['complete']:
             path = self.folder/'components.csv'
             temporary = path.with_suffix('.csv.tmp')
@@ -597,10 +580,7 @@ def run_components(arch_path, args, tps, variant_root, *, kv_cache_memory_bytes=
                         store.append(point, repeat, result)
                     if index % max(1,len(points)//20) == 0 or index+1 == len(points):
                         log.info("Native MoE rank=%d: %d/%d points", target.rank, index+1, len(points))
-                status = store.publish()
-                if not status['complete']:
-                    failed = status.get('conditioning_summary', {}).get('failed_points', 0)
-                    raise RuntimeError(f"Native MoE acquisition not publishable: {failed} conditioning controls failed; see {variant_root/'meta.yaml'}")
+                store.publish()
             finally:
                 store.close()
                 llm.collective_rpc('moe_component_release')

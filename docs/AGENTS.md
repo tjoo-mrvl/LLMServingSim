@@ -25,7 +25,8 @@ timings; the variant-root `meta.yaml` records methods, observed runtime versions
 and publication evidence. New per-TP records live under `per_tp[tp]`; do not
 document new standalone contract/category/context/callable/skew metadata files.
 Raw repetition checkpoints are acquisition data, not an alternative metadata store.
-Document compact MoE conditioning summaries separately from raw control records.
+Document that a MoE point is timed once and published as measured; only older
+tables carry a control summary.
 Skew metadata is root-only; do not promise a `skew.meta.yaml` read fallback.
 Failure-only diagnostics are optional debugging artifacts, not required simulator
 inputs or material to commit with a profile bundle.

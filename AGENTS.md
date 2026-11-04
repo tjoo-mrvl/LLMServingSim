@@ -2660,15 +2660,23 @@ once per forward during eager measurements. No CPU duration is added.
 No-op resume preserves original runtime observations. Record distinct later
 `acquisition_contexts` only after validating new work; this list is not a count
 of durable or completed measurement rows.
-Expert measurements rotate positions and L2-sized weight banks, compare B/2B
-under identical complete-cycle work, independently verify eager outputs and
-require the recorded stability gate before publication. Those rules condition
-the measurement; they do not prove full-model cache equivalence.
-Publish only `coverage.conditioning_summary` with `checked_points`,
-`failed_points` and `max_relative_change`; retain the tolerance in
-`contract.expert_conditioning`. Individual control points and timings belong to
-raw resume checkpoints, not published metadata. Preserve runtime observations,
-geometry, dtypes, parallelism, backend, completion and the CSV integrity check.
+Expert measurements rotate positions and L2-sized weight banks over whole
+cycles (`moe_conditioning.py`: the smallest power-of-two bank count, at least
+four, holding four times the L2 capacity) and independently verify eager outputs.
+Those rules condition the measurement; they do not prove full-model cache
+equivalence. **Each point is timed once and published as measured, and no
+comparison of timings may withhold a table**: GPUs are not deterministic, and a
+pass/fail check over hundreds of noisy points per rank fails on every long run,
+only after its hours are spent, while rerunning reuses the same raw rows and
+fails again. The earlier lower-bank control pass with a 3% gate is gone. Its
+tables (policy `rotated-weight-cycles`, with a `conditioning_summary` and a
+tolerance) stay readable in serving, each checked against its own record;
+`single-pass-rotated-weight-cycles` records neither, and serving rejects a record
+that mixes the two. Judge a table by `rank_cross_check` and the raw per-forward
+values in `samples.jsonl`, never by a published pass/fail. Preserve runtime
+observations, geometry, dtypes, parallelism, backend, completion and the CSV
+integrity check. A shared GPU is no longer caught by a gate: give every
+process its own GPU.
 
 New plans use `--moe-grid-factor` (default 2) for input rows N, active local
 experts A and local assignments M, including feasible endpoints, envelope

@@ -35,6 +35,12 @@ _DP1_PREPARE = {
 }
 
 
+# Tables measured before the control pass was dropped (the shipped Qwen3-30B
+# ones) carry this policy, the control's tolerance and its summary. They stay
+# readable, checked against their own record; nothing acquires them any more.
+_CONTROLLED_CONDITIONING_POLICY = 'rotated-weight-cycles'
+
+
 class MoeCoverageError(ValueError):
     pass
 
@@ -192,10 +198,12 @@ class MoeComponentTable:
                 or contract.get('graph_memory_pool') != 'independent_per_variant'
                 or contract.get('graph_output_reference') != 'independent_pre_capture_clone'):
             raise ValueError('Historical graph data requires verified launch-correlated acquisition')
-        if ((contract.get('expert_conditioning') or {}).get('schema') != MOE_CONDITIONING_POLICY
-                or coverage.get('quality_supported') is not True
+        conditioning = (contract.get('expert_conditioning') or {}).get('schema')
+        controlled = conditioning == _CONTROLLED_CONDITIONING_POLICY
+        if (conditioning not in (MOE_CONDITIONING_POLICY, _CONTROLLED_CONDITIONING_POLICY)
+                or (controlled and coverage.get('quality_supported') is not True)
                 or contract.get('eager_attribution') != EAGER_ATTRIBUTION):
-            raise ValueError('Native MoE data requires matched-work conditioning and native launch attribution')
+            raise ValueError('Native MoE data requires rotated-weight conditioning and native launch attribution')
         required = {'model', 'hardware', 'variant', 'global_experts', 'global_top_k', 'hidden_dim'}
         if not required.issubset(expected) or any(contract.get(k) != v for k, v in expected.items()):
             raise ValueError('Model, hardware or tensor geometry differs from the measured MoE contract')
@@ -355,20 +363,27 @@ class MoeComponentTable:
                 or coverage['expected_rounds'] != len(plan)*contract['protocol']['rounds']
                 or coverage['completed_rounds'] != coverage['expected_rounds']):
             raise ValueError('Native MoE plan and completed coverage disagree')
-        summary = coverage.get('conditioning_summary')
-        tolerance = contract['expert_conditioning'].get('quality_relative_tolerance')
         expert_points = sum(point['component'] == 'experts' for point in plan)
-        if (not isinstance(summary, dict)
-                or set(summary) != {'checked_points', 'failed_points', 'max_relative_change'}
-                or type(summary['checked_points']) is not int
-                or summary['checked_points'] != expert_points or expert_points < 1
-                or type(summary['failed_points']) is not int or summary['failed_points'] != 0
-                or type(tolerance) not in (int, float) or not math.isfinite(tolerance)
-                or not 0 < tolerance < 1
-                or type(summary['max_relative_change']) not in (int, float)
-                or not math.isfinite(summary['max_relative_change'])
-                or not 0 <= summary['max_relative_change'] <= tolerance):
-            raise ValueError('Native MoE conditioning summary disagrees with supported coverage')
+        if controlled:
+            summary = coverage.get('conditioning_summary')
+            tolerance = contract['expert_conditioning'].get('quality_relative_tolerance')
+            if (not isinstance(summary, dict)
+                    or set(summary) != {'checked_points', 'failed_points', 'max_relative_change'}
+                    or type(summary['checked_points']) is not int
+                    or summary['checked_points'] != expert_points or expert_points < 1
+                    or type(summary['failed_points']) is not int or summary['failed_points'] != 0
+                    or type(tolerance) not in (int, float) or not math.isfinite(tolerance)
+                    or not 0 < tolerance < 1
+                    or type(summary['max_relative_change']) not in (int, float)
+                    or not math.isfinite(summary['max_relative_change'])
+                    or not 0 <= summary['max_relative_change'] <= tolerance):
+                raise ValueError('Native MoE conditioning summary disagrees with supported coverage')
+        elif (expert_points < 1 or 'conditioning_summary' in coverage
+                or 'quality_supported' in coverage
+                or 'quality_relative_tolerance' in contract['expert_conditioning']):
+            # One pass per point: a control summary or tolerance here means the
+            # label and the record disagree.
+            raise ValueError('Native MoE conditioning record disagrees with its single-pass policy')
         for pairs in (*self.local.values(), *self.expert.values(), *self.zero.values(), *self.assignments.values()):
             pairs.sort()
         if self.independent_assignments:

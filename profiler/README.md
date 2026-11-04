@@ -38,7 +38,7 @@ profiler/                          Python package: python -m profiler
 │   ├── moe_profile.py             native local/DP+EP component acquisition
 │   ├── moe_deployment.py          TP/DP/EP ownership and token domains
 │   ├── moe_geometry.py            global expert placement and routing geometry
-│   ├── moe_conditioning.py        matched-work expert measurement controls
+│   ├── moe_conditioning.py        expert weight-rotation plan
 │   ├── skew.py                    heterogeneous-decode acquisition
 │   ├── skew_calibration.py        reference-aligned fit and supported-N lookup
 │   ├── skew_plan.py               dynamic distribution coverage and feasibility
@@ -777,7 +777,7 @@ out-of-capture ranges instead of being added everywhere. DP cancellation can
 require small local eager points even when only another rank exceeds the cap.
 Compiler-SP padding is included in the physical acquisition bound. A and M
 remain independent geometric axes, since capture sizes do not determine routing.
-Conditioning and repeated measurements remain required; sampling
+Weight rotation and repeated measurements remain required; sampling
 alone does not establish an interpolation error bound or full-model accuracy.
 
 The simulator constructs each deployment table's Delaunay support on first use,
@@ -945,8 +945,8 @@ native MoE entries. Existing root-only engine, lookup, layout and calibration
 sections stay in place. New acquisitions do not create standalone metadata JSON
 or YAML files beside their tables; historical sidecars have narrow read fallbacks,
 except `skew.meta.yaml`, which is no longer loaded. MoE publication retains
-settings and a compact conditioning summary, not individual control-point timings;
-quality checks still run and raw controls remain in acquisition checkpoints.
+settings and no timing-based pass/fail record: each expert point is timed once and
+published as measured, and raw forwards remain in acquisition checkpoints.
 Raw repetition checkpoints may remain for acquisition resume. The empty
 `.meta.lock` is concurrency control, not another metadata record.
 Saved method, policy and format labels use descriptive hyphen-separated names.

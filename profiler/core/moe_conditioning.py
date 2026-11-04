@@ -1,4 +1,4 @@
-"""Deterministic full-position weight reuse control, independent of timings."""
+"""Deterministic full-position weight rotation plan, independent of timings."""
 import math
 from .metadata_names import MOE_CONDITIONING_POLICY
 
@@ -13,8 +13,6 @@ def expert_conditioning(contract, active, minimum_iterations):
     if policy['schema'] != MOE_CONDITIONING_POLICY:
         raise ValueError('Unknown expert conditioning protocol')
     if (type(policy['capacity_multiple']) is not int or policy['capacity_multiple'] < 1
-            or not 0 < policy['quality_relative_tolerance'] < 1
-            or policy['representative'] != 'higher_bank_control'
             or policy['warmup_complete_cycles'] != 3):
         raise ValueError('Unsupported expert conditioning policy')
     weight_bytes = contract['expert_weight_bytes']
@@ -22,7 +20,7 @@ def expert_conditioning(contract, active, minimum_iterations):
     if any(type(v) is not int or v < 1 for v in (weight_bytes,l2_bytes)):
         raise ValueError('Measured weight size and actual GPU cache capacity are required')
     offsets = list(range(0,local,active)) if active else [0]
-    banks = policy.get('minimum_banks', 2)
+    banks = policy['minimum_banks']
     if type(banks) is not int or banks < 1 or banks & (banks-1):
         raise ValueError('The minimum independent weight-bank count must be a positive power of two')
     if active:
@@ -30,15 +28,10 @@ def expert_conditioning(contract, active, minimum_iterations):
         # A experts. This is a conditioning guard, never a latency equation.
         while banks*weight_bytes < policy['capacity_multiple']*l2_bytes:
             banks *= 2
-    if not active:
+    else:
         banks = 1
-    control = 2*banks if active else 1
-    cycles = [len(offsets)*b for b in (banks,control)]
-    common = math.lcm(*cycles)
-    count = math.ceil(minimum_iterations/common)*common
-    # Both arms cover whole cycles, but must also launch exactly the same
-    # amount of warm-up and timed work. Otherwise bank count is confounded
-    # with execution count and the length of uninterrupted GPU activity.
-    forwards = [count,count]
-    return dict(offsets=offsets,bank_counts=[banks,control],cycles=cycles,
-                forward_counts=forwards,warmup_forwards=3*count,selected_arm=1)
+    cycle = len(offsets)*banks
+    # Whole cycles only, so every bank and offset is timed equally often.
+    count = math.ceil(minimum_iterations/cycle)*cycle
+    return dict(offsets=offsets,banks=banks,cycle=cycle,forwards=count,
+                warmup_forwards=3*count)

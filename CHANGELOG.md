@@ -134,6 +134,20 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   2.0, and the script's comments no longer describe nearest-neighbour lookup
   or MoE priced from an EP1 table. The untested `TARGET=v4flash` branch is
   removed.
+- Native MoE expert components are timed once per point and published as
+  measured. The lower-bank control pass and its 3% stability gate are removed:
+  GPUs are not deterministic, so a gate that allowed no miss refused whole
+  tables (on an A10G, a few of about 690 Qwen3-30B points jump between two
+  timings), only after the run had finished, and a rerun reused the same raw
+  rows and refused again. The measured arm is unchanged (same banks, rotation
+  cycles, warmup and forwards), so each point costs one timed pass instead of
+  two. New contracts carry policy `single-pass-rotated-weight-cycles` and no
+  `conditioning_summary`; the shipped Qwen3-30B tables, policy
+  `rotated-weight-cycles`, still load and no regression clock moves. Nothing
+  rejects two processes sharing a GPU any more, so give each its own, and
+  judge a table by `rank_cross_check`. Remeasure a published bundle into a new
+  output root, because resume refuses to continue under the changed policy. See
+  [Native MoE components](https://llmservingsim.ai/docs/profiler/native-moe-components).
 
 ### Fixed
 

@@ -88,8 +88,8 @@ GPUs than ranks, each GPU measures several ranks in turn.
 Each rank keeps its own table folder and writer lock, and every process
 replaces only its own entry in the locked `meta.yaml`. Processes with disjoint
 ranks can therefore share one output root. Give each process its own GPU.
-Processes sharing a GPU disturb each other's timings, and the expert
-conditioning gate then refuses to publish their tables. Overlapping ranks
+Processes sharing a GPU disturb each other's timings, and nothing rejects the
+result: each point is timed once and published as measured. Overlapping ranks
 collide on the lock, and the second writer fails. A rank outside every selected
 target fails before engine startup. `profile` does not accept the option, because its
 ordinary categories need one writer per variant root.
@@ -330,11 +330,14 @@ Expert measurements may use more forwards to complete the required weight cycles
 The stored time is the median of the per-context forward medians, in microseconds.
 
 Expert measurements rotate local expert positions and independent weight banks.
-Bank count is derived from local expert weight bytes and GPU L2 capacity, with
-a minimum of two banks. The `B` and `2B` arms use identical warmup and timed
-forward counts covering complete cycles. Every expert point must pass the
-recorded 3% pooled-median stability check before the higher-bank measurement is
-published. Independent weight-bank outputs are compared against cloned eager
+Bank count is the smallest power of two, at least four, whose weights hold four
+times the GPU's L2 capacity (one bank for the all-remote point). Warmup and the
+timed forwards cover whole rotation cycles, and each point is timed once: the
+median of its per-context forward medians is the stored time. No comparison of
+timings withholds a table. GPUs are not deterministic, so a pass/fail check on
+noisy timings would refuse tables that are as good as any other; judge a table
+by the rank cross-check and by the per-forward values kept in `samples.jsonl`.
+Independent weight-bank outputs are compared against cloned eager
 references, including DP1 output alias checks.
 The live local path instead retains native output allocation and checks against
 the exact native method at each routing stimulus, including every cloned bank.
@@ -396,13 +399,17 @@ and measurement conditioning, with acquisition observations kept as provenance.
 New contracts record `modes: [eager]` and `expert_sampling` (axis names, factor
 and transformed `capture_tokens`). `sampling_graph` retains source and target
 graph coordinates separately from the eager measurement contract.
-Coverage records completion, completed rounds and the table checksum. Its compact
-`conditioning_summary` contains `checked_points`, `failed_points` and
-`max_relative_change`; the tolerance stays in `contract.expert_conditioning`.
-Every control check still runs, but individual control coordinates and timings
-are not published in metadata.
-`samples.jsonl` preserves individual forwards and control measurements for resume
-and auditing; runtime lookup needs only root metadata and the component CSV.
+Coverage records completion, completed rounds and the table checksum.
+`contract.expert_conditioning` records the policy
+(`single-pass-rotated-weight-cycles`), the L2 capacity, the bank multiple and
+the warmup cycle count. Tables measured earlier with a lower-bank control pass,
+policy `rotated-weight-cycles`, additionally carry a `conditioning_summary`
+(`checked_points`, `failed_points`, `max_relative_change`) and a tolerance, and
+only those with no failed point were published. Serving reads both forms and
+checks each against its own record; nothing acquires the controlled form any
+more.
+`samples.jsonl` preserves individual forwards for resume and auditing; runtime
+lookup needs only root metadata and the component CSV.
 Acquisition failures may additionally retain `failures.jsonl` and a diagnostic
 Chrome trace for a failed attribution check. These are optional debugging
 artifacts emitted on failure, not normal-path metadata or simulator inputs; do

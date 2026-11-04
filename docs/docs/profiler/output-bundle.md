@@ -701,9 +701,10 @@ Optional `--ep` filters the supported TP*DP targets without changing their geome
 It publishes root `per_tp[tp].moe_components` metadata
 and deployment-specific `components.csv` tables. Contracts and coverage live in
 that root record, not standalone index/contract/coverage JSON files.
-Conditioning coverage is a compact count and maximum-change summary; individual
-control coordinates and timings stay in raw resume checkpoints. Publication still
-requires the configured quality checks and preserves the completed table checksum.
+Each point is timed once and published as measured; no timing comparison
+withholds a table. Publication requires every planned round and records the
+completed table checksum. Tables measured earlier with a lower-bank control pass
+also carry a compact `conditioning_summary` and remain readable.
 These are separate from the legacy whole-block `moe.csv`: local gate/routing,
 gathered experts and local finalization have different token domains and
 eager measurements. New acquisition does not capture isolated CUDA graphs.

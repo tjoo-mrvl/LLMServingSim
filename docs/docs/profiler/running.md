@@ -219,7 +219,7 @@ on routing-work axes and uncovered token ranges, with mandatory feasible geometr
 corners. Target serving graph points replace interior geometric token points in
 fully covered regimes after DP/SP transformation. Eager-only regimes, out-of-cap
 rows and DP cancellation retain geometric coverage; A and M keep their own axes.
-Sampling and conditioning checks do not by
+Sampling and weight rotation do not by
 themselves establish full-model accuracy.
 
 Omitted DP does not affect dense models, coverage, ordinary category slices or
@@ -1036,8 +1036,8 @@ MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 HARDWARE=RTXPRO6000 TP=2 \
 Each visible GPU (`CUDA_VISIBLE_DEVICES`, else every GPU `nvidia-smi` lists)
 runs one `slice --group moe --moe-ranks` process. With G GPUs and more ranks,
 GPU i measures ranks i, i+G, … in turn, so a single GPU measures them all.
-Never place two processes on one GPU: they disturb each other's timings and
-the expert conditioning gate refuses to publish. `DP` defaults to 1, and `EP`,
+Never place two processes on one GPU: they disturb each other's timings, and
+each point is timed once and published as measured. `DP` defaults to 1, and `EP`,
 if set, must equal TP × DP. `OUT_ROOT`, `MOE_ROUNDS` and `MOE_GRID_FACTOR`
 forward the matching flags; arguments after the script name reach every slice
 unchanged, so engine limits such as `--max-num-batched-tokens` go there.
