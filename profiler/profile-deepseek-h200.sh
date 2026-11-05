@@ -72,14 +72,16 @@
 #                           |         |           | axes, so lowering this is
 #                           |         |           | ~quadratic profiling cost for
 #                           |         |           | little gain.
-#   MAX_NUM_SEQS            | 256     | 512       | decode-batch (n_decode) axis.
-#                           |         |           | Profile ABOVE the runtime cap: a
-#                           |         |           | mixed (prefill + decode) shot at
-#                           |         |           | n = MSQ needs MSQ+1 requests and is
-#                           |         |           | filtered, so a profile at 256 has no
-#                           |         |           | mixed shot above 181 decodes. Run the
-#                           |         |           | bench and sim at <=256 (upstream's
-#                           |         |           | examples profile 256, run 128).
+#   MAX_NUM_SEQS            | 256     | 513       | decode-batch (n_decode) axis.
+#                           |         |           | Profile ABOVE the runtime cap. The n
+#                           |         |           | axis is geometric (..., 181, 256, 362,
+#                           |         |           | 512, 724) and a mixed (prefill + decode)
+#                           |         |           | shot needs one request more than its
+#                           |         |           | decodes, so mixed shots reach the
+#                           |         |           | largest grid value <= MSQ-1: 181 at
+#                           |         |           | 256, 362 at 512, 512 at 513. Above that
+#                           |         |           | a mixed lookup is flat in n. 513 lets
+#                           |         |           | the bench and sim run at up to 512.
 #   MEASUREMENT_ITERATIONS  | 3       | 3 (keep)  | N=3 already cuts DVFS jitter to
 #                           |         |           | ~5%; more is linear cost for
 #                           |         |           | marginal gain on the big shots.
@@ -92,7 +94,7 @@
 # Qwen3-30B at tiny nested limits) and by enumerating R1's TP8 grids:
 #   * dense, per_sequence, attention: shots already in the CSV are skipped.
 #     R1's 2048/128 plan has 22,312 attention shots at the full context reach,
-#     all inside the 16384/512 plan of 40,022 (14,088 with ATTENTION_MAX_KV=
+#     all inside the 16384/513 plan of 41,577 (14,088 with ATTENTION_MAX_KV=
 #     16384, of which 92% are inside it). Rows outside the final plan stay.
 #   * skew: only part of a smaller sweep is reused (76% of R1's 2048/128 cases,
 #     31% in the toy), so run STAGE=skew once, at the final limits.
@@ -105,7 +107,7 @@
 #
 #   MAX_NUM_BATCHED_TOKENS=2048 MAX_NUM_SEQS=128 ATTENTION_MAX_KV=16384 \
 #       STAGE=fast ./profiler/profile-deepseek-h200.sh      # trial
-#   STAGE=fast ./profiler/profile-deepseek-h200.sh          # extend to 16384/512
+#   STAGE=fast ./profiler/profile-deepseek-h200.sh          # extend to 16384/513
 #   STAGE=moe  ./profiler/profile-deepseek-h200.sh          # once, final limits
 #   STAGE=skew ./profiler/profile-deepseek-h200.sh          # once, final limits
 #
@@ -221,7 +223,7 @@ case "$TARGET" in
       ATTENTION_CHUNK_FACTOR="${ATTENTION_CHUNK_FACTOR:-2.0}"
       ATTENTION_KV_FACTOR="${ATTENTION_KV_FACTOR:-2.0}"
       MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
-      MAX_NUM_SEQS="${MAX_NUM_SEQS:-512}"
+      MAX_NUM_SEQS="${MAX_NUM_SEQS:-513}"
       MEASUREMENT_ITERATIONS="${MEASUREMENT_ITERATIONS:-3}"
     fi
     # skew density (only consulted when skew runs). Bump kvs/kp to 4.0 if the

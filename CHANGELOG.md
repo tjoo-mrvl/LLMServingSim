@@ -145,10 +145,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   script leaves `--attention-max-kv` to the profiler's default, R1's whole
   context window, so a trace that reaches tens of thousands of tokens is
   measured instead of extrapolated (`ATTENTION_MAX_KV` still bounds a trial
-  run). The limits are 16384 tokens and 512 sequences (were 4096 and 256):
-  vLLM's offline H200 default fits a 10K-token prompt in one step, and profiling
-  above the runtime sequence cap keeps mixed shots at that cap feasible, so run
-  the bench and simulator at 256 or fewer. The script documents a staged run:
+  run). The limits are 16384 tokens and 513 sequences (were 4096 and 256):
+  vLLM's offline H200 default fits a 10K-token prompt in one step, and a mixed
+  (prefill plus decode) shot needs one request more than its decodes, so mixed
+  shots reach only the largest decode-count grid value below the profile's cap
+  (181 at 256, 362 at 512, 512 at 513). Above that a mixed lookup is flat in the
+  decode count, so profile above the runtime cap and run the bench and simulator
+  at 512 or fewer. The script documents a staged run:
   a trial at 2048/128 is extended by the default run, which skips what the trial
   measured for the ordinary tables, while skew and the native MoE tables run once
   at the final limits.

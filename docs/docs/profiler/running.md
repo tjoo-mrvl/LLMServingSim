@@ -185,6 +185,31 @@ unset to inherit the CLI defaults.
 | `MAX_NUM_BATCHED_TOKENS` | `2048` | Profiler internally bumps this by `+MSQ` for shot-bypass headroom; subtracted back when recording meta |
 | `MAX_NUM_SEQS` | `256` | Profile with `MSQ > runtime MSQ` so mixed-regime cases at `n = runtime_MSQ` stay feasible |
 
+### Choosing `MAX_NUM_SEQS` against the runtime cap
+
+The decode-count axis is geometric (factor √2: …, 91, 128, 181, 256, 362, 512, 724,
+1024), and pure-decode shots reach `MAX_NUM_SEQS`. A mixed shot (a prefill chunk plus
+decodes) needs one request more than its decodes, so mixed shots reach only the
+largest grid value that is at most `MAX_NUM_SEQS − 1`. On DeepSeek-R1 at 16384 tokens:
+
+| Profiled `MAX_NUM_SEQS` | Largest mixed shot (decodes) | Pure decode up to |
+| --- | --- | --- |
+| 256 | 181 | 256 |
+| 512 | 362 | 512 |
+| 513 | 512 | 513 |
+| 1024 | 724 | 1024 |
+
+Above the largest mixed shot, a mixed lookup falls back to the nearest measured cell and
+is flat in the decode count. On the shipped Llama bundle, profiled at 256, a mixed step
+with a 512-token chunk reads 1101.9 us at 181 decodes and again at 200, 230 and 255,
+while the decode work grows 1.4x; the same decodes without a prefill chunk read 520 us
+and 720 us at 181 and 255. A mixed step under a runtime cap of `R` sequences has at most
+`R − 1` decodes, so profile at `R + 1` when `R` is a grid value (512 needs 513) and
+otherwise one above the next grid value. Profiling at 513 instead of 512 adds 1,555
+attention shots (3.9%) and 17 skew cases per TP on R1. The token budget needs no such
+margin: mixed shots exist at the top chunk with the same decode bounds, so a runtime
+budget equal to the profiled one is covered.
+
 ## MoE parallelism
 
 For supported native execution contracts, MoE acquisition defaults to
@@ -434,13 +459,13 @@ the new one and fires the rest. Rows outside the new plan stay in the CSV, and
 with nested limits (Llama-3.1-8B: the extended and the fresh tables hold the same
 keys, with timings 1.000x apart at the median), and by enumerating DeepSeek-R1's
 TP8 grids: every shot of a 2048/128 plan, 22,312 attention shots at the full
-context reach, is inside the 16384/512 plan of 40,022. Do not pass `--force`, which
+context reach, is inside the 16384/513 plan of 41,577. Do not pass `--force`, which
 replaces what was measured.
 
 Two parts do not carry over:
 
 - **Skew.** Its cases are draws that depend on the limits, so only part of a smaller
-  sweep is reused: 76% of R1's 2048/128 cases are in the 16384/512 plan (31% in the
+  sweep is reused: 76% of R1's 2048/128 cases are in the 16384/513 plan (31% in the
   A10G toy). Run skew once, at the final limits.
 - **Native MoE components.** The point plan and token budget are part of each
   deployment's contract, so a different limit is refused with `Native MoE

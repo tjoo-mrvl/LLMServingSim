@@ -1527,7 +1527,7 @@ same sampling envelope. Raising the limits extends an ordinary sweep in place:
 resume identity excludes `--max-num-batched-tokens`, `--max-num-seqs` and
 `--attention-max-kv`, so shots already in the CSV are skipped and rows outside the
 new plan stay (verified on an A10G, and for R1's TP8 grids: all 22,312 attention
-shots of a 2048/128 plan are in the 16384/512 plan). Skew draws depend on the
+shots of a 2048/128 plan are in the 16384/513 plan). Skew draws depend on the
 limits, so only part is reused (76% on R1); native MoE contracts carry the point
 plan and token budget, so a changed limit is refused ("use a new output root").
 `run_full` runs native MoE last, after TP-stable replication and `persist_meta`,
@@ -1549,8 +1549,15 @@ if a later measurement fails.
 Both the uniform attention sweep and the skew sweep cap `n_reqs > max_num_seqs`
 (strict `>`, not `>=`) so that `n = MSQ` **pure** cases (no prefill chunk) fit.
 This uses vLLM V1's `input_batch` buffer exactly up to `MSQ`. Mixed cases at
-`n = MSQ` need `MSQ + 1` requests and are still filtered. If a runtime workload
-needs mixed-regime data at `n = X`, profile with `MAX_NUM_SEQS ≥ X + 1`.
+`n = MSQ` need `MSQ + 1` requests and are still filtered. The decode-count axis is
+geometric (factor √2: ..., 91, 128, 181, 256, 362, 512, 724, 1024), so mixed shots
+reach the largest grid value ≤ `MSQ − 1`: 181 at 256, 362 at 512, 512 at 513, 724 at
+1024 (R1's grid at 16384 tokens). Above it a mixed lookup falls back to the nearest
+cell and is flat in `n_decode`: on the shipped Llama bundle (profiled at 256) it reads
+1101.9 us at 181 decodes and again at 200, 230 and 255, while decode work grows 1.4x.
+A mixed step under a runtime cap of `R` sequences has at most `R − 1` decodes, and the
+smallest grid value at or above that must be ≤ `MSQ − 1`. So profile at `R + 1` when `R`
+is a grid value (512 → 513) and otherwise at the next grid value above `R`, plus one.
 
 The bounds that count **tokens** rather than requests have to see
 `decode_q_len`, because a decode request submits `q` of them. They are inside

@@ -671,9 +671,10 @@ DP 1, one process per visible GPU, with per-process logs in `MOE_LOG_DIR`
 every rank on that one GPU. `SMOKE=1` writes `outputs/profile-deepseek-h200/smoke/`
 unless `OUT_ROOT` is set, so its tiny grid never mixes with the real bundle.
 
-The limits default to 16384 tokens and 512 sequences, with the attention reach at
-R1's whole context window. Profile above the runtime sequence cap and run the
-bench and simulator at 256 or fewer. A trial at `MAX_NUM_BATCHED_TOKENS=2048
+The limits default to 16384 tokens and 513 sequences, with the attention reach at
+R1's whole context window. Profile above the runtime sequence cap: 513 gives mixed
+(prefill plus decode) shots up to 512 decodes, so run the bench and simulator at 512
+or fewer. A trial at `MAX_NUM_BATCHED_TOKENS=2048
 MAX_NUM_SEQS=128 ATTENTION_MAX_KV=16384` can be extended by re-running the default
 stages: the ordinary tables skip what the trial measured, while skew and the
 native MoE tables run once, at the final limits. See
