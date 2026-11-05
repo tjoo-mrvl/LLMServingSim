@@ -262,6 +262,32 @@ no warning at all.
 - Or stay at the profiled bound. Extrapolation is usually fine for
   small overshoots; large ones can drift.
 
+## Attention lookup above the profiled range
+
+**Symptom:**
+
+```text
+attention 'attention' at tp=1: kv_decode=20000 is above the profiled top 16384
+for RTXPRO6000/meta-llama/Llama-3.1-8B/bf16, so lookups there extrapolate
+linearly from the top two samples. Profile with a larger --attention-max-kv to
+measure that range.
+```
+
+**Cause:** A request's context, chunk or batch went past the top of one
+attention axis (`prefill_chunk`, `prefill_key`, `n_decode` or `kv_decode`), as
+recorded by the profiled grid. The startup warning above compares only the
+runtime limits, so a trace whose context outruns `--attention-max-kv` is
+visible only here.
+
+It is emitted **once per `(hardware, model, variant, tp, kernel, axis)`** and
+names the first value that passed, not the largest. The lookup is unchanged: the
+last two samples are extended linearly.
+
+**Fix:** Re-profile with a larger `--attention-max-kv` (context),
+`--max-num-batched-tokens` (chunk) or `--max-num-seqs` (decode count), or keep
+the workload inside the profiled range. For a dense kernel linear extension of
+the KV axis is physically reasonable but unmeasured.
+
 ## Simulator stuck / very slow on big workloads
 
 **Symptom:** Simulation runs but takes much longer than expected,
@@ -345,7 +371,7 @@ different:
 
 | Knob | What it bounds | What you lose |
 | --- | --- | --- |
-| `ATTENTION_MAX_KV` | the top of the kv axes | long-context coverage; the simulator extrapolates past the last profiled kv |
+| `ATTENTION_MAX_KV` | the top of the kv axes | long-context coverage; the simulator extrapolates past the last profiled kv and warns once per kernel |
 | `MAX_MODEL_LEN` | the engine's context, so the KV cache it reserves | the same reach, and it caps `ATTENTION_MAX_KV` too (the grid runs to `min(the two)`) |
 | `MAX_NUM_SEQS` | `n_decode` per shot | large-batch decode coverage |
 | `MAX_NUM_BATCHED_TOKENS` | tokens per shot, i.e. the activation peak | large prefill-chunk coverage |

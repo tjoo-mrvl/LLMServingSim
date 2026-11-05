@@ -957,6 +957,65 @@ def _key_saturates(perf_db, layer):
     return bool((section.get(layer) or {}).get("key_saturates"))
 
 
+# What widens each attention axis, for the warning below. The prefill key and
+# the decode KV both reach as far as ``--attention-max-kv``.
+_ATTENTION_AXIS_FLAG = {
+    "prefill_chunk": "--max-num-batched-tokens",
+    "prefill_key": "--attention-max-kv",
+    "n_decode": "--max-num-seqs",
+    "kv_decode": "--attention-max-kv",
+}
+_attention_tops_cache = {}
+
+
+def _attention_axis_tops(tbl):
+    """Largest profiled value on each axis of one attention table."""
+    cached = _attention_tops_cache.get(id(tbl))
+    if cached is None or cached[0] is not tbl:
+        slices = tbl["slices"].values()
+        cached = (tbl, {
+            "prefill_chunk": tbl["pc_vals"][-1],
+            "n_decode": tbl["nd_vals"][-1],
+            "prefill_key": max((s["prefill_key_vals"][-1] for s in slices
+                                if s["prefill_key_vals"]), default=0),
+            "kv_decode": max((r["keys"][-1] for s in slices for r in s["rows"]
+                              if r["keys"]), default=0),
+        })
+        _attention_tops_cache[id(tbl)] = cached
+    return cached[1]
+
+
+def _warn_beyond_profiled_attention(perf_db, tp, layer, decode_q_len, queries):
+    """Say once per (kernel, TP, axis) that a lookup passed the axis's top.
+
+    The lookup itself is unchanged: ``_axis_bracket`` still extrapolates
+    linearly from the top two samples, which is sound for a dense kernel but
+    unmeasured. This only makes it visible, because a trace can carry a
+    longer context than the sweep reached and nothing else reports it.
+    Defined outside the lookup functions that ``lookup_fingerprint`` hashes,
+    so enabled skew fits stay valid.
+    """
+    by_q = (_tp_tables(perf_db, tp).get("attention_by_layer") or {}).get(layer)
+    if not by_q:
+        return  # the lookup raises its own, clearer error
+    tbl = _attention_q_slice(by_q, decode_q_len, layer, tp)
+    if not tbl["pc_nd_pairs"]:
+        return
+    tops = _attention_axis_tops(tbl)
+    for axis, value in queries.items():
+        if value > tops[axis]:
+            key = ("attn_beyond", perf_db["hardware"], perf_db["model"],
+                   perf_db["variant"], tp, layer, axis)
+            if key not in _skipped_layer_warned:
+                _skipped_layer_warned.add(key)
+                logger.warning(
+                    "attention %r at tp=%d: %s=%d is above the profiled top %d for "
+                    "%s/%s/%s, so lookups there extrapolate linearly from the top "
+                    "two samples. Profile with a larger %s to measure that range.",
+                    layer, tp, axis, int(value), tops[axis], perf_db["hardware"],
+                    perf_db["model"], perf_db["variant"], _ATTENTION_AXIS_FLAG[axis])
+
+
 def _lookup_attention_with_skew(
     perf_db, tp, prefill_chunk, prefill_key,
     n_decode, kv_decode_mean, kv_decode_max, kv_decode_min,
@@ -977,6 +1036,9 @@ def _lookup_attention_with_skew(
     compounds that; the Chakra trace converter requires integer
     ``comp_time`` so we round here.
     """
+    _warn_beyond_profiled_attention(perf_db, tp, layer, decode_q_len, dict(
+        prefill_chunk=prefill_chunk, prefill_key=prefill_key, n_decode=n_decode,
+        kv_decode=kv_decode_max if n_decode > 1 else kv_decode_mean))
     t_mean = _lookup_attention(
         perf_db, tp, prefill_chunk, prefill_key, n_decode, kv_decode_mean,
         layer, decode_q_len,

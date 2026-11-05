@@ -1777,6 +1777,15 @@ Runtime vs. profiled warnings: on first load of a `(hardware, model, variant)`,
 the simulator compares the CLI's `--max-num-batched-tokens` and `--max-num-seqs`
 against `meta.yaml`'s `engine_effective` values and logs a one-shot warning
 when the runtime exceeds the profiler's sweep bounds (lookups will extrapolate).
+Attention lookups add a per-lookup warning, `_warn_beyond_profiled_attention`
+(called from `_lookup_attention_with_skew`): once per (hardware, model, variant,
+TP, kernel, axis), when a query passes the top of the prefill-chunk, prefill-key,
+decode-count or decode-KV axis (the table's overall top, not each slice's). The
+startup warning cannot see a trace whose context outruns `--attention-max-kv`.
+Lookups themselves are unchanged. Keep the check outside the functions
+`lookup_fingerprint` hashes (`_lookup_attention`, `_attn_slice_lookup`,
+`_axis_bracket`, the table builders): editing any of them marks every shipped
+skew fit stale.
 
 ### Agentic session support (dependency chains)
 The simulator supports closed-loop agentic workloads (SWE-bench, tool-calling agents)

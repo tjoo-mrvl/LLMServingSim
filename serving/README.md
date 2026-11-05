@@ -289,7 +289,9 @@ the complete resolved engine configuration.
 `meta.yaml` next to each variant records the engine flags the profiler swept
 (notably `max_num_batched_tokens` and `max_num_seqs`); the simulator warns at
 startup when the runtime values exceed them, signalling that lookups will
-extrapolate.
+extrapolate. An attention lookup also warns once per kernel, TP and axis when a
+query passes the profiled top of the prefill chunk, prefill key, decode count or
+decode KV axis.
 
 ### Head dimension
 

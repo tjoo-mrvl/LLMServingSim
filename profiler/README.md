@@ -357,8 +357,9 @@ grid; the KV factor controls both prefill-key and decode-KV axes. See the
 checkpoint sweeps out to 131k or beyond and the largest decode shots ask the
 engine for `n_decode * kv_decode` tokens of KV in one go. Setting it bounds the
 biggest allocation the sweep ever makes, and can reduce its shot count. The cost is
-long-context coverage: the simulator extrapolates past the last profiled kv,
-whose accuracy must be checked even for a dense kernel. Sparse indexers may
+long-context coverage: the simulator extrapolates past the last profiled kv
+and warns once per kernel, and that accuracy must be checked even for a dense
+kernel. Sparse indexers may
 continue scaling after the selected-attention cost saturates; see the
 `--attention-max-kv` section of the profiling guide.
 

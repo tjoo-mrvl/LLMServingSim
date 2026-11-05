@@ -227,7 +227,10 @@ measured support, reducing confidence; missing attention corners also have
 nearest-cell fallbacks. Do not generalize that behavior to every category:
 query lengths and legacy EP degrees select discrete slices, skew uses buckets,
 and installed native MoE components reject out-of-support work. A startup
-range warning is not proof that every subsequent lookup is supported.
+range warning is not proof that every subsequent lookup is supported. Attention
+lookups also warn once per kernel, TP and axis when a query passes the profiled
+top of the prefill chunk, prefill key, decode count or decode KV; dense and
+per-sequence lookups have only the startup warning.
 
 The `time_us` value at each grid point is converted to ns at load
 time, so lookups directly yield ns.

@@ -93,6 +93,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   profile measured; plots and summaries are unchanged. Older runs and bundles
   are skipped. See
   [Bench CLI → Kernel check](https://llmservingsim.ai/docs/reference/bench-cli#kernel-check).
+- A warning when an attention lookup goes past what was profiled. The simulator
+  now says once per kernel, TP and axis when a query passes the profiled top of
+  the prefill-chunk, prefill-key, decode-count or decode-KV axis, naming the flag
+  that widens it. The startup warning compares only the runtime limits, so a
+  trace whose context outran `--attention-max-kv` was extrapolated silently.
+  Lookups and every regression clock are unchanged, and enabled skew fits stay
+  valid. See
+  [Troubleshooting → Attention lookup above the profiled range](https://llmservingsim.ai/docs/getting-started/troubleshooting#attention-lookup-above-the-profiled-range).
 
 ### Changed
 
