@@ -49,39 +49,70 @@
 #
 #   Knob                    | default | here (R1) | why
 #   ------------------------|---------|-----------|-------------------------------
-#   ATTENTION_MAX_KV        | model   | 32768     | covers the measured SWE-bench
-#                           | context |           | envelope (max ~21.7K ctx) with
-#                           | (164K)  |           | headroom. Below the cap the sim
-#                           |         |           | measures; above it it extrapolates.
-#                           |         |           | Bump to 65536 if R1 --use-vllm /
-#                           |         |           | long-output traces grow past it.
-#                           |         |           | (Also widens skew's kvs/kp axes.)
+#   ATTENTION_MAX_KV        | model   | unset     | the profiler's default: R1's whole
+#                           | context |           | context window (~164K), as every
+#                           | (164K)  |           | shipped long-context bundle uses.
+#                           |         |           | Below the reach the sim measures;
+#                           |         |           | above it it extrapolates, and
+#                           |         |           | nothing warns. Set it only to
+#                           |         |           | bound a trial run.
 #   ATTENTION_CHUNK_FACTOR  | 2.0     | 2.0 (keep)| the profiler default; the chunk
 #                           |         |           | axis is interpolated like the
 #                           |         |           | others.
-#   MAX_NUM_BATCHED_TOKENS  | 2048    | 4096      | bounds the prefill-chunk axis.
-#                           |         |           | SWE-bench's growing prefix +
-#                           |         |           | prefix cache keep per-turn new
-#                           |         |           | prefill small (~3.8K), so 4096
-#                           |         |           | covers it. Match the sim's
-#                           |         |           | --max-num-batched-tokens.
+#   MAX_NUM_BATCHED_TOKENS  | 2048    | 16384     | bounds the prefill-chunk axis and
+#                           |         |           | the MoE token axis. 16384 is vLLM
+#                           |         |           | 0.31's offline default on an H200
+#                           |         |           | and holds a ~10K accessibility-tree
+#                           |         |           | prompt (OSWorld) in one step. Profile
+#                           |         |           | at least as high as the bench and
+#                           |         |           | the sim use (--max-num-batched-tokens).
 #   ATTENTION_KV_FACTOR     | 2.0     | 2.0 (keep)| attention latency is ~linear in
 #                           |         |           | KV, so doubling-spaced points
 #                           |         |           | interpolate well. KV sits on 2
 #                           |         |           | axes, so lowering this is
 #                           |         |           | ~quadratic profiling cost for
 #                           |         |           | little gain.
-#   MAX_NUM_SEQS            | 256     | 256 (keep)| decode-batch (n_decode) axis;
-#                           |         |           | raise only to simulate >256
-#                           |         |           | concurrent seqs.
+#   MAX_NUM_SEQS            | 256     | 512       | decode-batch (n_decode) axis.
+#                           |         |           | Profile ABOVE the runtime cap: a
+#                           |         |           | mixed (prefill + decode) shot at
+#                           |         |           | n = MSQ needs MSQ+1 requests and is
+#                           |         |           | filtered, so a profile at 256 has no
+#                           |         |           | mixed shot above 181 decodes. Run the
+#                           |         |           | bench and sim at <=256 (upstream's
+#                           |         |           | examples profile 256, run 128).
 #   MEASUREMENT_ITERATIONS  | 3       | 3 (keep)  | N=3 already cuts DVFS jitter to
 #                           |         |           | ~5%; more is linear cost for
 #                           |         |           | marginal gain on the big shots.
 #
-# NOTE on skew: skew's kvs/kp axes derive from ATTENTION_MAX_KV, so raising it
-# (e.g. to 65536) also grows the skew sweep. If the skew stage runs long, coarsen
-# it with SKEW_KVS_FACTOR=4 / SKEW_KP_FACTOR=4 (halves those axes) rather than
-# dropping ATTENTION_MAX_KV.
+# =============================================================================
+# STAGED RUN: a small trial first, then extend it
+# =============================================================================
+# Resume extends the ordinary tables when the limits grow, so a trial pass
+# costs nothing the full pass redoes. Checked on an A10G (Llama-3.1-8B and
+# Qwen3-30B at tiny nested limits) and by enumerating R1's TP8 grids:
+#   * dense, per_sequence, attention: shots already in the CSV are skipped.
+#     R1's 2048/128 plan has 22,312 attention shots at the full context reach,
+#     all inside the 16384/512 plan of 40,022 (14,088 with ATTENTION_MAX_KV=
+#     16384, of which 92% are inside it). Rows outside the final plan stay.
+#   * skew: only part of a smaller sweep is reused (76% of R1's 2048/128 cases,
+#     31% in the toy), so run STAGE=skew once, at the final limits.
+#   * native MoE: a different limit is a different plan, and resume refuses it
+#     ("use a new output root"). Run STAGE=moe once, at the final limits, in the
+#     real root. A trial that ran STAGE=fast leaves its TP1/EP1 MoE table at the
+#     trial's limits, so the extending STAGE=fast ends with that refusal after the
+#     ordinary tables, TP-stable copies and meta.yaml are complete.
+# Never set FORCE for the extension: it replaces what was measured.
+#
+#   MAX_NUM_BATCHED_TOKENS=2048 MAX_NUM_SEQS=128 ATTENTION_MAX_KV=16384 \
+#       STAGE=fast ./profiler/profile-deepseek-h200.sh      # trial
+#   STAGE=fast ./profiler/profile-deepseek-h200.sh          # extend to 16384/512
+#   STAGE=moe  ./profiler/profile-deepseek-h200.sh          # once, final limits
+#   STAGE=skew ./profiler/profile-deepseek-h200.sh          # once, final limits
+#
+# NOTE on skew: skew's kvs/kp axes derive from ATTENTION_MAX_KV, so the full
+# context also widens the skew sweep. If the skew stage runs long, coarsen it
+# with SKEW_KVS_FACTOR=4 / SKEW_KP_FACTOR=4 (halves those axes) rather than
+# lowering ATTENTION_MAX_KV, which would make the attention table extrapolate.
 # =============================================================================
 set -euo pipefail
 
@@ -111,10 +142,10 @@ cd "$REPO_ROOT"
 set_run_flags() {
   run_flags=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
              --max-num-seqs "$MAX_NUM_SEQS"
-             --attention-max-kv "$ATTENTION_MAX_KV"
              --attention-chunk-factor "$ATTENTION_CHUNK_FACTOR"
              --attention-kv-factor "$ATTENTION_KV_FACTOR"
              --measurement-iterations "$MEASUREMENT_ITERATIONS")
+  [[ -n "${ATTENTION_MAX_KV:-}" ]] && run_flags+=(--attention-max-kv "$ATTENTION_MAX_KV")
   [[ -n "$DTYPE" ]]          && run_flags+=(--dtype "$DTYPE")
   [[ -n "${FORCE:-}" ]]      && run_flags+=(--force)
   [[ -n "${VERBOSITY:-}" ]]  && run_flags+=($VERBOSITY)
@@ -182,19 +213,19 @@ case "$TARGET" in
       MEASUREMENT_ITERATIONS="${MEASUREMENT_ITERATIONS:-1}"
     else
       TP_DEGREES="${TP_DEGREES:-1,8}"
-      # Sized to the SWE-bench trace (max ~21.7K ctx). For a bounded window,
-      # MAX_NUM_SEQS=64 (SWE-bench is low-concurrency) shrinks the attention
-      # grid; the run's heartbeat logs the shot count and ETA. Raise
-      # ATTENTION_MAX_KV to 65536 only for longer traces (measure first).
-      ATTENTION_MAX_KV="${ATTENTION_MAX_KV:-32768}"
+      # ATTENTION_MAX_KV stays unset, so the attention and skew grids reach
+      # R1's whole context window (the profiler default). For a bounded
+      # window, MAX_NUM_SEQS=64 (SWE-bench is low-concurrency) shrinks the
+      # attention grid; the run's heartbeat logs the shot count and ETA.
+      ATTENTION_MAX_KV="${ATTENTION_MAX_KV:-}"
       ATTENTION_CHUNK_FACTOR="${ATTENTION_CHUNK_FACTOR:-2.0}"
       ATTENTION_KV_FACTOR="${ATTENTION_KV_FACTOR:-2.0}"
-      MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
-      MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
+      MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-16384}"
+      MAX_NUM_SEQS="${MAX_NUM_SEQS:-512}"
       MEASUREMENT_ITERATIONS="${MEASUREMENT_ITERATIONS:-3}"
     fi
     # skew density (only consulted when skew runs). Bump kvs/kp to 4.0 if the
-    # skew sweep is too slow at ATTENTION_MAX_KV=65536.
+    # skew sweep is too slow at the full context.
     SKEW_N_FACTOR="${SKEW_N_FACTOR:-2.0}"
     SKEW_PC_FACTOR="${SKEW_PC_FACTOR:-2.0}"
     SKEW_KP_FACTOR="${SKEW_KP_FACTOR:-2.0}"

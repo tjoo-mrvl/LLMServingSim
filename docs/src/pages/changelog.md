@@ -144,7 +144,17 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   `--only-skew`. The attention chunk factor returns to the profiler default
   2.0, and the script's comments no longer describe nearest-neighbour lookup
   or MoE priced from an EP1 table. The untested `TARGET=v4flash` branch is
-  removed.
+  removed. The attention and skew reach is no longer pinned to 32768: the
+  script leaves `--attention-max-kv` to the profiler's default, R1's whole
+  context window, so a trace that reaches tens of thousands of tokens is
+  measured instead of extrapolated (`ATTENTION_MAX_KV` still bounds a trial
+  run). The limits are 16384 tokens and 512 sequences (were 4096 and 256):
+  vLLM's offline H200 default fits a 10K-token prompt in one step, and profiling
+  above the runtime sequence cap keeps mixed shots at that cap feasible, so run
+  the bench and simulator at 256 or fewer. The script documents a staged run:
+  a trial at 2048/128 is extended by the default run, which skips what the trial
+  measured for the ordinary tables, while skew and the native MoE tables run once
+  at the final limits.
 - Native MoE expert components are timed once per point and published as
   measured. The lower-bank control pass and its 3% stability gate are removed:
   GPUs are not deterministic, so a gate that allowed no miss refused whole
