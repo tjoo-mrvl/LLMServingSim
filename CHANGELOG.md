@@ -137,6 +137,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   fast, moe and skew in turn.
   `SMOKE=1` also measures EP8 rank 0's MoE components and writes a scratch
   output root, so its tiny grid no longer blocks the real run from resuming.
+  It runs verbose by default (`VERBOSITY=--silent` overrides), because the expert
+  and shared-expert output checks log from inside the vLLM worker and appear in
+  no other mode.
   `STAGE=skew` no longer passes `--ep 1`, which the CLI refuses with
   `--only-skew`. The attention chunk factor returns to the profiler default
   2.0, and the script's comments no longer describe nearest-neighbour lookup

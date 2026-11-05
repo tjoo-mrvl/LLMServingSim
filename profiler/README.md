@@ -659,7 +659,7 @@ A staged driver for DeepSeek-R1 at TP1 and TP8. Run the stages in order, or
 
 ```bash
 STAGE=coverage ./profiler/profile-deepseek-h200.sh   # catalog check, no CSVs
-SMOKE=1 ./profiler/profile-deepseek-h200.sh          # tiny grid plus EP8 rank 0's MoE, scratch root
+SMOKE=1 ./profiler/profile-deepseek-h200.sh          # tiny grid plus EP8 rank 0's MoE, scratch root, verbose
 STAGE=fast ./profiler/profile-deepseek-h200.sh       # every category at TP1 and TP8, MoE at TP1/EP1
 STAGE=moe ./profiler/profile-deepseek-h200.sh        # TP8/EP8 MoE components, one process per GPU
 STAGE=skew ./profiler/profile-deepseek-h200.sh       # the skew sweep
@@ -668,7 +668,8 @@ STAGE=skew ./profiler/profile-deepseek-h200.sh       # the skew sweep
 `STAGE=moe` runs `profile-moe-ranks.sh` with TP = EP = `EP` (default 8) and
 DP 1, one process per visible GPU, with per-process logs in `MOE_LOG_DIR`
 (default `outputs/profile-deepseek-h200/`). `CUDA_VISIBLE_DEVICES=0` measures
-every rank on that one GPU. `SMOKE=1` writes `outputs/profile-deepseek-h200/smoke/`
+every rank on that one GPU. `SMOKE=1` runs verbose, so the log shows the expert and
+shared-expert output checks (logged inside the vLLM worker), and writes `outputs/profile-deepseek-h200/smoke/`
 unless `OUT_ROOT` is set, so its tiny grid never mixes with the real bundle.
 
 The limits default to 16384 tokens and 513 sequences, with the attention reach at

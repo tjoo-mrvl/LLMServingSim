@@ -207,6 +207,10 @@ case "$TARGET" in
       # copy at TP8 width) -- NOT real timing numbers, so it writes a scratch root.
       TP_DEGREES="${TP_DEGREES:-1}"; STAGE="fast"
       OUT_ROOT="${OUT_ROOT:-outputs/profile-deepseek-h200/smoke}"
+      # The expert and shared-expert output checks log from inside the vLLM
+      # worker, and only verbose mode shows worker logs; without it the smoke
+      # log has no sign that they ran. VERBOSITY=--silent still overrides.
+      VERBOSITY="${VERBOSITY:---verbose}"
       ATTENTION_MAX_KV="${ATTENTION_MAX_KV:-2048}"
       ATTENTION_CHUNK_FACTOR="${ATTENTION_CHUNK_FACTOR:-2.0}"
       ATTENTION_KV_FACTOR="${ATTENTION_KV_FACTOR:-2.0}"
