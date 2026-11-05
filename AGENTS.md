@@ -1523,7 +1523,16 @@ defaults. A category slice can change the grid when its factors or resolved
 limits differ; a lower `--max-num-seqs` narrows support through feasibility
 filters. Match the recorded chunk, KV and request factors, decode query lengths,
 maximum KV, request/token limits and target graph policy when retaining the
-same sampling envelope. A changed envelope is a new acquisition choice, not a
+same sampling envelope. Raising the limits extends an ordinary sweep in place:
+resume identity excludes `--max-num-batched-tokens`, `--max-num-seqs` and
+`--attention-max-kv`, so shots already in the CSV are skipped and rows outside the
+new plan stay (verified on an A10G, and for R1's TP8 grids: all 22,312 attention
+shots of a 2048/128 plan are in the 16384/512 plan). Skew draws depend on the
+limits, so only part is reused (76% on R1); native MoE contracts carry the point
+plan and token budget, so a changed limit is refused ("use a new output root").
+`run_full` runs native MoE last, after TP-stable replication and `persist_meta`,
+so that refusal (or any MoE failure) cannot leave TP-stable rows or the recorded
+limits stale. A changed envelope is a new acquisition choice, not a
 row-for-row refresh.
 
 **A long sweep prints a heartbeat.** The rich progress bar needs a TTY.

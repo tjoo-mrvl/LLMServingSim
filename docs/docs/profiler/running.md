@@ -423,6 +423,31 @@ the current identity or files measured with a different method require a
 separate output root or explicit `--force`; they are not silently mixed with
 new timings. See [acquisition identity](./output-bundle#cuda-activity-and-acquisition-identity).
 Fully skipped ordinary categories retain their previous measurement timestamp.
+
+### Extending a sweep to larger limits
+
+A trial at small limits can be extended in place. The resume identity does not
+include `MAX_NUM_BATCHED_TOKENS`, `MAX_NUM_SEQS` or `ATTENTION_MAX_KV`, so
+re-running with larger values skips every shot of the earlier plan that is also in
+the new one and fires the rest. Rows outside the new plan stay in the CSV, and
+`meta.yaml` records the larger run's limits and attention grid. Checked on an A10G
+with nested limits (Llama-3.1-8B: the extended and the fresh tables hold the same
+keys, with timings 1.000x apart at the median), and by enumerating DeepSeek-R1's
+TP8 grids: every shot of a 2048/128 plan, 22,312 attention shots at the full
+context reach, is inside the 16384/512 plan of 40,022. Do not pass `--force`, which
+replaces what was measured.
+
+Two parts do not carry over:
+
+- **Skew.** Its cases are draws that depend on the limits, so only part of a smaller
+  sweep is reused: 76% of R1's 2048/128 cases are in the 16384/512 plan (31% in the
+  A10G toy). Run skew once, at the final limits.
+- **Native MoE components.** The point plan and token budget are part of each
+  deployment's contract, so a different limit is refused with `Native MoE
+  measurement conditions changed; use a new output root`. Run the MoE slice once, at
+  the final limits. In a full `profile` the native MoE step runs last, after the
+  TP-stable copies and `meta.yaml`, so its refusal leaves the ordinary tables
+  consistent.
 New acquisition metadata is kept in the variant-root `meta.yaml`, with per-TP
 records under `per_tp[tp]`, rather than metadata files beside the tables.
 Supported historical sidecars other than `skew.meta.yaml` remain readable;

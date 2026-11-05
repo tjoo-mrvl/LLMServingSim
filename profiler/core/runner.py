@@ -533,10 +533,6 @@ def run_full(
                 finally:
                     spin_down(llm, tmpdir)
 
-    if component_args is not None:
-        from .moe_profile import run_components
-        run_components(arch_path, component_args, args.tp_degrees, variant_root)
-
     # After every tp has run, copy tp_stable rows from tp1 into the rest.
     # Skip when only_skew=True (nothing new to replicate).
     if not args.only_skew:
@@ -563,6 +559,13 @@ def run_full(
                  records_engine=not args.only_skew,
                  records_attention_grid=not args.only_skew,
                  measured_categories=measured)
+
+    # Native MoE last. It can be refused (a changed plan needs a new output
+    # root) or fail after hours, and the ordinary tables, their TP-stable copies
+    # and the bundle metadata must already be consistent when it does.
+    if component_args is not None:
+        from .moe_profile import run_components
+        run_components(arch_path, component_args, args.tp_degrees, variant_root)
 
     log.done(variant_root)
 

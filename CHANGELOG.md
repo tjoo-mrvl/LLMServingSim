@@ -266,6 +266,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   none holds the point, so it still never extrapolates. Answers the old lookup
   gave are unchanged, and no regression clock moves. See
   [Native MoE components](https://llmservingsim.ai/docs/profiler/native-moe-components).
+- A full `profile` no longer leaves its bundle inconsistent when the native MoE
+  step fails or is refused. MoE ran before the TP-stable copies and `meta.yaml`, so
+  re-running at larger limits (which a changed MoE plan refuses, as it needs a
+  new output root) skipped both: TP-stable layers in the other TP folders kept the
+  earlier run's points, and `meta.yaml` kept its limits and attention grid. MoE
+  now runs last. The refusal still ends the run with its error. See
+  [Running the profiler → Extending a sweep to larger limits](https://llmservingsim.ai/docs/profiler/running#extending-a-sweep-to-larger-limits).
 
 ## [v1.3.0] - 2026-10-19
 
