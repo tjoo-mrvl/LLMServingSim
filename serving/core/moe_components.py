@@ -140,10 +140,35 @@ class _ExpertSurface:
         weights.append(1.-sum(weights))
         if any(not math.isfinite(weight) or weight < -self.tolerance
                or weight > 1.+self.tolerance for weight in weights):
-            raise MoeCoverageError('Expert query has no nonnegative interpolation weights')
+            # find_simplex can hand back a neighbour of the simplex that holds
+            # the point when simplices are thin, and that neighbour's weights
+            # fail this test. Test every simplex; refuse only if none holds it.
+            simplex, weights = self._containing(projected)
         weights = [max(0., min(1., weight)) for weight in weights]
         total = sum(weights)
         return sum(weight*value for weight, value in zip(weights, self.vertices[simplex]))/total
+
+    def _containing(self, projected):
+        """The simplex whose barycentric weights are all valid at this point.
+
+        Same weights and same acceptance test as ``__call__``, applied to every
+        simplex at once. A point on a face shared by several simplices has valid
+        weights in each, and they interpolate to the same value there (only the
+        shared vertices carry weight), so which one is picked does not matter.
+        Degenerate simplices hold NaN transforms and never qualify.
+        """
+        import numpy as np
+
+        d = self.dimension
+        weights = np.einsum('sij,sj->si', self.transforms[:, :d],
+                            projected-self.transforms[:, d])
+        weights = np.concatenate([weights, 1.-weights.sum(axis=1, keepdims=True)], axis=1)
+        with np.errstate(invalid='ignore'):
+            inside = np.all((weights >= -self.tolerance) & (weights <= 1.+self.tolerance), axis=1)
+        if not inside.any():
+            raise MoeCoverageError('Expert query has no nonnegative interpolation weights')
+        best = int(np.argmax(np.where(inside, weights.min(axis=1), -np.inf)))
+        return best, weights[best].tolist()
 
 
 class MoeComponentTable:

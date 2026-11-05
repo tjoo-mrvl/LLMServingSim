@@ -2708,7 +2708,11 @@ Serving automatically consumes matching tables for the supported modular
 local/DP+EP or separately admitted live local path. Local components use token interpolation.
 New experts use physical N/A/M interpolation: construct affine-rank-reduced
 simplices at table load, then use nonnegative barycentric weights and bounded
-query caches. Do not normalize by query-dependent feasible ranges: doing so
+query caches. SciPy's `find_simplex` can return a neighbour of the simplex that
+holds a point when simplices are thin; if the returned simplex's weights fail the
+nonnegativity test, `_ExpertSurface._containing` tests every simplex and refuses
+only when none holds the point (a point on a shared face interpolates to the same
+value in each simplex, so the choice cannot matter). Do not normalize by query-dependent feasible ranges: doing so
 can reduce assignment work during interpolation. Check feasible geometry and
 measured support; never extrapolate. Historical balanced-total tables retain
 their original interpolation and graph/eager selection. The routing policy

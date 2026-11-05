@@ -442,6 +442,10 @@ such as EP1's `M=N*k`. Lookup uses at most four measured vertices with nonnegati
 weights; exact rows are returned directly and queries are cached with bounded
 capacity. There is no online nearest-neighbour search, fitted predictor or
 per-workload multiplier. Out-of-support queries do not extrapolate.
+Thin simplices can make SciPy's point location return a neighbour of the simplex
+that holds the query; when that simplex's weights are not all nonnegative, lookup
+tests every simplex and uses the one that holds the point, so a query inside the
+measured support is not refused for a numerical reason.
 
 The expert query is `(gathered/padded N, rank-local A, rank-local M)`, and all
 three coordinates enter the lookup cache key. Local gate/finalization components

@@ -257,6 +257,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   DeepSeek-V3.2 and GLM-5 catalog keeps vLLM 0.28's merged
   `mla_b_proj`, and no regression clock moves. See
   [KV cache & memory → Model weights](https://llmservingsim.ai/docs/simulator/scheduling/kv-cache-and-memory#1-model-weights-per-gpu).
+- Stop refusing native MoE expert queries that lie inside the measured support.
+  SciPy's point location can return a neighbour of the simplex that holds a query
+  when simplices are thin, and the lookup then raised "no nonnegative
+  interpolation weights" (about 5 in a million random feasible queries on the R1
+  EP8 plan; default BALANCED routing never hit it). When the returned simplex
+  fails the weight test, the lookup now tests every simplex and refuses only if
+  none holds the point, so it still never extrapolates. Answers the old lookup
+  gave are unchanged, and no regression clock moves. See
+  [Native MoE components](https://llmservingsim.ai/docs/profiler/native-moe-components).
 
 ## [v1.3.0] - 2026-10-19
 
