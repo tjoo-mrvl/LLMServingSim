@@ -17,6 +17,15 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   when the sweep reaches it. See
   [Native MoE components → Memory preflight](https://llmservingsim.ai/docs/profiler/native-moe-components#memory-preflight).
 
+- Memory headroom for long sweeps. The ordinary categories and the skew sweep fire
+  the shots most likely to need temporary GPU memory first (same plan, resume keys
+  and tables), log what those shots used and what stayed free, and stop with a
+  suggested `--gpu-memory-utilization` when that is too little; an out-of-memory
+  error elsewhere logs the same remedy. The worker returns its allocator cache after
+  each shot so a shot's memory need does not depend on its predecessors.
+  `profile-deepseek-h200.sh` takes `GPU_MEMORY_UTILIZATION`. See
+  [Memory headroom during a sweep](https://llmservingsim.ai/docs/profiler/running#memory-headroom-during-a-sweep).
+
 - Profiles record the KV cache dtype vLLM resolved,
   `engine_resolved.per_tp[tp].kv_cache_dtype`, read in the worker after the
   model is built, and the simulator sizes the KV cache from it. vLLM picks the

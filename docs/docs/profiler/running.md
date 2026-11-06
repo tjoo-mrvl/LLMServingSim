@@ -396,6 +396,42 @@ methodology.
 
 
 
+## Memory headroom during a sweep
+
+vLLM budgets an engine's memory at startup from a prefill that carries no cached
+context. A shot with history needs more: MLA decompresses a long context into
+temporaries (K is `[context, heads, 192]`, beside the `kv_b_proj` output), and a
+wide decode batch allocates split buffers. What `--gpu-memory-utilization` leaves
+free is all they get, and the shot that does not fit can sit hours into a sweep.
+
+The ordinary categories and the skew sweep therefore fire the shots most likely to
+need temporary memory first. Three proxies rank every shot (prefill tokens plus their
+history, new tokens, KV tokens), and the four heaviest under each fire before the
+rest, in plan order. The plan, the resume keys and the tables are unchanged. Two
+consequences: the progress heartbeat is pessimistic at the start, because its first
+shots are the slowest, and an out-of-memory error arrives in seconds instead of
+hours (the log says which utilization to try).
+
+After those shots the profiler logs what they used and what stayed free:
+
+```text
+TP=1 skew memory headroom: the 12 heaviest shots fired first. Each took at most
+2.47 GiB beyond the 17.49 GiB resident ... from the 4.29 of 22.11 GiB free,
+leaving 1.81 GiB; 0.50 GiB is required.
+```
+
+It stops with a suggested utilization when less than 512 MiB, or a tenth of what they
+used, remains. That is a floor against a near miss, not a prediction: the proxies rank
+shots and cannot prove the heaviest was the greatest. The worker also returns the
+allocator's cached memory to the driver after every shot, outside the timed region, so
+a shot's temporaries do not fragment the room the next shot of another shape needs.
+
+The utilization is not part of the measurement identity. Rerun the same command with
+the suggested `GPU_MEMORY_UTILIZATION` and completed shots are kept; it only changes
+the KV block count the feasibility filters read. The native MoE engine is separate:
+its KV cache has a fixed size, so utilization does not change its memory (see
+[Native MoE components → Memory preflight](./native-moe-components#memory-preflight)).
+
 ## Preview or rebuild skew calibration without a GPU
 
 `python -m profiler plan-skew MODEL --hardware HARDWARE --tp 1` streams the

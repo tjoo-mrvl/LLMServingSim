@@ -82,6 +82,20 @@
 #                           |         |           | 256, 362 at 512, 512 at 513. Above that
 #                           |         |           | a mixed lookup is flat in n. 513 lets
 #                           |         |           | the bench and sim run at up to 512.
+#   GPU_MEMORY_UTILIZATION  | 0.9     | unset     | the fraction of GPU memory vLLM budgets
+#                           |         |           | for the engine (weights + KV cache +
+#                           |         |           | the activations of a prefill with no
+#                           |         |           | history). What it leaves free is all a
+#                           |         |           | shot's own temporaries get, and MLA's
+#                           |         |           | long-context shots need more than the
+#                           |         |           | startup profiling saw. The attention and
+#                           |         |           | skew sweeps fire their heaviest shots
+#                           |         |           | first, report what is left and stop with
+#                           |         |           | a suggested value if it is too little;
+#                           |         |           | pass that value here. It is not part of
+#                           |         |           | the measurement identity, so completed
+#                           |         |           | shots are kept. It does not affect the
+#                           |         |           | MoE engine, whose KV cache has a fixed size.
 #   MEASUREMENT_ITERATIONS  | 3       | 3 (keep)  | N=3 already cuts DVFS jitter to
 #                           |         |           | ~5%; more is linear cost for
 #                           |         |           | marginal gain on the big shots.
@@ -131,6 +145,7 @@ OUT_ROOT="${OUT_ROOT:-}"
 DTYPE="${DTYPE:-}"
 FORCE="${FORCE:-}"             # FORCE=1 -> wipe + re-profile from scratch (default: resume)
 VERBOSITY="${VERBOSITY:-}"     # e.g. VERBOSITY=--verbose  (DEBUG + vLLM stdout)
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"   # e.g. 0.8; unset = the profiler default (0.9)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # script lives in profiler/; repo root is its parent
 cd "$REPO_ROOT"
@@ -138,8 +153,8 @@ cd "$REPO_ROOT"
 # -----------------------------------------------------------------------------
 # set_run_flags
 # Fills run_flags with the flags every command here shares: the ATTENTION_* /
-# MAX_* / MEASUREMENT_ITERATIONS globals set per target, plus DTYPE, FORCE and
-# VERBOSITY. --hardware, --tp and --out-root are each caller's own.
+# MAX_* / MEASUREMENT_ITERATIONS globals set per target, plus DTYPE, FORCE,
+# GPU_MEMORY_UTILIZATION and VERBOSITY. --hardware, --tp and --out-root are each caller's own.
 # -----------------------------------------------------------------------------
 set_run_flags() {
   run_flags=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
@@ -149,6 +164,7 @@ set_run_flags() {
              --measurement-iterations "$MEASUREMENT_ITERATIONS")
   [[ -n "${ATTENTION_MAX_KV:-}" ]] && run_flags+=(--attention-max-kv "$ATTENTION_MAX_KV")
   [[ -n "$DTYPE" ]]          && run_flags+=(--dtype "$DTYPE")
+  [[ -n "$GPU_MEMORY_UTILIZATION" ]] && run_flags+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
   [[ -n "${FORCE:-}" ]]      && run_flags+=(--force)
   [[ -n "${VERBOSITY:-}" ]]  && run_flags+=($VERBOSITY)
   return 0

@@ -17,6 +17,7 @@ import pandas as pd
 from . import logger as log
 from .skew_calibration import measurement_shape
 from .bundle_metadata import read_tp, write_tp
+from . import memory_headroom
 from .skew_plan import iter_cases
 from .skew_support import complete_plan
 
@@ -361,21 +362,44 @@ def sample_skew(llm, arch, args, limits, tp, tp_root):
     write_tp(tp_root, 'skew', plan)
     rows, fired, skipped = [], 0, 0
     started, initialized = time.monotonic(), False
+    # The cases most likely to need temporary memory fire first (same plan, same
+    # keys, one extra pass over the streamed cases): an OOM then costs seconds,
+    # and the headroom they leave is measured before the long part starts.
+    probe = memory_headroom.heaviest(chain(iter_cases(args, limits), extra), lambda case: case[0],
+                                     skip=prior, key_of=lambda case: case[2])
+    probed = {case[2] for case in probe}
+    headroom = memory_headroom.Headroom(llm, f'TP={tp} skew', log, args.gpu_memory_utilization or 0.9)
+
+    def ordered():
+        yield from probe
+        for case in chain(iter_cases(args, limits), extra):
+            if case[2] not in probed:
+                yield case
+
     try:
-        for shot, family, key in chain(iter_cases(args, limits), extra):
+        for shot, family, key in ordered():
             if key in prior:
                 skipped += 1
                 continue
             if not initialized:
                 llm.collective_rpc("skew_initialize")
                 initialized = True
+            if fired == 0:
+                headroom.begin()
             by_layer = {name: [] for name in catalog}
             for _ in range(args.skew_rounds):
                 rpc_args = (shot.as_dict(), catalog, args.measurement_iterations, scope_contexts,
                             live)
                 if component_layout_contract is not None:
                     rpc_args += (component_layout_contract,)
-                results = llm.collective_rpc("skew_measure", args=rpc_args)
+                try:
+                    results = llm.collective_rpc("skew_measure", args=rpc_args)
+                except Exception as exc:
+                    if memory_headroom.is_out_of_memory(exc):
+                        memory_headroom.explain_out_of_memory(
+                            log, exc, label=f'TP={tp} skew', done=fired + 1, total=total - plan["reusable_cases"],
+                            utilization=args.gpu_memory_utilization or 0.9)
+                    raise
                 if not results:
                     raise ValueError('No worker skew timings returned')
                 for result in results:
@@ -408,6 +432,8 @@ def sample_skew(llm, arch, args, limits, tp, tp_root):
                 acquisitions.append(facts)
             plan['case_families'][key] = family
             fired += 1
+            if fired == len(probe):
+                headroom.finish(len(probe))
             if fired % 20 == 0:
                 _flush_rows(out, rows)
                 rows.clear()

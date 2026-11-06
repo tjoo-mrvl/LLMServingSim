@@ -53,6 +53,7 @@ LLMServingSim/
 │   │   ├── skew.py             # Heterogeneous-decode skew sweep
 │   │   ├── skew_calibration.py # Offline reference-aligned fit + supported-N lookup
 │   │   ├── skew_plan.py        # Dynamic heterogeneous distribution coverage
+│   │   ├── memory_headroom.py  # Heaviest-shots-first order, headroom report, OOM hint
 │   │   ├── writer.py           # CSV + meta.yaml writer, TP-stable replication
 │   │   ├── bundle_metadata.py  # Locked variant-root metadata updates
 │   │   ├── metadata_names.py   # Shared descriptive metadata names
@@ -1534,6 +1535,22 @@ plan and token budget, so a changed limit is refused ("use a new output root").
 so that refusal (or any MoE failure) cannot leave TP-stable rows or the recorded
 limits stale. A changed envelope is a new acquisition choice, not a
 row-for-row refresh.
+
+**Memory headroom.** vLLM budgets an engine at startup from a prefill with no cached
+context, so the temporaries of a shot that carries history (MLA's context
+decompression, a wide decode batch's split buffers) are invisible to it, and the
+shot that does not fit can come hours in. `memory_headroom.py` fires the heaviest
+shots first, under three generic proxies (prefill tokens plus history, new tokens, KV
+tokens; never a model family), in every ordinary category and the skew sweep. The set
+of shots, the resume keys and the tables do not change. `Extension.fire` and
+`skew_measure` release the allocator's cache after each shot, outside the timed
+region, so a shot's memory need does not depend on the shots before it. After the
+heaviest shots `Headroom.finish` logs what they used and stops with `HeadroomError`
+and a suggested `--gpu-memory-utilization` when less than 512 MiB, or a tenth of what
+they used, is left (a floor against a near miss, calibrated on one A10G; heavier
+shots outside the probe were 3-4x lighter in every measured case). An OOM anywhere
+else logs the same remedy. Utilization is not part of the measurement identity, so
+the rerun keeps completed shots. The native MoE engine is separate: see its preflight.
 
 **A long sweep prints a heartbeat.** The rich progress bar needs a TTY.
 Ordinary categories also write periodic atomic CSV checkpoints between

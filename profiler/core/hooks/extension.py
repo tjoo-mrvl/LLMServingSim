@@ -20,6 +20,26 @@ from profiler.core.hooks.dummy_weights import install as _install_dummy_weights
 _install_dummy_weights()
 
 
+def _releases_cached_memory(method):
+    """Return the allocator's unused cache to the driver after every shot.
+
+    A shot's temporaries stay cached, split into blocks of that shot's shapes. The next shot, of another shape,
+    can then fail for want of one contiguous block while the driver reports memory free, which turns a sweep's
+    memory need into a function of the shots before it. Releasing the cache outside the timed region makes every
+    shot start from the resident state, so the heaviest shots (``memory_headroom``) bound all the others.
+    """
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            import torch
+            torch.cuda.empty_cache()
+    return wrapper
+
+
 class Extension:
     """Worker-side profiling entry point.
 
@@ -84,6 +104,17 @@ class Extension:
     def moe_component_release(self):
         self._moe_components = None
 
+    def memory_snapshot(self, reset_peak=False):
+        """This worker's GPU memory now: driver-free bytes and the allocator's own counters."""
+        import torch
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats()
+        free, total = torch.cuda.mem_get_info()
+        return dict(free=free, total=total, allocated=torch.cuda.memory_allocated(),
+                    reserved=torch.cuda.memory_reserved(),
+                    peak_allocated=torch.cuda.max_memory_allocated(),
+                    peak_reserved=torch.cuda.max_memory_reserved())
+
     def skew_initialize(self):
         from .skew_measurement import initialize
         return initialize(self.model_runner)
@@ -92,6 +123,7 @@ class Extension:
         from .attention_lookup import runtime_semantic
         return runtime_semantic(self.model_runner, profile_tp)
 
+    @_releases_cached_memory
     def skew_measure(self, shot_dict, catalog, iterations=3, scope_contexts=None,
                      attention_lookup_semantic=None, component_layout_contract=None):
         from .capture_scope_contract import normalize_contexts
@@ -105,6 +137,7 @@ class Extension:
                        attention_lookup_sha256=attention_lookup_sha256,
                        component_layout_contract=component_layout_contract)
 
+    @_releases_cached_memory
     def fire(
         self,
         shot_dict: dict[str, Any],

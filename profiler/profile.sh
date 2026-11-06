@@ -58,7 +58,9 @@ HARDWARE="RTXPRO6000"
 # at, since a profile measured under one paging regime doesn't describe
 # another. GPU_MEMORY_UTILIZATION also sets the KV block count, which every
 # shot-feasibility filter is measured against, so it changes *which* shots the
-# sweep contains.
+# sweep contains. What it leaves free is all a shot's own temporaries get: the attention
+# and skew sweeps fire their heaviest shots first and stop with a suggested value when
+# too little is left; set it to that value and rerun (completed shots are kept).
 # BLOCK_SIZE=16
 # GPU_MEMORY_UTILIZATION=0.9
 # MAX_MODEL_LEN caps the engine's context length; lowering it cuts profile

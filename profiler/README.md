@@ -39,6 +39,7 @@ profiler/                          Python package: python -m profiler
 │   ├── moe_deployment.py          TP/DP/EP ownership and token domains
 │   ├── moe_geometry.py            global expert placement and routing geometry
 │   ├── moe_conditioning.py        expert weight-rotation plan
+│   ├── memory_headroom.py         heaviest-shots-first order, headroom report and OOM hint
 │   ├── skew.py                    heterogeneous-decode acquisition
 │   ├── skew_calibration.py        reference-aligned fit and supported-N lookup
 │   ├── skew_plan.py               dynamic distribution coverage and feasibility
@@ -671,6 +672,12 @@ DP 1, one process per visible GPU, with per-process logs in `MOE_LOG_DIR`
 every rank on that one GPU. `SMOKE=1` runs verbose, so the log shows the expert and
 shared-expert output checks (logged inside the vLLM worker), and writes `outputs/profile-deepseek-h200/smoke/`
 unless `OUT_ROOT` is set, so its tiny grid never mixes with the real bundle.
+
+`GPU_MEMORY_UTILIZATION` (unset: the profiler's 0.9) is forwarded as
+`--gpu-memory-utilization`. The attention and skew sweeps fire their heaviest shots
+first, report the memory left and stop with a suggested value if it is too little; pass
+that value and rerun. See
+[Memory headroom during a sweep](../docs/docs/profiler/running.md#memory-headroom-during-a-sweep).
 
 The limits default to 16384 tokens and 513 sequences, with the attention reach at
 R1's whole context window. Profile above the runtime sequence cap: 513 gives mixed
