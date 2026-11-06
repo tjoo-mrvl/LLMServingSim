@@ -53,7 +53,7 @@ LLMServingSim/
 │   │   ├── skew.py             # Heterogeneous-decode skew sweep
 │   │   ├── skew_calibration.py # Offline reference-aligned fit + supported-N lookup
 │   │   ├── skew_plan.py        # Dynamic heterogeneous distribution coverage
-│   │   ├── memory_headroom.py  # Heaviest-shots-first order, headroom report, OOM hint
+│   │   ├── kv_pool.py          # KV pool pin for the attention/skew engine, OOM hint
 │   │   ├── writer.py           # CSV + meta.yaml writer, TP-stable replication
 │   │   ├── bundle_metadata.py  # Locked variant-root metadata updates
 │   │   ├── metadata_names.py   # Shared descriptive metadata names
@@ -1536,21 +1536,35 @@ so that refusal (or any MoE failure) cannot leave TP-stable rows or the recorded
 limits stale. A changed envelope is a new acquisition choice, not a
 row-for-row refresh.
 
-**Memory headroom.** vLLM budgets an engine at startup from a prefill with no cached
-context, so the temporaries of a shot that carries history (MLA's context
-decompression, a wide decode batch's split buffers) are invisible to it, and the
-shot that does not fit can come hours in. `memory_headroom.py` fires the heaviest
-shots first, under three generic proxies (prefill tokens plus history, new tokens, KV
-tokens; never a model family), in every ordinary category and the skew sweep. The set
-of shots, the resume keys and the tables do not change. `Extension.fire` and
-`skew_measure` release the allocator's cache after each shot, outside the timed
-region, so a shot's memory need does not depend on the shots before it. After the
-heaviest shots `Headroom.finish` logs what they used and stops with `HeadroomError`
-and a suggested `--gpu-memory-utilization` when less than 512 MiB, or a tenth of what
-they used, is left (a floor against a near miss, calibrated on one A10G; heavier
-shots outside the probe were 3-4x lighter in every measured case). An OOM anywhere
-else logs the same remedy. Utilization is not part of the measurement identity, so
-the rerun keeps completed shots. The native MoE engine is separate: see its preflight.
+**The attention and skew engine's KV pool is pinned to what the plan can use.** vLLM
+gives the pool every byte utilization leaves after the weights and the activation peak
+of a prefill with no cached context, and the temporaries of a shot that carries history
+(MLA's context decompression, a wide decode batch's split buffers) need exactly what
+the plan's own KV never touches, which that startup budget never saw. `kv_pool.py`
+bounds the plan from the limits alone, before any shot: `max_num_seqs * align(L)` with
+`L = min(max_model_len - 1, attention_max_kv + max(max_num_batched_tokens, q))`, the
+longest request any attention or skew case holds. Every shot's block-aligned KV is at
+most that, so the planners' KV-budget filters pass the same shots against the pinned
+pool as against the natural one. **The plan is always built from the natural boot's limits** and `engine_resolved` records
+them; only the engine that fires the shots is rebooted. Do not plan against the pinned
+engine's limits, and do not derive the pin by enumerating a plan: skew's support
+completion adds cases after attention is measured, but they pass the same `feasible`
+constraints, so the bound covers them.
+
+The pin is `num_gpu_blocks_override`, in blocks, because vLLM maps blocks to bytes for
+any cache-group layout. Its size is the largest of the worker's own page accounting for
+the bound shot (`cache_pages.pool_pages_required`, the same code that allocates a
+shot's pages), one maximum-length request (vLLM refuses a smaller pool), and enough
+group-aware `kv_cache_size_tokens` for the bound. **Do not size it from the token
+capacity alone.** On a hybrid stack (Qwen3.8, block 784, four groups) the capacity said
+1,534 blocks hold 129 requests of 9,216 tokens while the worker needs 1,936, because
+every recurrent group holds a whole page per request however short it is. The booted pool is checked against
+all three and grown and rebooted when short; a pool no smaller than the natural one
+keeps the natural engine, and so does a native profile, whose cache allocation is fixed
+and recorded in its admission contract. Utilization is not part of the measurement identity and a
+pinned pool does not follow it, so the OOM hint names the plan flags instead. The pin
+stops the pool from taking memory the plan never touches; it does not prove that the
+temporaries fit. The native MoE engine is separate: see its preflight.
 
 **A long sweep prints a heartbeat.** The rich progress bar needs a TTY.
 Ordinary categories also write periodic atomic CSV checkpoints between

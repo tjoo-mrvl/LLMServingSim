@@ -396,40 +396,68 @@ methodology.
 
 
 
-## Memory headroom during a sweep
+## KV pool and memory during a sweep
 
-vLLM budgets an engine's memory at startup from a prefill that carries no cached
-context. A shot with history needs more: MLA decompresses a long context into
-temporaries (K is `[context, heads, 192]`, beside the `kv_b_proj` output), and a
-wide decode batch allocates split buffers. What `--gpu-memory-utilization` leaves
-free is all they get, and the shot that does not fit can sit hours into a sweep.
+vLLM gives an engine's KV pool every byte `--gpu-memory-utilization` leaves after
+the weights and the activation peak of a prefill that carries no cached context. The
+attention and skew plans use a fraction of that pool. A shot with history needs room
+the startup budget never saw: MLA decompresses a long context into temporaries (K is
+`[context, heads, 192]`, beside the `kv_b_proj` output), and a wide decode batch
+allocates split buffers. Whatever the pool leaves free is all they get.
 
-The ordinary categories and the skew sweep therefore fire the shots most likely to
-need temporary memory first. Three proxies rank every shot (prefill tokens plus their
-history, new tokens, KV tokens), and the four heaviest under each fire before the
-rest, in plan order. The plan, the resume keys and the tables are unchanged. Two
-consequences: the progress heartbeat is pessimistic at the start, because its first
-shots are the slowest, and an out-of-memory error arrives in seconds instead of
-hours (the log says which utilization to try).
-
-After those shots the profiler logs what they used and what stayed free:
+The profiler therefore pins the pool of the engine that runs attention, and of the
+skew sweep that rides on it, to what the plan can use. The bound comes from the
+engine's limits alone, before any shot:
 
 ```text
-TP=1 skew memory headroom: the 12 heaviest shots fired first. Each took at most
-2.47 GiB beyond the 17.49 GiB resident ... from the 4.29 of 22.11 GiB free,
-leaving 1.81 GiB; 0.50 GiB is required.
+bound = max_num_seqs * align(L)
+L     = min(max_model_len - 1, attention_max_kv + max(max_num_batched_tokens, q))
 ```
 
-It stops with a suggested utilization when less than 512 MiB, or a tenth of what they
-used, remains. That is a floor against a near miss, not a prediction: the proxies rank
-shots and cannot prove the heaviest was the greatest. The worker also returns the
-allocator's cached memory to the driver after every shot, outside the timed region, so
-a shot's temporaries do not fragment the room the next shot of another shape needs.
+`L` is the longest single request any attention or skew shot can hold, and `q` the
+largest decode query length. Every shot's block-aligned KV is at most `bound`, so the
+feasibility filters pass the same shots against the pinned pool as against the natural
+one: the plan, its resume keys and the recorded engine limits all come from the natural
+boot and do not change. Only the engine that fires the shots is rebooted, once, with
+`num_gpu_blocks_override` set to the largest of
 
-The utilization is not part of the measurement identity. Rerun the same command with
-the suggested `GPU_MEMORY_UTILIZATION` and completed shots are kept; it only changes
-the KV block count the feasibility filters read. The native MoE engine is separate:
-its KV cache has a fixed size, so utilization does not change its memory (see
+- the blocks the worker's own page accounting needs for `max_num_seqs` requests of
+  length `L`, across every cache group (a hybrid model's recurrent state pages count,
+  which its token capacity does not show),
+- the blocks one maximum-length request needs, because vLLM refuses a smaller pool, and
+- enough group-aware tokens for the bound.
+
+The booted pool is checked against all three, and a pool that falls short is grown and
+rebooted rather than run. A pool that would not be smaller keeps the natural engine,
+because the plan then fills it, and a native profile keeps its explicitly fixed cache
+allocation. The log says which:
+
+```text
+TP=1 KV pool pinned to what the plan can use: 103296 -> 74305 blocks, 1652736 ->
+1188880 group-aware tokens (plan bound 1188864); GPU memory free after boot
+0.97 -> 2.96 GiB
+```
+
+How much the pin hands back depends on the plan. A short reach leaves most of the pool
+unused, while a plan that reaches the whole context window needs most of a card's:
+DeepSeek-R1's default plan (513 sequences over its whole 163,838-token reach) is 84
+million tokens, 90 GiB of one-layer MLA cache, so there the pin returns only what a
+natural pool held beyond that. The pin does not prove that the temporaries fit; it
+stops the KV pool from taking memory the plan never touches. The pool is not part of
+the measurement identity, and its size did not move the timings where it was
+checked: a whole attention plan (10,967 shots, DeepSeek-R1 cut to five layers on an
+A10G) re-measured against a pinned pool matched the table measured against the
+natural one, with a median ratio of 1.000 and a 5th to 95th percentile of 0.993 to
+1.012.
+
+`--gpu-memory-utilization` is not part of the identity either, so a rerun with another
+value keeps completed shots. On a pinned engine it changes nothing, because the pool no
+longer follows it. On an engine that is not pinned it sets the pool and therefore which
+shots the feasibility filters keep. An out-of-memory error during a sweep says which
+case applies and which flags shrink the plan and its temporaries together
+(`--max-num-batched-tokens`, `--max-num-seqs`, `--attention-max-kv`). The native MoE
+engine is separate: its KV cache has a fixed size, so utilization does not change its
+memory either (see
 [Native MoE components → Memory preflight](./native-moe-components#memory-preflight)).
 
 ## Preview or rebuild skew calibration without a GPU

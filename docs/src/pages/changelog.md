@@ -17,14 +17,18 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   when the sweep reaches it. See
   [Native MoE components → Memory preflight](https://llmservingsim.ai/docs/profiler/native-moe-components#memory-preflight).
 
-- Memory headroom for long sweeps. The ordinary categories and the skew sweep fire
-  the shots most likely to need temporary GPU memory first (same plan, resume keys
-  and tables), log what those shots used and what stayed free, and stop with a
-  suggested `--gpu-memory-utilization` when that is too little; an out-of-memory
-  error elsewhere logs the same remedy. The worker returns its allocator cache after
-  each shot so a shot's memory need does not depend on its predecessors.
-  `profile-deepseek-h200.sh` takes `GPU_MEMORY_UTILIZATION`. See
-  [Memory headroom during a sweep](https://llmservingsim.ai/docs/profiler/running#memory-headroom-during-a-sweep).
+- The engine that runs attention and the skew sweep pins its KV pool to what the
+  plan can use. vLLM gives the pool everything its utilization leaves, and the
+  temporaries of a shot that carries history (MLA's context decompression, a wide
+  decode batch's split buffers) need the room the plan's own KV never touches. The
+  bound is computed from the limits alone, so the plan, its resume keys and the
+  recorded engine limits come from the natural boot and do not change; only the
+  engine that fires the shots is rebooted, once, with the pool sized from the
+  worker's own page accounting (hybrid models' recurrent state pages included).
+  A pool that would not be smaller keeps the natural engine. An out-of-memory error
+  names the flags that shrink the plan. `profile-deepseek-h200.sh` takes
+  `GPU_MEMORY_UTILIZATION`. See
+  [KV pool and memory during a sweep](https://llmservingsim.ai/docs/profiler/running#kv-pool-and-memory-during-a-sweep).
 
 - Profiles record the KV cache dtype vLLM resolved,
   `engine_resolved.per_tp[tp].kv_cache_dtype`, read in the worker after the

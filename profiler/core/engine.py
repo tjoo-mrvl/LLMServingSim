@@ -345,14 +345,20 @@ def _materialize_config(
     return written
 
 
+PRIVATE_ENGINE_OVERRIDES = ('kv_cache_memory_bytes', 'num_gpu_blocks_override')
+
+
 def _private_engine_overrides(value):
-    """Bound isolated acquisition cache allocation without changing workloads."""
+    """Bound isolated acquisition cache allocation without changing workloads.
+
+    One positive integer, either a byte budget (the native MoE engine) or a block count (the KV pool pin).
+    """
     if value is None:
         return {}
-    if (type(value) is not dict or set(value) != {'kv_cache_memory_bytes'}
-            or type(value['kv_cache_memory_bytes']) is not int
-            or value['kv_cache_memory_bytes'] < 1):
-        raise ValueError('Private engine overrides require positive integer kv_cache_memory_bytes only')
+    if (type(value) is not dict or len(value) != 1 or set(value) - set(PRIVATE_ENGINE_OVERRIDES)
+            or type(next(iter(value.values()))) is not int or next(iter(value.values())) < 1):
+        raise ValueError('Private engine overrides require one positive integer, '
+                         + ' or '.join(PRIVATE_ENGINE_OVERRIDES))
     return dict(value)
 
 
@@ -503,6 +509,25 @@ def resolve_attention_max_kv(args: ProfileArgs, limits: RuntimeLimits) -> int:
     return max(1, limits.max_model_len - max(1, q_max) - 1)
 
 
+def kv_pool_size(llm: LLM) -> tuple[int, int]:
+    """The engine's KV pool as ``(blocks, tokens)``.
+
+    ``kv_cache_size_tokens`` is vLLM's own group-aware capacity, added in
+    v0.28. Prefer it: for a hybrid model whose requests occupy several KV
+    cache groups at once (attention pages + mamba state), the older
+    ``num_gpu_blocks * block_size`` overstates what a request can actually
+    get, and every feasibility filter downstream would inherit that error.
+    Fall back to the product for engines that leave it unset.
+    """
+    cache = llm.llm_engine.vllm_config.cache_config
+    blocks = cache.num_gpu_blocks
+    assert blocks is not None, "vLLM did not report num_gpu_blocks"
+    tokens = getattr(cache, "kv_cache_size_tokens", None)
+    if tokens is None:
+        tokens = blocks * cache.block_size
+    return int(blocks), int(tokens)
+
+
 def probe_limits(llm: LLM, args: ProfileArgs | None = None) -> RuntimeLimits:
     """Read back the runtime shapes the engine accepted.
 
@@ -513,19 +538,7 @@ def probe_limits(llm: LLM, args: ProfileArgs | None = None) -> RuntimeLimits:
     ``engine_mnbt - engine_msq``.
     """
     cfg = llm.llm_engine.vllm_config
-
-    # ``kv_cache_size_tokens`` is vLLM's own group-aware capacity, added in
-    # v0.28. Prefer it: for a hybrid model whose requests occupy several KV
-    # cache groups at once (attention pages + mamba state), the older
-    # ``num_gpu_blocks * block_size`` overstates what a request can actually
-    # get, and every feasibility filter downstream would inherit that error.
-    # Fall back to the product for engines that leave it unset.
-    num_cache_tokens = getattr(cfg.cache_config, "kv_cache_size_tokens", None)
-    if num_cache_tokens is None:
-        num_cache_blocks = cfg.cache_config.num_gpu_blocks
-        block_size = cfg.cache_config.block_size
-        assert num_cache_blocks is not None, "vLLM did not report num_gpu_blocks"
-        num_cache_tokens = num_cache_blocks * block_size
+    _, num_cache_tokens = kv_pool_size(llm)
 
     # MoE params read from the live HF config (post-override).
     hf_cfg = getattr(cfg.model_config, "hf_text_config", None)

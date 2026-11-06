@@ -85,17 +85,14 @@
 #   GPU_MEMORY_UTILIZATION  | 0.9     | unset     | the fraction of GPU memory vLLM budgets
 #                           |         |           | for the engine (weights + KV cache +
 #                           |         |           | the activations of a prefill with no
-#                           |         |           | history). What it leaves free is all a
-#                           |         |           | shot's own temporaries get, and MLA's
-#                           |         |           | long-context shots need more than the
-#                           |         |           | startup profiling saw. The attention and
-#                           |         |           | skew sweeps fire their heaviest shots
-#                           |         |           | first, report what is left and stop with
-#                           |         |           | a suggested value if it is too little;
-#                           |         |           | pass that value here. It is not part of
-#                           |         |           | the measurement identity, so completed
-#                           |         |           | shots are kept. It does not affect the
-#                           |         |           | MoE engine, whose KV cache has a fixed size.
+#                           |         |           | history). The attention and skew engine
+#                           |         |           | pins its KV pool to what the plan can
+#                           |         |           | use, so MLA's long-context shots get the
+#                           |         |           | rest and this value changes nothing there
+#                           |         |           | once the pool is pinned. It is not part
+#                           |         |           | of the measurement identity, and it does
+#                           |         |           | not affect the MoE engine, whose KV cache
+#                           |         |           | has a fixed size.
 #   MEASUREMENT_ITERATIONS  | 3       | 3 (keep)  | N=3 already cuts DVFS jitter to
 #                           |         |           | ~5%; more is linear cost for
 #                           |         |           | marginal gain on the big shots.

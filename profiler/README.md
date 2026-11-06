@@ -39,7 +39,7 @@ profiler/                          Python package: python -m profiler
 │   ├── moe_deployment.py          TP/DP/EP ownership and token domains
 │   ├── moe_geometry.py            global expert placement and routing geometry
 │   ├── moe_conditioning.py        expert weight-rotation plan
-│   ├── memory_headroom.py         heaviest-shots-first order, headroom report and OOM hint
+│   ├── kv_pool.py                 KV pool pin for the attention and skew engine, OOM hint
 │   ├── skew.py                    heterogeneous-decode acquisition
 │   ├── skew_calibration.py        reference-aligned fit and supported-N lookup
 │   ├── skew_plan.py               dynamic distribution coverage and feasibility
@@ -255,7 +255,9 @@ describes a different machine: `--block-size`,
 The last two additionally bound the sweep's axes, and
 `--gpu-memory-utilization` sets the KV block count that every
 shot-feasibility filter is measured against — so all four change *which*
-shots exist, not just the numbers in them.
+shots exist, not just the numbers in them. (The attention and skew engine pins
+its pool to what the plan can use, so utilization changes the plan there only
+when the natural pool is smaller than that bound.)
 
 ## Quick start
 
@@ -372,7 +374,8 @@ None of them is free: every shot-feasibility filter is measured against the KV
 cache the engine resolved, so these change *which shots the sweep contains*,
 not only whether it survives. `GPU_MEMORY_UTILIZATION` cuts both ways -- lower
 leaves more room for activations but shrinks the KV cache, filtering out more
-of the large-kv shots.
+of the large-kv shots. The attention and skew engine pins its KV pool to what the
+plan can use, so there only a pool smaller than the plan's bound is affected.
 
 #### Engine limits and model shape
 
@@ -674,10 +677,10 @@ shared-expert output checks (logged inside the vLLM worker), and writes `outputs
 unless `OUT_ROOT` is set, so its tiny grid never mixes with the real bundle.
 
 `GPU_MEMORY_UTILIZATION` (unset: the profiler's 0.9) is forwarded as
-`--gpu-memory-utilization`. The attention and skew sweeps fire their heaviest shots
-first, report the memory left and stop with a suggested value if it is too little; pass
-that value and rerun. See
-[Memory headroom during a sweep](../docs/docs/profiler/running.md#memory-headroom-during-a-sweep).
+`--gpu-memory-utilization`. The engine that runs attention and skew pins its KV pool to
+what the plan can use, so for it the value changes nothing once the pool is pinned; it
+still sets the pool of an engine that is not. See
+[KV pool and memory during a sweep](../docs/docs/profiler/running.md#kv-pool-and-memory-during-a-sweep).
 
 The limits default to 16384 tokens and 513 sequences, with the attention reach at
 R1's whole context window. Profile above the runtime sequence cap: 513 gives mixed

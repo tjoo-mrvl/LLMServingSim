@@ -26,8 +26,13 @@ def allocate_counts(counts_by_group, num_blocks):
     return [tuple(groups) for groups in result]
 
 
-def allocate_shot_blocks(shot, runner):
-    """Use installed generic cache specs; no model-family or version branch."""
+def group_page_counts(requests, runner):
+    """Pages each request takes in each cache group: ``[group][request]``.
+
+    The one place that turns request lengths into physical pages, from the installed generic cache specs (no
+    model-family or version branch). ``allocate_shot_blocks`` allocates from it and ``pool_pages_required``
+    sizes the pool with it, so a pool sized for a shot is a pool that shot can be allocated from.
+    """
     from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
     cache = runner.kv_cache_config
     counts = []
@@ -36,7 +41,7 @@ def allocate_shot_blocks(shot, runner):
         specs = (list(group_spec.kv_cache_specs.values())
                  if isinstance(group_spec, UniformTypeKVCacheSpecs) else [group_spec])
         per_request = []
-        for new_tokens, history in shot.requests:
+        for new_tokens, history in requests:
             if (type(new_tokens) is not int or type(history) is not int
                     or new_tokens < 1 or history < 0):
                 raise ValueError('Invalid synthetic request geometry')
@@ -62,7 +67,16 @@ def allocate_shot_blocks(shot, runner):
                 needs.append(count)
             per_request.append(max(needs))
         counts.append(per_request)
-    return allocate_counts(counts, int(cache.num_blocks))
+    return counts
+
+
+def pool_pages_required(requests, runner):
+    """Blocks the shared pool needs to hold these requests at once, with the reserved null block."""
+    return 1 + sum(sum(row) for row in group_page_counts(requests, runner))
+
+
+def allocate_shot_blocks(shot, runner):
+    return allocate_counts(group_page_counts(shot.requests, runner), int(runner.kv_cache_config.num_blocks))
 
 
 def assigned_group_spans(requests, groups, num_blocks):

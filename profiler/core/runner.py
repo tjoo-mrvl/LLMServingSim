@@ -24,7 +24,7 @@ import dataclasses
 import time
 
 from profiler.core import logger as log
-from profiler.core import memory_headroom
+from profiler.core import kv_pool
 from profiler.core.categories import (
     CATEGORY_BY_NAME,
     Category,
@@ -280,13 +280,6 @@ def _fire_one_category(
         return False
 
     label = f"TP={tp}  {category.label}"
-    # The shots most likely to need temporary memory fire first (same set, same
-    # keys): an OOM then costs seconds, and the headroom they leave is measured.
-    probe = memory_headroom.heaviest(shots, lambda shot: shot)
-    if len(probe) < len(shots):
-        taken = {id(shot) for shot in probe}
-        shots = probe + [shot for shot in shots if id(shot) not in taken]
-    headroom = memory_headroom.Headroom(llm, label, log, args.gpu_memory_utilization or 0.9)
     # Checkpoint between complete shots, never while processing a worker
     # result. Interrupted writes retain the previous atomically replaced CSV.
     heartbeat = max(1, len(shots) // 100)
@@ -302,17 +295,13 @@ def _fire_one_category(
                 if component_layout_contract is not None:
                     raise ValueError('Local native profiles require their own admitted category contract')
                 rpc_args += (None, native_scope)
-            if done == 1:
-                headroom.begin()
             try:
                 raw = llm.collective_rpc(
                     "fire", args=rpc_args,
                 )
             except Exception as exc:
-                if memory_headroom.is_out_of_memory(exc):
-                    memory_headroom.explain_out_of_memory(
-                        log, exc, label=label, total=len(shots), done=done,
-                        utilization=args.gpu_memory_utilization or 0.9)
+                if kv_pool.is_out_of_memory(exc):
+                    kv_pool.explain_out_of_memory(exc, llm=llm, label=label, total=len(shots), done=done)
                 raise
             # collective_rpc returns one result per worker (one per
             # TP rank). The timings are identical across ranks; take
@@ -354,9 +343,6 @@ def _fire_one_category(
             if done == 1:
                 sink.stage_measurement(identity, replace=wipe)
             bar.advance(1)
-            if done == len(probe):
-                sink.flush(clear=False)  # the probe is kept even when its headroom ends the run
-                headroom.finish(len(probe))
             if done == 1 or done % 100 == 0 or time.monotonic() >= checkpoint_at:
                 # Retain the complete accumulator, including duplicate counts:
                 # flushing only the newest rows would erase earlier checkpoints.
@@ -509,6 +495,19 @@ def run_full(
                      if limits.num_experts else ""),
                 )
 
+            if profile is None and any(c.name == "attention" for c in by_depth[depth]):
+                # Attention and the skew sweep that rides on it are the shots
+                # that carry history, and their temporaries need the memory the
+                # plan's own KV never uses. The planning limits stay this
+                # boot's; only the engine that fires the shots is rebooted.
+                # A native profile fixes its cache allocation explicitly, and
+                # that bound is not ours to reduce.
+                llm, tmpdir = kv_pool.pin_kv_pool(
+                    llm, tmpdir, args, limits,
+                    lambda overrides: spin_up(main_args, tp, axes, native_profile=profile,
+                                              engine_overrides=overrides),
+                    f"TP={tp}")
+
             try:
                 if not args.only_skew:
                     for category in by_depth[depth]:
@@ -657,6 +656,13 @@ def run_slice(
         args = dataclasses.replace(
             args, attention_max_kv=resolve_attention_max_kv(args, limits),
         )
+    if profile is None and group == "attention":
+        # Same pin as run_full's: the shots that carry history get the memory
+        # the plan's own KV never uses.
+        llm, tmpdir = kv_pool.pin_kv_pool(
+            llm, tmpdir, args, limits,
+            lambda overrides: spin_up(args, tp, axes, native_profile=profile, engine_overrides=overrides),
+            f"TP={tp}")
     try:
         acquired = _fire_one_category(llm, category, arch, args, limits, tp, tp_root)
     finally:

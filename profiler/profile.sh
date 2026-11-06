@@ -56,11 +56,10 @@ HARDWARE="RTXPRO6000"
 # BLOCK_SIZE and GPU_MEMORY_UTILIZATION mirror the simulator's --block-size
 # and --npu-memory-utilization; keep them in step with whatever you simulate
 # at, since a profile measured under one paging regime doesn't describe
-# another. GPU_MEMORY_UTILIZATION also sets the KV block count, which every
-# shot-feasibility filter is measured against, so it changes *which* shots the
-# sweep contains. What it leaves free is all a shot's own temporaries get: the attention
-# and skew sweeps fire their heaviest shots first and stop with a suggested value when
-# too little is left; set it to that value and rerun (completed shots are kept).
+# another. GPU_MEMORY_UTILIZATION sets the KV block count the shot-feasibility
+# filters are measured against and what a shot's own temporaries get. The attention
+# and skew engine pins its KV pool to what the plan can use, so there it changes
+# nothing once the pool is pinned (completed shots are kept either way).
 # BLOCK_SIZE=16
 # GPU_MEMORY_UTILIZATION=0.9
 # MAX_MODEL_LEN caps the engine's context length; lowering it cuts profile
