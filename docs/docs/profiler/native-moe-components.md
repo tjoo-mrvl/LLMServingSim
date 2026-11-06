@@ -128,6 +128,26 @@ startup fails. The internal acquisition caller can raise the cap; context limits
 are never reduced to fit it. Actual component-engine settings are observations
 in that MoE contract, not replacement cache facts for ordinary profiling or serving.
 
+## Memory preflight
+
+Expert measurements rotate several independent copies of the rank's expert weights
+(banks) so the weights stay cold, and reserve scratch memory that grows with the row
+count (`8 x rows x top_k x hidden x 4` bytes, at least 1 GiB). Before any point is
+timed, the profiler checks the most demanding point against the GPU's free memory and
+logs the numbers:
+
+```text
+Native MoE rank=0 memory preflight: the largest expert point (1024 rows) needs 5.69 GiB
+free (4 banks of 1.31 GiB resident after the first point, ...); 7.06 of 22.11 GiB is free
+```
+
+A point that cannot fit fails there, in the first minute, with the shortfall and the
+remedy, instead of when the sweep reaches the largest point. The component engine fixes
+its KV cache at an explicit size, so `--gpu-memory-utilization` does not change this
+check. Lower `--max-num-batched-tokens`, which the scratch reserve scales with, or use a
+GPU with more memory. The guard is never relaxed, and the same inequality still runs
+before every point.
+
 ## Live local boundaries
 
 The live adapter admits actual APIs, tensor layouts and capabilities rather than

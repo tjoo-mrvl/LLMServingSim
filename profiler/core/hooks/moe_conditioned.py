@@ -11,6 +11,66 @@ from .moe_expert_region import NativeExpertRegion
 from .skew_measurement import MARKER
 
 
+def expert_memory_need(owner, n, active, iterations):
+    """What conditioning a point with ``n`` rows and ``active`` experts must find free.
+
+    The guard includes one extra conversion-sized buffer and an independent
+    output reference. It is evaluated from the same numbers by the preflight
+    and by every point, and is never relaxed after an OOM.
+    """
+    plan = expert_conditioning(owner.contract, active, iterations)
+    banks = plan['banks']
+    additional = max(0, banks-len(owner.expert_banks))
+    reserve = max(2**30, 8*n*owner.cfg.experts_per_token*owner.cfg.hidden_dim*4)
+    live = owner.contract['expert_region']['schema'] == 'native-live-expert-region'
+    bank_bytes = owner.contract['expert_bank_bytes'] if live else owner.contract['expert_weight_bytes']
+    # A live bank clones already processed native tensors once, without a
+    # second conversion buffer. Account all persistent scales in its footprint
+    # and recheck free memory before each bank. The legacy conversion path
+    # keeps its original double-buffer and quarter-device guards.
+    needed = additional*bank_bytes*(1 if live else 2)+reserve
+    return dict(plan=plan, banks=banks, additional=additional, reserve=reserve, live=live,
+                bank_bytes=bank_bytes, needed=needed)
+
+
+def _refusal(need, n, free, total, owner):
+    gib = lambda value: f'{value/2**30:.2f} GiB'
+    return MemoryError(
+        f'Native expert conditioning at {n} rows needs {gib(need["needed"])} free '
+        f'({need["additional"]} more weight bank(s) of {gib(need["bank_bytes"])} and a '
+        f'{gib(need["reserve"])} scratch reserve, which grows with the row count) but {gib(free)} of '
+        f'{gib(total)} is free with {len(owner.expert_banks)} bank(s) resident. '
+        '--gpu-memory-utilization does not change this: the component engine fixes its KV cache '
+        'at an explicit size. Lower --max-num-batched-tokens (the reserve scales with it) or use '
+        'a GPU with more memory; the guard is never relaxed.')
+
+
+def preflight_experts(owner, points, iterations):
+    """Check the most demanding expert point before any is timed.
+
+    ``points`` are ``(rows, active_experts)`` pairs. A point that cannot fit
+    would otherwise fail only when the sweep reaches it, after every smaller
+    point has been spent. Nothing is allocated here.
+    """
+    torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info(owner.device)
+    worst = None
+    for n, active in points:
+        need = expert_memory_need(owner, n, active, iterations)
+        quarter = (not need['live'] and need['additional']*owner.contract['expert_weight_bytes'] > total//4)
+        if worst is None or need['needed'] > worst[1]['needed'] or quarter:
+            worst = (n, need, quarter)
+        if quarter:
+            break
+    if worst is None:
+        return dict(checked=0, free=free, total=total)
+    n, need, quarter = worst
+    if need['needed'] > free or quarter:
+        raise _refusal(need, n, free, total, owner)
+    return dict(checked=len(points), rows=n, needed=need['needed'], free=free, total=total,
+                banks=need['banks'], bank_bytes=need['bank_bytes'], reserve=need['reserve'])
+
+
 @torch.inference_mode()
 def measure_experts(owner, point, iterations, failure_dir=None):
     if point['mode'] != 'eager':
@@ -19,27 +79,21 @@ def measure_experts(owner, point, iterations, failure_dir=None):
     from .moe_components import ProfileCall
 
     n, active, pairs = (point[k] for k in ('tokens','activated_experts','local_assignments'))
-    plan = expert_conditioning(owner.contract, active, iterations)
-    banks = plan['banks']
-    # The allocation guard includes one extra conversion-sized buffer and
-    # an independent output reference. Never relax it after an OOM.
-    additional = banks-len(owner.expert_banks)
-    reserve = max(2**30, 8*n*owner.cfg.experts_per_token*owner.cfg.hidden_dim*4)
+    need = expert_memory_need(owner, n, active, iterations)
+    plan, banks, additional, reserve = need['plan'], need['banks'], need['additional'], need['reserve']
+    live, bank_bytes = need['live'], need['bank_bytes']
     free, total = torch.cuda.mem_get_info(owner.device)
-    live = owner.contract['expert_region']['schema'] == 'native-live-expert-region'
-    bank_bytes = owner.contract['expert_bank_bytes'] if live else owner.contract['expert_weight_bytes']
-    # A live bank clones already processed native tensors once, without a
-    # second conversion buffer. Account all persistent scales in its footprint
-    # and recheck free memory before each bank. The legacy conversion path
-    # keeps its original double-buffer and quarter-device guards.
-    needed = max(0,additional)*bank_bytes*(1 if live else 2)+reserve
-    if needed > free or (not live and max(0,additional)*owner.contract['expert_weight_bytes'] > total//4):
-        raise MemoryError('Native expert conditioning exceeds safe free GPU memory; lower engine memory utilization or use a larger GPU')
+    if need['needed'] > free or (not live and additional*owner.contract['expert_weight_bytes'] > total//4):
+        raise _refusal(need, n, free, total, owner)
     for _ in range(additional):
         if live:
             free, _ = torch.cuda.mem_get_info(owner.device)
             if bank_bytes+reserve > free:
-                raise MemoryError('Native processed weight bank plus workspace reserve exceeds free GPU memory')
+                raise MemoryError(
+                    f'Native weight bank ({bank_bytes/2**30:.2f} GiB) plus the {reserve/2**30:.2f} GiB scratch '
+                    f'reserve needs more than the {free/2**30:.2f} GiB free. --gpu-memory-utilization does not '
+                    'change this (the component engine fixes its KV cache): lower --max-num-batched-tokens, '
+                    'which the reserve scales with, or use a GPU with more memory.')
             owner.expert_banks.append(owner.expert.clone())
         else:
             # Every bank is rebuilt from its own copy of the checkpoint, scales

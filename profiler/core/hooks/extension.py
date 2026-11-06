@@ -76,6 +76,11 @@ class Extension:
             import traceback
             raise RuntimeError(f"Native MoE point {point}:\n{traceback.format_exc()}") from exc
 
+    def moe_component_preflight(self, points, iterations):
+        """Check the largest expert point's memory need before any point is timed."""
+        from .moe_conditioned import preflight_experts
+        return preflight_experts(self._moe_components, [tuple(p) for p in points], iterations)
+
     def moe_component_release(self):
         self._moe_components = None
 

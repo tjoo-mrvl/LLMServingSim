@@ -10,6 +10,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
 
 ### Added
 
+- Native MoE sweeps check their largest expert point against free memory before
+  timing any point. The weight banks that keep the weights cold and a scratch
+  reserve that grows with the row count must fit, and a point that does not now
+  fails in the first minute, with the banks, reserve and free memory, instead of
+  when the sweep reaches it. See
+  [Native MoE components → Memory preflight](https://llmservingsim.ai/docs/profiler/native-moe-components#memory-preflight).
+
 - Profiles record the KV cache dtype vLLM resolved,
   `engine_resolved.per_tp[tp].kv_cache_dtype`, read in the worker after the
   model is built, and the simulator sizes the KV cache from it. vLLM picks the
@@ -177,6 +184,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) co
   [Native MoE components](https://llmservingsim.ai/docs/profiler/native-moe-components).
 
 ### Fixed
+
+- The native MoE memory guard told users to lower `--gpu-memory-utilization`, which
+  the component engine ignores (its KV cache has a fixed size). The error now reports
+  the banks, scratch reserve and free memory, and names `--max-num-batched-tokens`.
 
 - Decide sequence-parallel MoE with one rule,
   `moe_deployment.sequence_parallel_moe`, shared by the memory model, the native

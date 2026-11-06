@@ -2702,6 +2702,11 @@ values in `samples.jsonl`, never by a published pass/fail. Preserve runtime
 observations, geometry, dtypes, parallelism, backend, completion and the CSV
 integrity check. A shared GPU is no longer caught by a gate: give every
 process its own GPU.
+The native MoE engine pins its KV cache with `kv_cache_memory_bytes`, which vLLM
+documents as ignoring `--gpu-memory-utilization`. `preflight_experts` therefore checks the
+largest expert point (the weight banks plus the row-scaled scratch reserve) against free
+memory before any point is timed, and the remedy for a refusal is `--max-num-batched-tokens`
+or a larger GPU, never utilization. The same inequality still guards every point.
 
 New plans use `--moe-grid-factor` (default 2) for input rows N, active local
 experts A and local assignments M, including feasible endpoints, envelope

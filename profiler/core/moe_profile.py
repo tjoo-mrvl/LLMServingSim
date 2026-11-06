@@ -554,6 +554,17 @@ def run_components(arch_path, args, tps, variant_root, *, kv_cache_memory_bytes=
             points = list(points_for(contract))
             contract['point_plan_sha256'] = fingerprint(points)
             parent = variant_root/f'tp{target.tp}'/'moe_components'
+            # Refuse a point that cannot fit now, not when the sweep reaches it.
+            expert_points = sorted({(point['tokens'], point['activated_experts'])
+                                    for point in points if point['component'] == 'experts'})
+            if expert_points:
+                fit = llm.collective_rpc('moe_component_preflight',
+                                         args=(expert_points, args.measurement_iterations))[0]
+                log.info("Native MoE rank=%d memory preflight: the largest expert point (%d rows) needs "
+                         "%.2f GiB free (%d banks of %.2f GiB resident after the first point, %.2f GiB "
+                         "scratch); %.2f of %.2f GiB is free", target.rank, fit['rows'],
+                         fit['needed']/2**30, fit['banks'], fit['bank_bytes']/2**30,
+                         fit['reserve']/2**30, fit['free']/2**30, fit['total']/2**30)
             store = MeasurementStore(parent, contract, points)
             try:
                 store.publish()
